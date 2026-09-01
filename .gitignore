@@ -1,0 +1,7 @@
+# the dashboard's scratch dir inside an adopted project
+.pcc/
+# secrets never belong in a repo; the .example twins do
+secrets/*.env
+!secrets/*.env.example
+__pycache__/
+*.pyc
