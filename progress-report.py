@@ -810,9 +810,12 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
                               url, str(c.get("auth_env", "")), bool(c.get("probe", True)))
         notes.append(f"[[context]] + {nm} -> {url}")
 
+    # "proposed" only while nothing has been written. A one-click save shows
+    # this diff AFTER the write, where calling it proposed would understate it.
     diff = "".join(difflib.unified_diff(
         before.splitlines(keepends=True), text.splitlines(keepends=True),
-        fromfile="docs/progress.toml", tofile="docs/progress.toml (proposed)", n=2))
+        fromfile="docs/progress.toml",
+        tofile="docs/progress.toml " + ("(proposed)" if dry_run else "(saved)"), n=2))
     if text == before:
         return {"ok": True, "changed": False, "notes": notes, "diff": "", "written": False}
     if dry_run:
@@ -1962,8 +1965,8 @@ details.promptfold pre{white-space:pre-wrap;font-family:var(--mono);font-size:11
 .stall{margin-top:9px;padding:8px 11px;border-radius:7px;background:var(--warn-soft);color:var(--warn);font-size:12.5px}
 .launch{margin-top:12px;display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
 .launch code{flex:1 1 340px;background:var(--panel-2);border:1px solid var(--line);border-radius:7px;
-  padding:9px 11px;font-family:var(--mono);font-size:12.5px;color:var(--ink-2);line-height:1.5;
-  max-height:78px;overflow:auto;display:block}
+  padding:10px 12px;font-family:var(--mono);font-size:11px;color:var(--ink-2);line-height:1.55;
+  max-height:260px;overflow:auto;display:block;white-space:pre-wrap}
 .copy{appearance:none;border:1px solid var(--accent);background:var(--accent);color:#fff;font:inherit;
   font-size:12.5px;font-weight:600;padding:9px 15px;border-radius:7px;cursor:pointer;white-space:nowrap}
 .copy:hover{filter:brightness(1.08)}
@@ -2514,7 +2517,11 @@ def render(d: dict) -> str:
             f'<div class="pactivity"></div></dd>'
             f'</dl>'
             f'<details class="promptfold"><summary>session prompt</summary>'
-            f'<pre>{e(p["prompt"])}</pre></details>'
+              # .launch is the host the developer-bar looks for: it appends a
+              # "Copy <tool> command" button built from the SELECTED developer's
+              # tool, shell and checkout. Rendered as a bare <pre> this element
+              # never existed, so that button was never built.
+              f'<div class="launch"><code>{e(p["prompt"])}</code></div></details>'
             f'</div></details>')
 
     # gantt

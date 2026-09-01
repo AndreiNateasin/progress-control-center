@@ -149,6 +149,13 @@ no CLI, and launching there would be useless — the developer is elsewhere. But
 **command** correct for their tool, shell and checkout. No agent installed anywhere,
 and no inbound access to a developer's machine, which would be refused regardless.
 
+Pick your name in the developer bar and every phase's prompt block grows a
+`Copy <tool> command` button built from *your* roster row — a PowerShell here-string
+if your profile says powershell, a heredoc if it says bash, `cd`-ing to your
+checkout rather than the server's. Bound to anything but loopback the server also
+stops baking its own profile into the page, since that profile describes the
+server's machine and nobody else's.
+
 ## Context providers are brokered, not queried
 
 A `[[context]]` entry describes knowledge a *launched session* should consult. The
@@ -188,6 +195,12 @@ characters of design document. A ticket is a work order.
 Creating the issue is a two-step: the first click only arms the button and makes it
 name the project it will land in. A phase that already has a key is refused, so a
 double click cannot raise a second ticket.
+
+Saving the config is *not* two-step, and the difference is the point: a ticket is
+outward-facing and cannot be withdrawn, while the config is a local file whose diff
+you can read after the fact. So Save writes on the first click and then shows the
+diff that landed — not the one a preview predicted, which is the stronger claim of
+the two. Preview is still there for reading first.
 
 ## Trust
 

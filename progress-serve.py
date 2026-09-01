@@ -58,6 +58,7 @@ import tomllib
 
 SELF_DIR = Path(__file__).resolve().parent      # where THIS install lives
 REPO = _pr.REPO                                 # re-pointed by init_repo()
+BIND_HOST = "127.0.0.1"                         # set by main() before init_repo
 DISTRO = os.environ.get("PCC_DISTRO", "Ubuntu-24.04")
 PROMPT_DIR = REPO / ".pcc"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -615,7 +616,11 @@ def init_repo(path: Path) -> None:
     global REPO, PROMPT_DIR, CFG
     REPO = Path(path).resolve()
     _pr.set_repo(REPO)
-    _pr.LOCAL_SURFACE = True        # personal profile is safe on YOUR dashboard
+    # Only YOUR dashboard may carry your profile. Bound to anything but
+    # loopback the page is served to other people, and the profile it would
+    # bake in describes this server's machine, not the viewer's - a checkout
+    # they do not have and a shell whose syntax breaks on paste.
+    _pr.LOCAL_SURFACE = BIND_HOST in ('127.0.0.1', 'localhost', '::1')
     PROMPT_DIR = REPO / ".pcc"
     cfgp = REPO / "docs" / "progress.toml"
     # An unconfigured repo must still START, because /setup is the thing that
@@ -2645,13 +2650,9 @@ SETUP_JS = r"""
     // the save, rather than a separate button you had to find first. A greyed
     // out "Write" sitting two cards below the field you just edited reads as
     // broken, and people reasonably went looking for Save.
-    var armed = false;
-    function disarm(){
-      armed = false;
-      var b = $('#sw-apply');
-      b.textContent = 'Save config';
-      b.classList.remove('warnbtn');
-    }
+    // No arm state any more: a click saves. Kept as the one place that
+    // invalidates a diff the user should no longer trust.
+    function disarm(){ diff($('#sw-diff'),''); }
     $('#sw-preview').addEventListener('click',function(){
       api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:false})
         .then(function(d){
@@ -2661,49 +2662,36 @@ SETUP_JS = r"""
         });
     });
     $('#sw-apply').addEventListener('click',function(){
+      // One click writes. The confirm step existed so a write was never a
+      // surprise, but this is a local file, Preview is still one click away,
+      // and the diff shown afterwards is the one that LANDED rather than the
+      // one a preview predicted - which is the stronger guarantee anyway.
       var b = this;
-      if(!armed){
-        b.disabled = true;
-        api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:false})
-          .then(function(d){
-            b.disabled = false;
-            if(!d.ok){say('#sw-pmsg',d.error,'err');diff($('#sw-diff'),'');return}
-            if(!d.changed){
-              diff($('#sw-diff'),'');
-              say('#sw-pmsg','Nothing to save - already up to date.','');
-              $('#sw-writecard').classList.remove('dirty');
-              return;
-            }
-            diff($('#sw-diff'),d.diff);
-            armed = true;
-            b.textContent = 'Confirm save';
-            b.classList.add('warnbtn');
-            say('#sw-pmsg','Review the changes below, then click again to save.','');
-          });
-        return;
-      }
       b.disabled = true;
       api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:true})
         .then(function(d){
-          b.disabled = false; disarm();
-          if(!d.ok){say('#sw-pmsg',d.error,'err');return}
-          // Show the diff the WRITE produced, not the one preview predicted: the
-          // file can have changed in between, and what landed is what matters.
+          b.disabled = false;
+          if(!d.ok){ say('#sw-pmsg',d.error,'err'); return }
+          if(!d.changed){
+            diff($('#sw-diff'),'');
+            say('#sw-pmsg','Nothing to save - already up to date.','');
+            $('#sw-writecard').classList.remove('dirty');
+            return;
+          }
           diff($('#sw-diff'),d.diff);
           $('#sw-writecard').classList.remove('dirty');
-          say('#sw-pmsg','Saved.','ok');
-          load();
+          say('#sw-pmsg','Saved. Below is what landed.','ok');
         });
     });
     // Editing after arming invalidates the diff you were just shown.
     // Bind to the containers that actually feed the committed save, not the
     // whole pane: the Tokens and checkout cards live here too, and neither
     // writes docs/progress.toml. Unscoped, typing a token claimed the config
-    // was dirty and disarmed an armed confirm.
+    // was dirty, and cleared a diff the user was still reading.
     ['#sw-proj','#sw-svc'].forEach(function(sel){
       var node=$(sel); if(!node) return;
       node.addEventListener('input',function(){
-        if(armed){ disarm(); diff($('#sw-diff'),''); }
+        disarm();                       // the shown diff is now stale
         say('#sw-pmsg','Unsaved changes.','');
         $('#sw-writecard').classList.add('dirty');
       });
@@ -3239,6 +3227,8 @@ def main() -> int:
     ap.add_argument("--trust-yes", action="store_true", dest="trust_yes",
                     help="approve this repo's configured commands without asking")
     a = ap.parse_args()
+    global BIND_HOST
+    BIND_HOST = a.host
 
     init_repo(_pr.resolve_repo(a.repo))
     fresh = not (REPO / "docs" / "progress.toml").exists()
