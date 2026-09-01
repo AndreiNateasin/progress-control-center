@@ -2085,6 +2085,17 @@ body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1
 .sw button.act.pri{background:var(--accent);border-color:var(--accent);color:#fff}
 .sw button.act.pri:hover{filter:brightness(1.08);color:#fff}
 .sw button.act[disabled]{opacity:.5;cursor:not-allowed}
+/* Save sticks to the bottom of the viewport: the fields it saves are a long
+   scroll above it, and a save button you have to go looking for is one people
+   assume is missing. */
+.sw .card.sticky-save{position:sticky;bottom:0;z-index:5;margin-top:18px;
+  border-color:var(--accent-soft);box-shadow:0 -8px 24px -18px rgba(0,0,0,.4),var(--shadow)}
+.sw .card.sticky-save.dirty{border-color:var(--accent)}
+.sw .card.sticky-save.dirty .msg{color:var(--accent);font-weight:600}
+/* armed = the next click writes. Colour alone would not say that, so the label
+   changes too. */
+.sw button.act.warnbtn{background:var(--crit);border-color:var(--crit);color:#fff}
+.sw button.act.warnbtn:hover{filter:brightness(1.08);color:#fff}
 .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px}
 .bar .msg{font-size:13px;color:var(--ink-2)}
 .bar .msg.err{color:var(--crit)}.bar .msg.ok{color:var(--done)}
@@ -2459,26 +2470,67 @@ SETUP_JS = r"""
           load();     // re-read: the page now has a config to edit rather than create
         });
     });
+    // Save is ONE button that arms, not a disabled gate behind Preview. The rule
+    // it enforces is unchanged - a committed file is never written without
+    // showing the diff first - but that diff is now a confirmation step inside
+    // the save, rather than a separate button you had to find first. A greyed
+    // out "Write" sitting two cards below the field you just edited reads as
+    // broken, and people reasonably went looking for Save.
+    var armed = false;
+    function disarm(){
+      armed = false;
+      var b = $('#sw-apply');
+      b.textContent = 'Save config';
+      b.classList.remove('warnbtn');
+    }
     $('#sw-preview').addEventListener('click',function(){
       api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:false})
         .then(function(d){
           if(!d.ok){say('#sw-pmsg',d.error,'err');diff($('#sw-diff'),'');return}
           diff($('#sw-diff'),d.diff);
-          $('#sw-apply').disabled=!d.changed;
-          say('#sw-pmsg', d.changed?'review the diff, then write':'nothing would change','');
+          say('#sw-pmsg', d.changed?'this is what would be saved':'nothing would change','');
         });
     });
     $('#sw-apply').addEventListener('click',function(){
+      var b = this;
+      if(!armed){
+        b.disabled = true;
+        api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:false})
+          .then(function(d){
+            b.disabled = false;
+            if(!d.ok){say('#sw-pmsg',d.error,'err');diff($('#sw-diff'),'');return}
+            if(!d.changed){
+              diff($('#sw-diff'),'');
+              say('#sw-pmsg','Nothing to save - already up to date.','');
+              $('#sw-writecard').classList.remove('dirty');
+              return;
+            }
+            diff($('#sw-diff'),d.diff);
+            armed = true;
+            b.textContent = 'Confirm save';
+            b.classList.add('warnbtn');
+            say('#sw-pmsg','Review the changes below, then click again to save.','');
+          });
+        return;
+      }
+      b.disabled = true;
       api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:true})
         .then(function(d){
+          b.disabled = false; disarm();
           if(!d.ok){say('#sw-pmsg',d.error,'err');return}
           // Show the diff the WRITE produced, not the one preview predicted: the
           // file can have changed in between, and what landed is what matters.
           diff($('#sw-diff'),d.diff);
-          say('#sw-pmsg','written to '+d.path+' \u2014 '+(d.reload||'')+
-              ' \u00b7 it is a COMMITTED file, so review `git diff` before you push','ok');
-          $('#sw-apply').disabled=true; load();
+          $('#sw-writecard').classList.remove('dirty');
+          say('#sw-pmsg','Saved.','ok');
+          load();
         });
+    });
+    // Editing after arming invalidates the diff you were just shown.
+    $('#pane-proj').addEventListener('input',function(){
+      if(armed){ disarm(); diff($('#sw-diff'),''); }
+      say('#sw-pmsg','Unsaved changes.','');
+      $('#sw-writecard').classList.add('dirty');
     });
   });
 })();
@@ -2555,7 +2607,7 @@ def setup_page(token: str) -> str:
         '<div class="pane" id="pane-proj">'
         '<div class="card"><h2>Project</h2>'
         '<p class="note">Shared settings, written to <code id="sw-ppath">…</code> — a '
-        '<b>committed</b> file. Nothing is written until you preview the diff and press write.</p>'
+        '<b>committed</b> file. Save shows you the change and asks once before writing.</p>'
         '<div id="sw-proj"></div></div>'
 
         '<div class="card"><h2>Services on this host</h2>'
@@ -2589,10 +2641,10 @@ def setup_page(token: str) -> str:
         '<span class="msg" id="sw-imsg"></span></div>'
         '<pre class="diff" id="sw-ilog" style="display:none"></pre></div>'
 
-        '<div class="card" id="sw-writecard"><h2>Write</h2>'
-        '<div class="bar"><button class="act" id="sw-preview">Preview changes</button>'
-        '<button class="act pri" id="sw-apply" disabled>Write to progress.toml</button>'
-        '<span class="msg" id="sw-pmsg"></span></div>'
+        '<div class="card sticky-save" id="sw-writecard">'
+        '<div class="bar"><button class="act pri" id="sw-apply">Save config</button>'
+        '<button class="act" id="sw-preview">Preview</button>'
+        '<span class="msg" id="sw-pmsg">No unsaved changes.</span></div>'
         '<pre class="diff" id="sw-diff" style="display:none"></pre></div></div>'
 
         "</div><script>window.__SW_TOKEN__=" + _pr.js(token) + ";</script>"
