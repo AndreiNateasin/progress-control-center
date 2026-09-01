@@ -19,7 +19,7 @@ scripts and the `claude` CLI, so the buttons are real. Split of duties:
     artifact       read-only, phone, shareable link        no actions
 
 TRUTH STAYS IN THE PLAN
-Ticking a box here rewrites the `- [ ]` in ANU-PLAN.md / docs/PHASE-*.md. The
+Ticking a box here rewrites the `- [ ]` in PLAN.md / docs/PHASE-*.md. The
 dashboard is an EDITOR for the plan, never a second store of progress — so the
 "derive, never duplicate" rule survives. Write-back matches the verbatim source
 line, not a line number: if the file changed since the page was rendered, the
@@ -273,7 +273,8 @@ def _detect_claude_app() -> str | None:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "(Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1).AppID"],
-            capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW)
+            capture_output=True, text=True, timeout=25, creationflags=NO_WINDOW,
+            **_pr.TEXT_IO)
         appid = (r.stdout or "").strip()
         return appid if appid and "!" in appid else None
     except (OSError, subprocess.SubprocessError):
@@ -659,22 +660,9 @@ def _env_prelude() -> str:
 
     Returns "" when no env file is configured or present — no provider, no cost.
     """
-    ctx = CFG.get("context_env_file") or (CFG.get("context_settings") or {}).get("env_file")
-    if not ctx:
-        # Convention when unset: secrets/context.env, matching --init's scaffold.
-        ctx = "secrets/context.env"
-    path = (REPO / ctx).resolve()
-
-    files = []
-    if REPO.resolve() in path.parents and path.exists():
-        files.append(path)
-    # Your own tokens too. The setup wizard stores JIRA_PAT / GIT_PAT in a 0600
-    # file under your user config; before this they were written and read by
-    # NOTHING, which made the wizard's token fields a dead end. They belong to
-    # you and reach only sessions you launch from your own dashboard.
-    upath = _pr.user_secrets_path()
-    if upath.exists():
-        files.append(upath)
+    # One file, the project's own. Every token a session needs — provider JWTs,
+    # the JIRA token, a forge PAT — is loaded from the same place.
+    files = _secret_files()
     if not files:
         return ""
 
@@ -840,13 +828,13 @@ def phase_activity(phase_id: str, model: dict) -> dict:
         # used to report "no commits yet" for a repo git could not even read.
         lg = subprocess.run(["git", "-C", str(REPO), "log", "--pretty=%h|%ad|%an|%s",
                              "--date=short", "-15", "--", *paths],
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=20, **_pr.TEXT_IO)
         if lg.returncode != 0:
             return {"ok": False, "error": "git log failed: " +
                     (lg.stderr or "").strip()[:200]}
         log = lg.stdout.strip()
         st = subprocess.run(["git", "-C", str(REPO), "diff", "--stat", "HEAD", "--", *paths],
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=20, **_pr.TEXT_IO)
         stat = st.stdout.strip() if st.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
@@ -1019,20 +1007,15 @@ def read_ticket_draft(phase_id: str) -> dict:
                       "description": str(d.get("description", ""))}}
 
 
+def project_secrets_path() -> Path:
+    """This project's token file — the shared definition, bound to this repo."""
+    return _pr.project_secrets_path(REPO, CFG)
+
+
 def _secret_files() -> list[Path]:
-    """Where a token may live, most-specific first. Same files _env_prelude
-    hands to a launched session — the difference is that creating an issue needs
-    the VALUE here, not a path to pass on."""
-    ctx = CFG.get("context_env_file") or (CFG.get("context_settings") or {}).get("env_file") \
-        or "secrets/context.env"
-    out = []
-    p = (REPO / ctx).resolve()
-    if REPO.resolve() in p.parents and p.exists():
-        out.append(p)
-    u = _pr.user_secrets_path()
-    if u.exists():
-        out.append(u)
-    return out
+    """Where a token may live. One file now; a list because callers iterate."""
+    p = project_secrets_path()
+    return [p] if p.exists() else []
 
 
 def _read_secret(var: str) -> str | None:
@@ -1230,39 +1213,39 @@ def link_ticket(phase_id: str, key: str) -> dict:
 # ---------------------------------------------------------------- action layer
 
 CSS = """
-#anu-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;gap:8px;align-items:center;
+#pcc-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;gap:8px;align-items:center;
  flex-wrap:wrap;padding:10px 14px;background:var(--panel);border-top:1px solid var(--line);
  box-shadow:0 -6px 24px -18px rgba(0,0,0,.6)}
-#anu-bar .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+#pcc-bar .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
  color:var(--ink-3);margin-right:2px}
-.anu-btn{appearance:none;border:1px solid var(--line);background:var(--panel-2);color:var(--ink);
+.pcc-btn{appearance:none;border:1px solid var(--line);background:var(--panel-2);color:var(--ink);
  font:inherit;font-size:12.5px;padding:6px 12px;border-radius:7px;cursor:pointer}
-.anu-btn:hover{border-color:var(--accent);color:var(--accent)}
-.anu-btn[disabled]{opacity:.5;cursor:progress}
-.anu-btn.run{border-color:var(--accent);background:var(--accent);color:#fff}
-.anu-btn.run:hover{color:#fff;filter:brightness(1.08)}
-#anu-out{position:fixed;right:14px;bottom:58px;z-index:51;width:min(680px,calc(100vw - 28px));
+.pcc-btn:hover{border-color:var(--accent);color:var(--accent)}
+.pcc-btn[disabled]{opacity:.5;cursor:progress}
+.pcc-btn.run{border-color:var(--accent);background:var(--accent);color:#fff}
+.pcc-btn.run:hover{color:#fff;filter:brightness(1.08)}
+#pcc-out{position:fixed;right:14px;bottom:58px;z-index:51;width:min(680px,calc(100vw - 28px));
  max-height:52vh;display:none;flex-direction:column;background:var(--panel);
  border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
-#anu-out.on{display:flex}
-#anu-out header{display:flex;align-items:center;justify-content:space-between;gap:10px;
+#pcc-out.on{display:flex}
+#pcc-out header{display:flex;align-items:center;justify-content:space-between;gap:10px;
  padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel-2)}
-#anu-out h4{margin:0;font-size:12.5px;font-weight:650}
-#anu-out pre{margin:0;padding:11px 13px;overflow:auto;font-family:var(--mono);font-size:11.5px;
+#pcc-out h4{margin:0;font-size:12.5px;font-weight:650}
+#pcc-out pre{margin:0;padding:11px 13px;overflow:auto;font-family:var(--mono);font-size:11.5px;
  line-height:1.55;white-space:pre-wrap;word-break:break-word}
-#anu-out .rc{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;margin-left:auto}
-#anu-out .rc.ok{background:var(--done-soft);color:var(--done)}
-#anu-out .rc.bad{background:var(--crit-soft);color:var(--crit)}
-#anu-out .rc.run{background:var(--accent-soft);color:var(--accent)}
-li[data-anu] .box{cursor:pointer}
-li[data-anu] .box:hover{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-li[data-anu].busy{opacity:.55}
-.anu-local{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+#pcc-out .rc{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;margin-left:auto}
+#pcc-out .rc.ok{background:var(--done-soft);color:var(--done)}
+#pcc-out .rc.bad{background:var(--crit-soft);color:var(--crit)}
+#pcc-out .rc.run{background:var(--accent-soft);color:var(--accent)}
+li[data-pcc] .box{cursor:pointer}
+li[data-pcc] .box:hover{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+li[data-pcc].busy{opacity:.55}
+.pcc-local{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
  background:var(--done-soft);color:var(--done);padding:2px 7px;border-radius:999px;font-weight:700}
-#anu-svc{position:fixed;left:0;right:0;bottom:52px;z-index:49;display:flex;gap:10px;
+#pcc-svc{position:fixed;left:0;right:0;bottom:52px;z-index:49;display:flex;gap:10px;
  flex-wrap:wrap;padding:0 14px}
-#anu-svc:empty{display:none}
-.anu-svc-chip{display:flex;align-items:center;gap:7px;background:var(--panel);
+#pcc-svc:empty{display:none}
+.pcc-svc-chip{display:flex;align-items:center;gap:7px;background:var(--panel);
  border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:12.5px;
  box-shadow:var(--shadow)}
 body{padding-bottom:104px}
@@ -1280,11 +1263,11 @@ JS = r"""
     }).then(function(r){ return r.json(); });
   }
 
-  var out = document.getElementById('anu-out'),
+  var out = document.getElementById('pcc-out'),
       pre = out.querySelector('pre'),
       ttl = out.querySelector('h4'),
       rcEl = out.querySelector('.rc'),
-      btns = Array.prototype.slice.call(document.querySelectorAll('.anu-btn[data-task]'));
+      btns = Array.prototype.slice.call(document.querySelectorAll('.pcc-btn[data-task]'));
 
   function enable(on){ btns.forEach(function(b){ b.disabled = !on; }); }
 
@@ -1330,13 +1313,13 @@ JS = r"""
 
   // Context providers: reachability only, no start/stop. Whether a launched
   // session could reach its knowledge is worth a chip; owning the process is not.
-  var svcWrap = document.getElementById('anu-svc');
+  var svcWrap = document.getElementById('pcc-svc');
   function renderSvc(rows){
     if(!svcWrap) return;
     if(!rows.length){ svcWrap.innerHTML=''; return; }
     svcWrap.innerHTML = '<span class="lbl">context</span>' + rows.map(function(r){
       var cls = r.state === 'reachable' ? 'done' : (r.state === 'unreachable' ? 'crit' : '');
-      return '<span class="anu-svc-chip" title="' + (r.hint||'') + ' — ' + (r.url||'') + '">'
+      return '<span class="pcc-svc-chip" title="' + (r.hint||'') + ' — ' + (r.url||'') + '">'
         + '<span class="pill ' + cls + '">' + r.state + '</span> ' + r.label + '</span>';
     }).join('');
   }
@@ -1356,7 +1339,7 @@ JS = r"""
   // your setup profile. The wizard asked for a preferred tool and the launcher
   // used to ignore it, which made the question look decorative.
   function preferredTool(){
-    try { if (localStorage.anuLauncher && LN[localStorage.anuLauncher]) return localStorage.anuLauncher; } catch(e){}
+    try { if (localStorage.pccLauncher && LN[localStorage.pccLauncher]) return localStorage.pccLauncher; } catch(e){}
     var t = window.__ANU_PROFILE_TOOL__;
     if (t && LN[t]) return t;
     // Prefer a launcher that actually delivers the prompt into a session over
@@ -1371,7 +1354,7 @@ JS = r"""
   }
   function toolSelect(){
     var sel = document.createElement('select');
-    sel.className = 'anu-btn';
+    sel.className = 'pcc-btn';
     // A select with no label announces only its current value. There is no
     // visible label to point at here, so it carries its own.
     sel.setAttribute('aria-label', 'Coding tool to open the session in');
@@ -1395,7 +1378,7 @@ JS = r"""
     btn.disabled = true;
     var was = btn.textContent;
     btn.textContent = 'Opening…';
-    try { localStorage.anuLauncher = tool; } catch(e){}
+    try { localStorage.pccLauncher = tool; } catch(e){}
     var copied = false;
     copyLocal(prompt).then(function(){ copied = true; }, function(){}).then(function(){
       return api('/api/session', {phase: phaseId, prompt: prompt, tool: tool});
@@ -1485,7 +1468,7 @@ JS = r"""
     if(lnKeys.length){
       var sel = toolSelect();
       var go = document.createElement('button');
-      go.className = 'anu-btn run';
+      go.className = 'pcc-btn run';
       go.textContent = isDone ? 'Open blank session here' : 'Open session on this item';
       go.title = isDone
         ? 'This item is done — opens the tool in the repo with no prompt at all'
@@ -1499,7 +1482,7 @@ JS = r"""
     }
 
     var cp = document.createElement('button');
-    cp.className = 'anu-btn';
+    cp.className = 'pcc-btn';
     cp.textContent = isDone ? 'Copy re-check prompt' : 'Copy prompt';
     cp.title = isDone ? 'A prompt that VERIFIES this item, rather than rebuilding it' : '';
     cp.addEventListener('click', function(ev){
@@ -1514,7 +1497,7 @@ JS = r"""
     var CMD = window.__PCC_TOOLCMD__ || {};
     if(Object.keys(CMD).length){
       var cc = document.createElement('button');
-      cc.className = 'anu-btn'; cc.textContent = 'Copy command';
+      cc.className = 'pcc-btn'; cc.textContent = 'Copy command';
       cc.title = 'A shell command for YOUR machine, prompt embedded';
       cc.addEventListener('click', function(ev){
         ev.stopPropagation();
@@ -1537,7 +1520,7 @@ JS = r"""
       wrap.className = 'istate';
       [['todo', 'To do'], ['active', 'In progress'], ['done', 'Done']].forEach(function(s){
         var b = document.createElement('button');
-        b.className = 'anu-btn' + (li.dataset.s === s[0] ? ' on' : '');
+        b.className = 'pcc-btn' + (li.dataset.s === s[0] ? ' on' : '');
         b.textContent = s[1];
         b.addEventListener('click', function(ev){
           ev.stopPropagation();
@@ -1575,7 +1558,7 @@ JS = r"""
     if(lnKeys.length){
       var sel = toolSelect();
       var open = document.createElement('button');
-      open.className = 'anu-btn run'; open.textContent = 'Open session';
+      open.className = 'pcc-btn run'; open.textContent = 'Open session';
       open.title = p.startable ? 'Open this phase in a coding session'
                                : 'This phase is blocked — the prompt says so';
       open.addEventListener('click', function(){ launch(open, p.id, p.prompt, sel.value, say); });
@@ -1584,14 +1567,14 @@ JS = r"""
 
     if(p.test){
       var t = document.createElement('button');
-      t.className = 'anu-btn'; t.textContent = 'Test';
+      t.className = 'pcc-btn'; t.textContent = 'Test';
       t.title = 'Run the `' + p.test + '` action — this phase’s exit test';
       t.addEventListener('click', function(){ runInto(p.test, t, host, say); });
       act.appendChild(t);
     }
 
     var rg = document.createElement('button');
-    rg.className = 'anu-btn'; rg.textContent = 'Regenerate';
+    rg.className = 'pcc-btn'; rg.textContent = 'Regenerate';
     rg.title = 'Re-read the plan and refresh this phase';
     rg.addEventListener('click', function(){
       rg.disabled = true; say('re-reading the plan…');
@@ -1641,7 +1624,7 @@ JS = r"""
     // then waited forever for a draft that could never be written.
     var terms = terminalTools();
     var draft = document.createElement('button');
-    draft.className = 'anu-btn'; draft.textContent = 'Draft ticket';
+    draft.className = 'pcc-btn'; draft.textContent = 'Draft ticket';
     if(!terms.length){
       draft.disabled = true;
       draft.title = 'Needs a terminal launcher (claude or opencode) — none found on this machine';
@@ -1668,16 +1651,16 @@ JS = r"""
     act.appendChild(draft);
 
     var load = document.createElement('button');
-    load.className = 'anu-btn'; load.textContent = 'Load draft';
+    load.className = 'pcc-btn'; load.textContent = 'Load draft';
     load.title = 'Read .pcc/ticket-' + p.id + '.json if a session has written it';
     load.addEventListener('click', function(){ loadDraft(p, act, say, host, true); });
     act.appendChild(load);
 
     var inp = document.createElement('input');
-    inp.type = 'text'; inp.placeholder = 'PROJ-123'; inp.className = 'anu-btn';
+    inp.type = 'text'; inp.placeholder = 'PROJ-123'; inp.className = 'pcc-btn';
     inp.style.width = '110px'; inp.style.cursor = 'text';
     var lk = document.createElement('button');
-    lk.className = 'anu-btn'; lk.textContent = 'Link ticket';
+    lk.className = 'pcc-btn'; lk.textContent = 'Link ticket';
     lk.title = 'Record an EXISTING ticket key on this phase (docs/progress.toml)';
     function doLink(){
       if(!inp.value.trim()){
@@ -1774,7 +1757,7 @@ JS = r"""
     var tmpl = p.jira_create_tmpl || '';
     if(tmpl){
       var open = document.createElement('button');
-      open.className = 'anu-btn'; open.textContent = 'Open prefilled JIRA form';
+      open.className = 'pcc-btn'; open.textContent = 'Open prefilled JIRA form';
       open.title = 'Opens JIRA with these fields; you press Create there. No token used.';
       open.addEventListener('click', function(){
         window.open(tmpl.split('{summary}').join(encodeURIComponent(s.value))
@@ -1789,7 +1772,7 @@ JS = r"""
     // TWO-STEP: the first click only arms the button, and makes it name the
     // project the issue will actually land in.
     var apiBtn = document.createElement('button');
-    apiBtn.className = 'anu-btn run';
+    apiBtn.className = 'pcc-btn run';
     var armed = false;
     if(jira && jira.configured){
       apiBtn.textContent = 'Create in JIRA…';
@@ -1951,14 +1934,14 @@ JS = r"""
   function wireTicks(root){
     (root || document).querySelectorAll('li.item .tick').forEach(function(btn){
       var li = btn.closest('li.item');
-      if(!li || li.getAttribute('data-anu')) return;
+      if(!li || li.getAttribute('data-pcc')) return;
       var lbl = li.querySelector('.lbl');
       if(!lbl) return;
       var rec = MAP[lbl.textContent.trim()];
       if(!rec || rec.ambiguous){ btn.disabled = true;
         btn.setAttribute('aria-label', 'Cannot change: this line appears twice in the plan');
         return; }
-      li.setAttribute('data-anu','1');
+      li.setAttribute('data-pcc','1');
       btn.addEventListener('click', function(ev){
         ev.preventDefault(); ev.stopPropagation();
         if(li.classList.contains('busy')) return;
@@ -1995,19 +1978,19 @@ def action_layer(token: str, model: dict) -> str:
                 idx.setdefault(k, {"file": it["file"], "raw": it["raw"]})
 
     buttons = "".join(
-        '<button class="anu-btn{cls}" data-task="{k}" data-label="{lab}" title="{hint}">{lab}</button>'.format(
+        '<button class="pcc-btn{cls}" data-task="{k}" data-label="{lab}" title="{hint}">{lab}</button>'.format(
             cls=" run" if v["primary"] else "", k=k, lab=v["label"], hint=v["hint"])
         for k, v in ACTIONS.items())
 
     return (
         "<style>" + CSS + "</style>"
-        '<div id="anu-out"><header><h4></h4><span class="rc"></span>'
-        '<button class="anu-btn x">close</button></header><pre></pre></div>'
-        '<div id="anu-svc"></div>'
-        '<div id="anu-bar"><span class="lbl">local</span>' + buttons +
-        '<a class="anu-btn" href="/setup" style="text-decoration:none;margin-left:auto"'
+        '<div id="pcc-out"><header><h4></h4><span class="rc"></span>'
+        '<button class="pcc-btn x">close</button></header><pre></pre></div>'
+        '<div id="pcc-svc"></div>'
+        '<div id="pcc-bar"><span class="lbl">local</span>' + buttons +
+        '<a class="pcc-btn" href="/setup" style="text-decoration:none;margin-left:auto"'
         ' title="configure this machine and this project">Setup</a>'
-        '<span class="anu-local">actions live</span></div>'
+        '<span class="pcc-local">actions live</span></div>'
         "<script>window.__ANU_TOKEN__=" + _pr.js(token) + ";"
         "window.__ANU_ITEMS__=" + _pr.js(idx) + ";"
         "window.__ANU_PROFILE_TOOL__=" + _pr.js(
@@ -2070,6 +2053,17 @@ body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1
 .subhead{margin:22px 0 2px;padding-top:16px;border-top:1px solid var(--line);
   font-size:14px;font-weight:600}
 .subhead .quiet{font-weight:400;color:var(--ink-3);font-size:12.5px}
+.advfold{margin:4px 0 0;border-top:1px solid var(--line)}
+.advfold > summary{cursor:pointer;font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink-3);padding:10px 0;min-height:24px;
+  display:flex;align-items:center}
+.advfold > summary:hover{color:var(--accent)}
+.derived{padding:10px 0 2px;line-height:1.7}
+.ready{margin-top:6px;padding:6px 9px;border-radius:6px;line-height:1.55}
+.ready.yes{background:var(--done-soft);color:var(--done)}
+.ready.no{background:var(--warn-soft);color:var(--warn)}
+.derived code{background:var(--panel-2);padding:1px 5px;border-radius:4px;
+  font-family:var(--mono);font-size:11.5px}
 .row .v input[type=text],.row .v input[type=date],.row .v input[type=password],.row .v select{
   width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;
   background:var(--bg);color:var(--ink);font:inherit;font-size:13.5px}
@@ -2083,6 +2077,10 @@ body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1
 .chip.up{background:var(--done-soft);color:var(--done);border-color:transparent}
 .chip.down{background:var(--todo-soft);color:var(--todo);border-color:transparent}
 .chip.have{background:var(--accent-soft);color:var(--accent);border-color:transparent}
+.row.stranded{background:var(--warn-soft);border-radius:8px;
+  padding:8px 10px;margin-top:6px;align-items:start}
+.row.stranded .k{color:var(--warn)}
+.row.stranded code{font-size:.92em;word-break:break-all}
 .chip.warn{background:var(--warn-soft);color:var(--warn);border-color:transparent}
 .sw button.act{appearance:none;font:inherit;font-size:13px;padding:7px 14px;border-radius:8px;
   border:1px solid var(--line);background:var(--panel-2);color:var(--ink);cursor:pointer}
@@ -2163,6 +2161,8 @@ SETUP_JS = r"""
       var op=el('option',{value:t,text:lab}); if(t===val)op.selected=true; s.appendChild(op)});
     return s}
   function val(id){var n=$('#'+id); return n?n.value.trim():''}
+  function esc(x){var n=document.createElement('div'); n.textContent=x==null?'':x;
+    return n.innerHTML}
   function on(key){var c=document.querySelector('input[data-k="'+key+'"]'); return !c||c.checked}
 
   function diff(pre,text){
@@ -2264,17 +2264,55 @@ SETUP_JS = r"""
     names.forEach(function(k){ tl.appendChild(el('div',{},[
       el('span',{text:k+'  '}), el('span',{class:'p',text:E.tools[k]})])) });
 
-    var sb=$('#sw-secrets'); sb.textContent='';
-    [['JIRA_PAT','JIRA personal access token','user'],
-     ['GIT_PAT','git / forge PAT','user']].forEach(function(s){
-      mkSecret(sb,s[0],s[1],s[2],E.secrets_set.indexOf(s[0])>=0);
+  }
+
+  function renderSecrets(){
+    var sb=$('#sw-secrets'); if(!sb) return;
+    sb.textContent='';
+    $('#sw-secpath').textContent = E.context_env_path || '';
+    var set = E.context_secrets_set || [];
+    // The JIRA row follows whatever auth_env the config names, so renaming the
+    // variable does not orphan the token you already stored.
+    var jiraVar = ((E.project.jira_api||{}).auth_env) || 'JIRA_PAT';
+    var seen = {};
+    [[jiraVar,'JIRA — only needed to create issues over the API'],
+     ['GIT_PAT','git / forge PAT, for sessions that push']].forEach(function(s){
+      if(seen[s[0]]) return; seen[s[0]]=1;
+      mkSecret(sb,s[0],s[1],set.indexOf(s[0])>=0);
     });
     (E.project.contexts||[]).forEach(function(c){
-      if(c.auth_env) mkSecret(sb,c.auth_env,'token for provider "'+c.name+'"','project',
-        E.context_secrets_set.indexOf(c.auth_env)>=0);
+      if(c.auth_env && !seen[c.auth_env]){ seen[c.auth_env]=1;
+        mkSecret(sb,c.auth_env,'token for provider "'+c.name+'"',set.indexOf(c.auth_env)>=0); }
+    });
+    strandedRow(sb);
+  }
+  // Tokens used to live in a user-level file. Moving the store here would leave
+  // any of those reading as "not set" with nothing saying a value still exists
+  // somewhere, so say so, and offer to move it rather than make you find it.
+  function strandedRow(box){
+    var L = E.legacy_secrets || {}, vars = (L.vars||[]).filter(function(v){
+      return (E.context_secrets_set||[]).indexOf(v) < 0; });
+    if(!vars.length) return;
+    var msg=el('span',{class:'msg'});
+    var move=el('button',{class:'act primary',text:'Move '+(vars.length>1?vars.length+' tokens':vars[0])+' here'});
+    var row=el('div',{class:'row stranded'},[el('span',{}),
+      el('label',{class:'k',text:'left behind'}),
+      el('div',{class:'v'},[el('div',{class:'bar'},[move,msg]),
+        el('div',{class:'why',html:esc(vars.join(', '))+' still sits in the old user-level store'+
+          ' (<code>'+esc(L.path||'')+'</code>), which nothing reads any more.'+
+          ' Moving writes the value here first and only then drops the original.'})])]);
+    box.appendChild(row);
+    move.addEventListener('click',function(){
+      move.disabled=true; say2(msg,'moving…','');
+      api('/api/setup/migrate-secrets',{vars:vars}).then(function(d){
+        if(!d || !d.ok){ move.disabled=false;
+          say2(msg,(d&&(d.failed||[]).join('; '))||(d&&d.error)||'failed','err'); return; }
+        say2(msg,'moved','ok');
+        setTimeout(load, 600);        // re-read: the rows above now say "stored"
+      });
     });
   }
-  function mkSecret(box,varname,label,scope,isSet){
+  function mkSecret(box,varname,label,isSet){
     var i=inp('s-'+varname,'',isSet?'stored \u2014 type to replace':'paste to store','password');
     i.setAttribute('autocomplete','new-password'); i.setAttribute('spellcheck','false');
     var save=el('button',{class:'act',text:'Save'});
@@ -2285,13 +2323,12 @@ SETUP_JS = r"""
       el('label',{class:'k',text:varname}),
       el('div',{class:'v'},[i,
         el('div',{class:'bar'},[save,clr,st,msg]),
-        el('div',{class:'why',html:label+' \u00b7 written to <b>'+
-          (scope==='user'?E.secrets_path:E.context_env_path)+
-          '</b> (mode 0600) \u00b7 never displayed back, never in a repo, never on a command line'})])]);
+        el('div',{class:'why',html:label+' \u00b7 never displayed back, never committed, '+
+          'never on a command line'})])]);
     save.addEventListener('click',function(){
       if(!i.value){say2(msg,'nothing typed','err');return}
       save.disabled=true;
-      api('/api/setup/secret',{scope:scope,var:varname,value:i.value}).then(function(d){
+      api('/api/setup/secret',{var:varname,value:i.value}).then(function(d){
         save.disabled=false;
         if(!d.ok){say2(msg,d.error,'err');return}
         i.value=''; i.placeholder='stored \u2014 type to replace';
@@ -2300,7 +2337,7 @@ SETUP_JS = r"""
       });
     });
     clr.addEventListener('click',function(){
-      api('/api/setup/secret',{scope:scope,var:varname,value:null}).then(function(d){
+      api('/api/setup/secret',{var:varname,value:null}).then(function(d){
         if(!d.ok){say2(msg,d.error,'err');return}
         st.textContent='not set'; st.className='chip'; clr.disabled=true;
         i.placeholder='paste to store'; say2(msg,'cleared','ok');
@@ -2336,55 +2373,80 @@ SETUP_JS = r"""
       'off by default for every new project \u00b7 an Artifact leaves this machine, so turning '+
       'this on is a deliberate, visible config change'));
 
-    box.appendChild(row('jira_browse','JIRA browse URL',
-      inp('p-jb',P.jira_browse,'https://site.atlassian.net/browse/{key}'),
-      '<b>{key}</b> is substituted per phase \u00b7 link-out only: the browser session is the '+
-      'identity, so no JIRA credential is stored or needed', !!P.jira_browse));
-    box.appendChild(row('jira_create','JIRA create URL',
-      inp('p-jc',P.jira_create,'https://site.atlassian.net/secure/CreateIssueDetails!init.jspa?pid=1&issuetype=3&summary={summary}'),
-      '<b>{summary}</b> / <b>{description}</b> are substituted and URL-encoded', !!P.jira_create));
-
-    // Direct creation. Optional, and clearly marked so: without it the ticket
-    // route is the prefilled form above, which needs no token at all.
+    // ONE JIRA section. There were nine fields, seven of which are derivable
+    // from the site URL and the project key: the browse and create URLs, the
+    // API base, the API version and the auth style all follow from them. Asking
+    // for each separately made a two-field job look like a configuration
+    // project, and invited exactly the mismatches it then had to warn about.
     var A = P.jira_api || {};
-    var cloud = /\.atlassian\.net/.test(A.api_base || P.jira_browse || '');
-    // A.* carries server-side FALLBACKS when nothing is configured yet, so
-    // preferring them would have defaulted a Cloud site to bearer auth while
-    // the hint beside it said Cloud rejects bearer. Detection wins until you
-    // have actually saved a choice.
-    var set = !!A.api_base;
-    var defMode = set ? A.auth_mode : (cloud ? 'basic' : 'bearer');
-    var defVer  = set ? String(A.api_version) : (cloud ? '3' : '2');
+    var site = (A.api_base || (P.jira_browse||'').replace(/\/browse\/.*$/,'') || '').replace(/\/+$/,'');
+    var cloud = /\.atlassian\.net/i.test(site);
     box.appendChild(el('div',{class:'subhead',
-      html:'Create tickets directly <span class="quiet">— optional. Leave blank and the '+
-           'prefilled form above stays the route, using your browser session and no token.</span>'}));
-    box.appendChild(row('jira_api_base','JIRA base URL',
-      inp('p-jab',A.api_base,'https://site.atlassian.net'),
-      'the site root, no path · leave empty to keep direct creation off', !!A.api_base));
+      html:'JIRA <span class="quiet">— optional. Everything below is derived from these '+
+           'two; open Advanced only if your instance differs.</span>'}));
+    box.appendChild(row('jira_site','Site URL',
+      inp('p-jsite',site,'https://yoursite.atlassian.net'),
+      'the site root, no path \u00b7 gives you ticket links, a prefilled create form, '+
+      'and (with a token) direct creation', !!site));
     box.appendChild(row('jira_project_key','Project key',
       inp('p-jpk',A.project_key,'PROJ'),
-      'the prefix on every issue in the project, e.g. <b>PROJ</b> in PROJ-123', !!A.project_key));
-    box.appendChild(row('jira_issue_type','Issue type',
+      'the prefix on every issue, e.g. <b>PROJ</b> in PROJ-123', !!A.project_key));
+
+    var adv = el('details',{class:'advfold'});
+    adv.appendChild(el('summary',{text:'Advanced — issue type, auth, URL overrides'}));
+    var abox = el('div',{});
+    adv.appendChild(abox);
+    box.appendChild(adv);
+
+    abox.appendChild(row('jira_issue_type','Issue type',
       inp('p-jit',A.issue_type||'Task','Task'),
-      'must match a type your project accepts — Task, Story, Bug'));
-    box.appendChild(row('jira_api_version','API version',
-      sel('p-jav',defVer,
-          [{v:'3',l:'3 — JIRA Cloud'},{v:'2',l:'2 — Server / Data Center'}]),
-      cloud ? 'your URL looks like <b>JIRA Cloud</b>, so 3' : 'Cloud is 3, self-hosted is 2'));
-    box.appendChild(row('jira_auth_mode','Auth type',
-      sel('p-jam',defMode,
-          [{v:'basic',l:'basic — email + API token (Cloud)'},
-           {v:'bearer',l:'bearer — personal access token (Server/DC)'}]),
-      cloud ? '<b>Cloud rejects bearer tokens</b> — use basic with your Atlassian '+
-              'account email and an API token from id.atlassian.com'
-            : 'Server and Data Center take a PAT as a bearer token'));
-    box.appendChild(row('jira_auth_user','Account email',
+      'must be a type your project accepts \u2014 Task, Story, Bug'));
+    abox.appendChild(row('jira_auth_user','Account email',
       inp('p-jau',A.auth_user,'you@example.com'),
-      'basic auth only — the Atlassian account the API token belongs to', !!A.auth_user));
-    box.appendChild(row('jira_auth_env','Token variable',
+      'JIRA Cloud identifies an API token by the account it belongs to. Leave empty '+
+      'for a self-hosted instance, which uses a bearer token instead.', !!A.auth_user));
+    abox.appendChild(row('jira_auth_env','Token variable',
       inp('p-jae',A.auth_env||'JIRA_PAT','JIRA_PAT'),
-      'the NAME of the variable holding the token. Store its value on '+
-      '<b>This machine → Tokens</b>; it never goes in this file'));
+      'the NAME of the variable holding the token \u00b7 store its value under '+
+      '<b>Tokens</b> below'));
+    abox.appendChild(row('jira_browse','Browse URL override',
+      inp('p-jb',P.jira_browse,''),
+      'left empty this is <b>{site}/browse/{key}</b>', false));
+    abox.appendChild(row('jira_create','Create URL override',
+      inp('p-jc',P.jira_create,''),
+      'a prefilled create form \u00b7 needs the numeric <b>pid</b>, which the key alone '+
+      'cannot give, so paste one here if you want that route', !!P.jira_create));
+
+    // Derivation, shown as it happens so nothing is silently invented.
+    var derived = el('div',{class:'why derived'});
+    box.appendChild(derived);
+    function redraw(){
+      var u = val('p-jsite').replace(/\/+$/,''), k = val('p-jpk');
+      var c = /\.atlassian\.net/i.test(u);
+      if(!u){ derived.innerHTML = '<b>No site URL</b> \u2014 ticket keys will show as plain '+
+        'text, and creating a ticket is not offered.'; return; }
+      var line = 'Derived: browse <code>'+esc(u)+'/browse/'+esc(k||'{key}')+
+        '</code> \u00b7 API <code>'+esc(u)+'</code> v'+(c?3:2)+
+        ' \u00b7 auth <b>'+(c?'basic, with the account email':'bearer token')+'</b>'+
+        (c?' \u2014 Cloud rejects bearer tokens':'');
+      // Say whether creating an issue can ACTUALLY work. Listing what is derived
+      // and stopping there reads as readiness; a missing account email would
+      // then surface only as a 401, at the moment you tried to raise a ticket.
+      var envv = val('p-jae') || 'JIRA_PAT', miss = [];
+      if(!k) miss.push('a <b>project key</b>');
+      if((E.context_secrets_set||[]).indexOf(envv) < 0)
+        miss.push('a token in <b>'+esc(envv)+'</b> (Tokens, below)');
+      if(c && !val('p-jau')) miss.push('the <b>account email</b> the token belongs to');
+      derived.innerHTML = line + '<div class="ready '+(miss.length?'no':'yes')+'">'+
+        (miss.length
+          ? 'Create in JIRA stays off until you add '+miss.join(', and ')+'.'
+          : 'Create in JIRA is ready \u2014 issues will be raised in <b>'+esc(k)+'</b>.')+
+        '</div>';
+    }
+    ['p-jsite','p-jpk','p-jau','p-jae'].forEach(function(id){
+      var n=$('#'+id); if(n) n.addEventListener('input',redraw);
+    });
+    redraw();
 
     if(P.actions.length) $('#sw-actions').innerHTML =
       'This project defines <b>'+P.actions.length+'</b> run command(s): <code>'+
@@ -2438,15 +2500,23 @@ SETUP_JS = r"""
     if(on('owner')) f.owner=val('p-owner');
     if(on('start_date')) f.start_date=val('p-start');
     if(on('allow_artifact_publish')) f.allow_artifact_publish=$('#p-pub').checked;
-    if(on('jira_browse')) f.jira_browse=val('p-jb');
-    if(on('jira_create')) f.jira_create=val('p-jc');
-    if(on('jira_api_base')) f.jira_api_base=val('p-jab');
-    if(on('jira_project_key')) f.jira_project_key=val('p-jpk');
-    if(on('jira_issue_type')) f.jira_issue_type=val('p-jit');
-    if(on('jira_api_version')) f.jira_api_version=val('p-jav');
-    if(on('jira_auth_mode')) f.jira_auth_mode=val('p-jam');
-    if(on('jira_auth_user')) f.jira_auth_user=val('p-jau');
-    if(on('jira_auth_env')) f.jira_auth_env=val('p-jae');
+    // The two merged fields expand here, so progress.toml keeps its explicit
+    // keys and nothing downstream has to know they were derived.
+    var site = val('p-jsite').replace(/\/+$/,'');
+    var key  = val('p-jpk');
+    if(on('jira_site') && site){
+      var c = /\.atlassian\.net/i.test(site);
+      f.jira_api_base   = site;
+      f.jira_api_version= c ? '3' : '2';
+      f.jira_auth_mode  = (on('jira_auth_user') && val('p-jau')) ? 'basic' : 'bearer';
+      if(!val('p-jb')) f.jira_browse = site + '/browse/{key}';
+    }
+    if(on('jira_browse') && val('p-jb')) f.jira_browse = val('p-jb');
+    if(on('jira_create') && val('p-jc')) f.jira_create = val('p-jc');
+    if(on('jira_project_key')) f.jira_project_key = key;
+    if(on('jira_issue_type')) f.jira_issue_type = val('p-jit');
+    if(on('jira_auth_user')) f.jira_auth_user = val('p-jau');
+    if(on('jira_auth_env')) f.jira_auth_env = val('p-jae');
     return f;
   }
 
@@ -2463,7 +2533,7 @@ SETUP_JS = r"""
         $('#sw-ppath').textContent=d.config_path;
         if(d.config_error) say('#sw-pmsg','config unreadable: '+d.config_error,'err');
         $('#sw-host').value=(d.host_default||'127.0.0.1');
-        renderLocal(); renderProject(); renderProjects();
+        renderLocal(); renderProject(); renderProjects(); renderSecrets();
       });
   }
   document.addEventListener('click',function(ev){
@@ -2648,15 +2718,7 @@ def setup_page(token: str) -> str:
         'can still be selected — the session prompt is always copyable.</p>'
         '<div class="tool-list" id="sw-tools"></div></div>'
 
-        '<div class="card"><h2>Tokens</h2>'
-        '<p class="note">Typed here, stored in a 0600 file outside every repo, and '
-        '<b>never sent back to this page</b> — only "stored" or "not set". Config '
-        'references the variable <i>name</i>; the value reaches a launched session '
-        'by file path, never on a command line. These are exported into sessions you '
-        'start from this dashboard, for the agent to use. <b>JIRA links need no token</b> '
-        '— browse and create open in your browser, which already has your session. '
-        'Set the JIRA <i>URLs</i> on the project tab to make ticket links appear.</p>'
-        '<div id="sw-secrets"></div></div></div>'
+        '</div>'
 
         '<div class="pane" id="pane-proj">'
         '<div class="card"><h2>Project</h2>'
@@ -2695,6 +2757,15 @@ def setup_page(token: str) -> str:
         '<span class="msg" id="sw-imsg"></span></div>'
         '<pre class="diff" id="sw-ilog" style="display:none"></pre></div>'
 
+        '<div class="card"><h2>Tokens</h2>'
+        '<p class="note">Stored in <code id="sw-secpath">…</code> — gitignored, mode 0600, '
+        'and <b>never sent back to this page</b>: only "stored" or "not set". The config '
+        'above holds the variable <i>name</i>; the value reaches a launched session by '
+        'file path, never on a command line. <b>Ticket links need no token</b> — browse '
+        'and the prefilled create form open in your browser, which already has your '
+        'session. A token is only needed to create issues over the API.</p>'
+        '<div id="sw-secrets"></div></div>'
+
         '<div class="card sticky-save" id="sw-writecard">'
         '<div class="bar"><button class="act pri" id="sw-apply">Save config</button>'
         '<button class="act" id="sw-preview">Preview</button>'
@@ -2727,15 +2798,59 @@ def setup_local(body: dict) -> dict:
     return {"ok": True, "path": str(p)}
 
 
+def legacy_secrets() -> dict:
+    """Tokens still sitting in the old user-level file.
+
+    Moving storage to the project would otherwise strand them silently: the
+    variable would read as unset with no hint that a value exists elsewhere.
+    Names only — the values are not read here.
+    """
+    p = _pr.user_secrets_path()
+    return {"path": str(p), "vars": _pr.loaded_secret_names(p) if p.exists() else []}
+
+
+def migrate_secrets(names: list) -> dict:
+    """Move named tokens from the old user file into the project's.
+
+    The value passes through this process and is written straight out; it is
+    never logged, never returned, and never shown. The source line is removed
+    only after the destination write succeeds, so a failure cannot lose it.
+    """
+    src, dst = _pr.user_secrets_path(), project_secrets_path()
+    if not src.exists():
+        return {"ok": False, "error": "there is no user-level secrets file"}
+    have = set(_pr.loaded_secret_names(src))
+    moved, failed = [], []
+    for var in [str(n) for n in (names or [])]:
+        if var not in have:
+            failed.append(f"{var}: not in the old file")
+            continue
+        try:
+            val = None
+            pat = re.compile(r"^\s*" + re.escape(var) + r"\s*=\s*(.*?)\s*$")
+            for line in src.read_text(encoding="utf-8").splitlines():
+                m = pat.match(line)
+                if m and m.group(1):
+                    val = m.group(1).strip().strip('"').strip("'")
+            if val is None:
+                failed.append(f"{var}: empty")
+                continue
+            _pr.write_secret(dst, var, val)          # destination first
+            _pr.write_secret(src, var, None)         # then drop the original
+            moved.append(var)
+        except (OSError, ValueError) as exc:
+            failed.append(f"{var}: {exc}")
+    return {"ok": not failed, "moved": moved, "failed": failed, "path": str(dst)}
+
+
 def setup_secret(body: dict) -> dict:
-    """Store or clear one token. Values go in, names come out — never the value."""
-    scope = body.get("scope")
-    if scope == "user":
-        path = _pr.user_secrets_path()
-    elif scope == "project":
-        path = REPO / "secrets" / "context.env"
-    else:
-        return {"ok": False, "error": "scope must be user or project"}
+    """Store or clear one token. Values go in, names come out — never the value.
+
+    One destination now: the project's gitignored env file. There is no scope
+    to pick, because there was never a good answer to which one a given token
+    belonged in — and two files meant two places to look when one was empty.
+    """
+    path = project_secrets_path()
     val = body.get("value")
     if val is not None:
         val = str(val).strip()
@@ -2910,6 +3025,7 @@ class Handler(BaseHTTPRequestHandler):
                               "configured": alive and (pp / "docs" / "progress.toml").exists(),
                               "state": project_trust(pp.resolve()) if alive else "missing",
                               "current": pp.resolve() == REPO if alive else False})
+            d["legacy_secrets"] = legacy_secrets()
             d["projects"] = projs
             d["project_registry"] = str(_pr.projects_path())
             self._json(d)
@@ -2995,6 +3111,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/setup/local":
             self._json(setup_local(body))
+            return
+
+        if path == "/api/setup/migrate-secrets":
+            self._json(migrate_secrets(body.get("vars") or []))
             return
 
         if path == "/api/setup/secret":

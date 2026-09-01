@@ -83,11 +83,19 @@ python progress-serve.py --repo /path/to/project
 ```
 
 With no `docs/progress.toml` it opens on **`/setup`**, whose two tabs are
-*This machine* (your name, tool, shell, checkout path, tokens — written outside
-every repo) and *This project* (name, plan file, owner, integrations — written to
-the committed config). Every autodiscovered value shows the evidence behind it and
+*This machine* (your name, tool, shell, checkout path — written to a profile
+outside every repo) and *This project* (name, plan file, owner, integrations and
+tokens — the first three written to the committed config, tokens to a gitignored
+env file beside it). Every autodiscovered value shows the evidence behind it and
 can be changed or switched off. Nothing reaches the committed config until you
 preview the diff.
+
+JIRA asks for two things: the site URL and the project key. The browse URL,
+create URL, API base, API version and auth mode are derived from them and shown
+as they are derived; Advanced holds the overrides for an instance that differs.
+The block ends with whether creating an issue can actually work, and names what
+is missing if it cannot — otherwise an absent account email surfaces only as a
+401, at the moment you try to raise a ticket.
 
 Or from a terminal, for scripted installs:
 

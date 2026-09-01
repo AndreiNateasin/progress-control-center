@@ -119,7 +119,7 @@ usage_rules       = "Cite sources; verify claims against the canonical source."
 ## Personal vs shared
 
 `docs/progress.toml` is **committed**, so it holds only the team roster — who exists
-and their default tool. Anything personal goes to a profile in your user config
+and their default tool. Who *you* are goes to a profile in your user config
 directory, outside every repo:
 
 ```toml
@@ -150,6 +150,19 @@ this stays a stdlib renderer with no client of its own.
 
 Secrets travel by `${VAR}` reference. The value stays in a gitignored env file and
 is expanded by the agent's own MCP client.
+
+## Tokens live with the project, not with you
+
+One project, one env file — `secrets/context.env` beside the config, gitignored.
+They used to be split, JIRA and git PATs in a user-level file and provider tokens
+in the project, which meant two places to look and a token whose scope did not
+match the config that named it. Config still only ever holds the variable NAME.
+
+Because the store moved, a token left in the old user-level file would read as
+"not set" with nothing to say a value still exists elsewhere. The wizard reports
+it by name and offers to move it: the destination is written first and the
+original dropped only after that succeeds, so an interrupted move duplicates a
+token rather than losing one.
 
 ## Tickets are drafted by a coding session
 

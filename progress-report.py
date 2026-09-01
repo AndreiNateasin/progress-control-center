@@ -3,7 +3,7 @@
 
     python3 scripts/progress-report.py [-o OUT.html] [--json]
 
-Progress is DERIVED, never stored. Checkbox state is read from ANU-PLAN.md §6 and
+Progress is DERIVED, never stored. Checkbox state is read from PLAN.md §6 and
 from docs/PHASE-*.md; docs/progress.toml supplies only what markdown cannot express
 (dependencies, effort, lead times). Tick a box in the plan and the report moves.
 
@@ -51,7 +51,7 @@ def resolve_repo(explicit: str | None = None) -> Path:
         return Path(env).resolve()
     try:
         r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, **TEXT_IO)
         top = (r.stdout or "").strip()
         if r.returncode == 0 and top and (Path(top) / "docs" / "progress.toml").exists():
             return Path(top).resolve()
@@ -133,8 +133,8 @@ def setup_wizard(repo: Path, non_interactive: bool = False) -> int:
     where your checkout is, and optionally takes a JIRA / git PAT.
 
     Secrets are read with getpass — never echoed, never in shell history, never
-    written to the repo. They land in a 0600 env file under your user config
-    dir, and every config reference to them is the variable NAME.
+    written to the repo. They land in a 0600 env file inside the project (the
+    gitignored one), and every config reference to them is the variable NAME.
     """
     import getpass
     import platform
@@ -151,7 +151,7 @@ def setup_wizard(repo: Path, non_interactive: bool = False) -> int:
     default_tool = next(iter(tools), "claude")
     try:
         git_name = subprocess.run(["git", "-C", str(repo), "config", "user.name"],
-                                  capture_output=True, text=True, timeout=10).stdout.strip()
+                                  capture_output=True, text=True, timeout=10, **TEXT_IO).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         git_name = ""
 
@@ -181,9 +181,10 @@ def setup_wizard(repo: Path, non_interactive: bool = False) -> int:
         return 0
 
     print("\n  Tokens (optional — press Enter to skip). Input is hidden and is")
-    print("  stored outside the repo; config only ever references the NAME.")
+    print("  stored in this project's gitignored env file; config only ever")
+    print("  references the NAME, never the value.")
     secrets_written = []
-    envp = user_secrets_path()
+    envp = project_secrets_path(repo, _load_cfg_quietly(repo))
     for var, label in (("JIRA_PAT", "JIRA personal access token"),
                        ("GIT_PAT", "git / GitHub PAT")):
         try:
@@ -318,7 +319,7 @@ def discover_services(repo: Path, write: bool = False, host: str = "127.0.0.1") 
 
 def _toml_str(v: str) -> str:
     r"""TOML string literal. Windows paths get a single-quoted LITERAL string so
-    C:\ai\anu stays readable instead of becoming C:\\ai\\anu."""
+    C:\src\myproject stays readable instead of becoming C:\\src\\myproject."""
     v = str(v)
     if "\\" in v and "'" not in v and "\n" not in v:
         return "'" + v + "'"
@@ -520,8 +521,43 @@ def forget_project(path: str) -> None:
                    if Path(e["path"]).as_posix().lower() != want])
 
 
+def _load_cfg_quietly(repo: Path) -> dict:
+    """[project] table only, or {} — for callers that need a path, not a contract."""
+    f = Path(repo) / "docs" / "progress.toml"
+    try:
+        return (tomllib.loads(f.read_text(encoding="utf-8")) or {}).get("project", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+# Subprocess output is UTF-8 — git's is, always — but Python decodes text=True
+# with the ANSI codepage on Windows, which turned every em-dash in a commit
+# subject into "â€”" on the rendered page. Pass this to every call that
+# decodes; `errors="replace"` because a mangled byte must not take the page down.
+TEXT_IO = {"encoding": "utf-8", "errors": "replace"}
+
+
 def user_secrets_path() -> Path:
+    """The OLD token store, kept only so a token left here can be found and moved.
+
+    Nothing writes here any more — see project_secrets_path().
+    """
     return user_config_dir() / "secrets.env"
+
+
+def project_secrets_path(repo: Path, cfg: dict | None = None) -> Path:
+    """The ONE file tokens live in: gitignored, inside the project they serve.
+
+    They used to be split — JIRA and git PATs in a user-level file, provider
+    tokens in the project — which meant two places to look, and a token whose
+    scope did not match the config that named it. One project, one env file.
+    """
+    cfg = cfg or {}
+    ctx = (cfg.get("context_env_file")
+           or (cfg.get("context_settings") or {}).get("env_file")
+           or "secrets/context.env")
+    cand = (Path(repo) / ctx).resolve()
+    return cand if Path(repo).resolve() in cand.parents else Path(repo) / "secrets" / "context.env"
 
 
 def write_secret(path: Path, var: str, value: str | None) -> Path:
@@ -577,7 +613,7 @@ def write_user_profile(prof: dict) -> Path:
 
 def plan_candidates(repo: Path) -> list[dict]:
     """Every root markdown file that could be the plan, with its checkbox count.
-    The wizard shows this list because '--init picked ANU-PLAN.md' is a guess,
+    The wizard shows this list because '--init picked PLAN.md' is a guess,
     and a wrong guess renders 0% forever rather than failing loudly."""
     out = []
     for md in sorted(repo.glob("*.md")):
@@ -615,7 +651,7 @@ def detect_environment(repo: Path) -> dict:
     for key, sink in (("user.name", "n"), ("user.email", "e")):
         try:
             v = subprocess.run(["git", "-C", str(repo), "config", key],
-                               capture_output=True, text=True, timeout=10).stdout.strip()
+                               capture_output=True, text=True, timeout=10, **TEXT_IO).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             v = ""
         if sink == "n":
@@ -636,8 +672,9 @@ def detect_environment(repo: Path) -> dict:
         "config_path": str(cfgp),
         "config_error": cfg.get("__error__", ""),
         "profile_path": str(user_config_dir() / "profile.toml"),
-        "secrets_path": str(user_secrets_path()),
-        "context_env_path": str(repo / "secrets" / "context.env"),
+        "secrets_path": str(project_secrets_path(repo, cfg)),
+        "legacy_secrets_path": str(user_secrets_path()),
+        "context_env_path": str(project_secrets_path(repo, cfg)),
         "platform": sysname,
         "host": platform.node(),
         "python": sys.version.split()[0],
@@ -645,8 +682,9 @@ def detect_environment(repo: Path) -> dict:
                 "is_repo": (repo / ".git").exists()},
         "tools": tools,
         "shells": ["powershell", "bash"],
-        "secrets_set": loaded_secret_names(user_secrets_path()),
-        "context_secrets_set": loaded_secret_names(repo / "secrets" / "context.env"),
+        "secrets_set": loaded_secret_names(project_secrets_path(repo, cfg)),
+        "legacy_secrets_set": loaded_secret_names(user_secrets_path()),
+        "context_secrets_set": loaded_secret_names(project_secrets_path(repo, cfg)),
         # --- local scope: assumption -> {value, why, saved, options} ----------
         # `why` is ALWAYS the live evidence, never "your profile". A saved answer
         # sets `saved` instead, so the UI can show both — otherwise the moment you
@@ -813,7 +851,7 @@ def check_config(repo: Path) -> int:
     for key in ("name", "start_date"):
         if not proj.get(key):
             problems.append(f"[project] is missing required key {key!r}")
-    plan_rel = proj.get("plan", "ANU-PLAN.md")
+    plan_rel = proj.get("plan", "PLAN.md")
     plan_p = repo / plan_rel
     sections: dict[str, str] = {}
     if not plan_p.exists():
@@ -1013,7 +1051,7 @@ def scaffold_init(target: Path, name: str | None, *, owner: str | None = None,
     if not owner:
         try:
             r = subprocess.run(["git", "-C", str(target), "config", "user.name"],
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, **TEXT_IO)
             owner = (r.stdout or "").strip()
         except (OSError, subprocess.SubprocessError):
             owner = ""
@@ -1171,7 +1209,7 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
 
 
 def plan_phase_sections(plan_text: str) -> dict[str, str]:
-    """Split ANU-PLAN.md §6 into {phase_id: section_text}."""
+    """Split PLAN.md §6 into {phase_id: section_text}."""
     sections: dict[str, str] = {}
     pat = re.compile(r"^###\s+Phase\s+([0-9A-Za-z]+)\s*[—\-–]\s*(.*)$", re.M)
     # Bound each phase at the next heading of ANY level. Without this the LAST
@@ -1274,7 +1312,7 @@ def phase_item_prompt_tmpl(p: dict, plan_name: str, providers: list) -> str:
 def git(*args: str) -> str:
     try:
         return subprocess.run(["git", "-C", str(REPO), *args],
-                              capture_output=True, text=True, timeout=20).stdout.strip()
+                              capture_output=True, text=True, timeout=20, **TEXT_IO).stdout.strip()
     except Exception:
         return ""
 
@@ -1367,7 +1405,7 @@ def _overlay_user_profile(devs: list, repo: Path) -> list:
 def build(repo: Path) -> dict:
     cfg = tomllib.loads((repo / "docs" / "progress.toml").read_text(encoding="utf-8"))
     proj = cfg["project"]
-    plan_text = (repo / proj.get("plan", "ANU-PLAN.md")).read_text(encoding="utf-8", errors="replace")
+    plan_text = (repo / proj.get("plan", "PLAN.md")).read_text(encoding="utf-8", errors="replace")
     sections = plan_phase_sections(plan_text)
 
     phases = []
@@ -1383,7 +1421,7 @@ def build(repo: Path) -> dict:
             items = parse_checklist((repo / doc).read_text(encoding="utf-8", errors="replace"), doc)
             src = doc
         if not items and pid in sections:
-            items = parse_checklist(sections[pid], proj.get("plan", "ANU-PLAN.md"))
+            items = parse_checklist(sections[pid], proj.get("plan", "PLAN.md"))
             src = f"{proj.get('plan')} §6"
 
         done = sum(1 for i in items if i["state"] == "done")
@@ -1814,10 +1852,10 @@ li.item[data-s="done"] .lbl{color:var(--ink-3);text-decoration:line-through;
   background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:9px 11px;
   margin-top:6px;max-height:200px;overflow:auto}
 .istate{display:inline-flex;margin-left:4px}
-.istate .anu-btn{border-radius:0;margin-left:-1px}
-.istate .anu-btn:first-child{border-radius:7px 0 0 7px;margin-left:0}
-.istate .anu-btn:last-child{border-radius:0 7px 7px 0}
-.istate .anu-btn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.istate .pcc-btn{border-radius:0;margin-left:-1px}
+.istate .pcc-btn:first-child{border-radius:7px 0 0 7px;margin-left:0}
+.istate .pcc-btn:last-child{border-radius:0 7px 7px 0}
+.istate .pcc-btn.on{background:var(--accent);border-color:var(--accent);color:#fff}
 
 /* filter chips: the old "Start work" tab was this list with one predicate. */
 .filters{display:flex;gap:4px;margin-left:auto}
@@ -2272,7 +2310,7 @@ def render(d: dict) -> str:
     by_id_r = {p["id"]: p for p in d["phases"]}
 
     def jira_link(p: dict) -> str:
-        """Ticket pill for a phase. `jira` on the phase is a key ('ANU-12') or a
+        """Ticket pill for a phase. `jira` on the phase is a key ('PROJ-12') or a
         full URL; [integrations.jira].browse_url turns keys into links. A key
         with no template still renders, just unlinked — degrade, never crash."""
         key = p.get("jira")
@@ -2962,7 +3000,7 @@ def main() -> int:
             tgt = Path(a.repo)
         else:
             r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, **TEXT_IO)
             tgt = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else Path.cwd()
         return scaffold_init(tgt, a.name, owner=a.owner,
                              jira_base=a.jira_base, jira_project=a.jira_project,
@@ -2992,10 +3030,10 @@ def main() -> int:
             watch = [REPO / "docs" / "progress.toml"]
             try:
                 cfg = tomllib.loads((REPO / "docs" / "progress.toml").read_text(encoding="utf-8"))
-                watch.append(REPO / cfg.get("project", {}).get("plan", "ANU-PLAN.md"))
+                watch.append(REPO / cfg.get("project", {}).get("plan", "PLAN.md"))
                 watch += [REPO / p["doc"] for p in cfg.get("phase", []) if p.get("doc")]
             except (OSError, tomllib.TOMLDecodeError):
-                watch.append(REPO / "ANU-PLAN.md")
+                watch.append(REPO / "PLAN.md")
             watch += list((REPO / "docs").glob("PHASE-*.md"))
             newest = 0.0
             for src in watch:
