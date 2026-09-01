@@ -2065,6 +2065,11 @@ body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1
 .row:first-of-type{border-top:0}
 .row.off > *:not(:first-child){opacity:.4}
 .row label.k{font-size:14px;padding-top:5px}
+/* a divider inside a card: these rows are one optional feature, not more of the
+   same list, and running them together made the card read as endless */
+.subhead{margin:22px 0 2px;padding-top:16px;border-top:1px solid var(--line);
+  font-size:14px;font-weight:600}
+.subhead .quiet{font-weight:400;color:var(--ink-3);font-size:12.5px}
 .row .v input[type=text],.row .v input[type=date],.row .v input[type=password],.row .v select{
   width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;
   background:var(--bg);color:var(--ink);font:inherit;font-size:13.5px}
@@ -2339,6 +2344,48 @@ SETUP_JS = r"""
       inp('p-jc',P.jira_create,'https://site.atlassian.net/secure/CreateIssueDetails!init.jspa?pid=1&issuetype=3&summary={summary}'),
       '<b>{summary}</b> / <b>{description}</b> are substituted and URL-encoded', !!P.jira_create));
 
+    // Direct creation. Optional, and clearly marked so: without it the ticket
+    // route is the prefilled form above, which needs no token at all.
+    var A = P.jira_api || {};
+    var cloud = /\.atlassian\.net/.test(A.api_base || P.jira_browse || '');
+    // A.* carries server-side FALLBACKS when nothing is configured yet, so
+    // preferring them would have defaulted a Cloud site to bearer auth while
+    // the hint beside it said Cloud rejects bearer. Detection wins until you
+    // have actually saved a choice.
+    var set = !!A.api_base;
+    var defMode = set ? A.auth_mode : (cloud ? 'basic' : 'bearer');
+    var defVer  = set ? String(A.api_version) : (cloud ? '3' : '2');
+    box.appendChild(el('div',{class:'subhead',
+      html:'Create tickets directly <span class="quiet">— optional. Leave blank and the '+
+           'prefilled form above stays the route, using your browser session and no token.</span>'}));
+    box.appendChild(row('jira_api_base','JIRA base URL',
+      inp('p-jab',A.api_base,'https://site.atlassian.net'),
+      'the site root, no path · leave empty to keep direct creation off', !!A.api_base));
+    box.appendChild(row('jira_project_key','Project key',
+      inp('p-jpk',A.project_key,'PROJ'),
+      'the prefix on every issue in the project, e.g. <b>PROJ</b> in PROJ-123', !!A.project_key));
+    box.appendChild(row('jira_issue_type','Issue type',
+      inp('p-jit',A.issue_type||'Task','Task'),
+      'must match a type your project accepts — Task, Story, Bug'));
+    box.appendChild(row('jira_api_version','API version',
+      sel('p-jav',defVer,
+          [{v:'3',l:'3 — JIRA Cloud'},{v:'2',l:'2 — Server / Data Center'}]),
+      cloud ? 'your URL looks like <b>JIRA Cloud</b>, so 3' : 'Cloud is 3, self-hosted is 2'));
+    box.appendChild(row('jira_auth_mode','Auth type',
+      sel('p-jam',defMode,
+          [{v:'basic',l:'basic — email + API token (Cloud)'},
+           {v:'bearer',l:'bearer — personal access token (Server/DC)'}]),
+      cloud ? '<b>Cloud rejects bearer tokens</b> — use basic with your Atlassian '+
+              'account email and an API token from id.atlassian.com'
+            : 'Server and Data Center take a PAT as a bearer token'));
+    box.appendChild(row('jira_auth_user','Account email',
+      inp('p-jau',A.auth_user,'you@example.com'),
+      'basic auth only — the Atlassian account the API token belongs to', !!A.auth_user));
+    box.appendChild(row('jira_auth_env','Token variable',
+      inp('p-jae',A.auth_env||'JIRA_PAT','JIRA_PAT'),
+      'the NAME of the variable holding the token. Store its value on '+
+      '<b>This machine → Tokens</b>; it never goes in this file'));
+
     if(P.actions.length) $('#sw-actions').innerHTML =
       'This project defines <b>'+P.actions.length+'</b> run command(s): <code>'+
       P.actions.join('</code> <code>')+'</code>. The wizard cannot add or change those \u2014 '+
@@ -2393,6 +2440,13 @@ SETUP_JS = r"""
     if(on('allow_artifact_publish')) f.allow_artifact_publish=$('#p-pub').checked;
     if(on('jira_browse')) f.jira_browse=val('p-jb');
     if(on('jira_create')) f.jira_create=val('p-jc');
+    if(on('jira_api_base')) f.jira_api_base=val('p-jab');
+    if(on('jira_project_key')) f.jira_project_key=val('p-jpk');
+    if(on('jira_issue_type')) f.jira_issue_type=val('p-jit');
+    if(on('jira_api_version')) f.jira_api_version=val('p-jav');
+    if(on('jira_auth_mode')) f.jira_auth_mode=val('p-jam');
+    if(on('jira_auth_user')) f.jira_auth_user=val('p-jau');
+    if(on('jira_auth_env')) f.jira_auth_env=val('p-jae');
     return f;
   }
 

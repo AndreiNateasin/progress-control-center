@@ -677,6 +677,11 @@ def detect_environment(repo: Path) -> dict:
             "allow_artifact_publish": bool(proj.get("allow_artifact_publish", False)),
             "jira_browse": ((cfg.get("integrations", {}) or {}).get("jira", {}) or {}).get("browse_url", ""),
             "jira_create": ((cfg.get("integrations", {}) or {}).get("jira", {}) or {}).get("create_url", ""),
+            "jira_api": {k: ((cfg.get("integrations", {}) or {}).get("jira", {}) or {}).get(k, d)
+                         for k, d in (("api_base", ""), ("project_key", ""),
+                                      ("issue_type", "Task"), ("api_version", 3),
+                                      ("auth_env", "JIRA_PAT"), ("auth_mode", "bearer"),
+                                      ("auth_user", ""))},
             "developers": [{"name": d.get("name", ""), "tool": d.get("tool", ""),
                             "shell": d.get("shell", "")} for d in cfg.get("developer", [])],
             "contexts": [{"name": c.get("name", ""), "label": c.get("label", ""),
@@ -698,8 +703,21 @@ PROJECT_FIELDS = {
     "allow_artifact_publish": ("[project]", bool),
     "jira_browse": ("[integrations.jira]", str),
     "jira_create": ("[integrations.jira]", str),
+    # Direct API creation. Optional: without these the ticket route stays the
+    # credential-free prefilled form, which needs no token at all.
+    "jira_api_base": ("[integrations.jira]", str),
+    "jira_project_key": ("[integrations.jira]", str),
+    "jira_issue_type": ("[integrations.jira]", str),
+    "jira_api_version": ("[integrations.jira]", int),
+    "jira_auth_env": ("[integrations.jira]", str),
+    "jira_auth_mode": ("[integrations.jira]", str),
+    "jira_auth_user": ("[integrations.jira]", str),
 }
-_KEYNAME = {"jira_browse": "browse_url", "jira_create": "create_url"}
+_KEYNAME = {"jira_browse": "browse_url", "jira_create": "create_url",
+            "jira_api_base": "api_base", "jira_project_key": "project_key",
+            "jira_issue_type": "issue_type", "jira_api_version": "api_version",
+            "jira_auth_env": "auth_env", "jira_auth_mode": "auth_mode",
+            "jira_auth_user": "auth_user"}
 
 
 def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
@@ -721,7 +739,15 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
         if key not in PROJECT_FIELDS:
             return {"ok": False, "error": f"field {key!r} is not writable from the wizard"}
         header, typ = PROJECT_FIELDS[key]
-        val = bool(val) if typ is bool else str(val)
+        if typ is bool:
+            val = bool(val)
+        elif typ is int:
+            try:
+                val = int(str(val).strip())
+            except ValueError:
+                return {"ok": False, "error": f"{_KEYNAME.get(key, key)} must be a whole number"}
+        else:
+            val = str(val)
         if typ is str and not val.strip():
             continue                                   # empty means "leave alone"
         # Already correct? Leave the author's line exactly as written. Rewriting
