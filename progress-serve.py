@@ -2557,30 +2557,29 @@ SETUP_JS = r"""
     var P=E.project, box=$('#sw-proj'); box.textContent='';
     box.appendChild(row('name','Project name',inp('p-name',P.name,'shown in every report'),
       'currently <b>'+(P.name||'unset')+'</b>'));
-    var cands=P.plan_candidates.map(function(c){
-      return {v:c.file,l:c.file+'   ('+c.checkboxes+' checkbox'+(c.checkboxes===1?'':'es')+')'}});
-    if(!cands.some(function(c){return c.v===P.plan})) cands.unshift({v:P.plan,l:P.plan});
     var best=P.plan_candidates[0];
-    // cands is already {v,l} for the <select>; the checkbox counts stay on
-    // P.plan_candidates as {file,checkboxes}. Reading .file off cands matched
-    // nothing and quietly pushed a value-less option to the top of the list.
+    // The checkbox counts live on P.plan_candidates as {file,checkboxes}.
     var RAW = P.plan_candidates || [];
     function boxesFor(f){
       for(var i=0;i<RAW.length;i++){ if(RAW[i].file === f) return RAW[i].checkboxes }
       return null;
     }
-    // The scan reaches below the root now, which in a big repo means hundreds of
-    // candidates - a select that long is not a chooser. So: the strongest few in
-    // the list, a browser for everything else, and the current value kept
-    // selectable even when it did not make the cut.
-    var TOP = 25;
-    var shortlist = cands.slice(0, TOP);
-    if(P.plan && !shortlist.some(function(c){ return c.v === P.plan })){
-      var mine = cands.filter(function(c){ return c.v === P.plan })[0];
-      shortlist.unshift(mine || {v:P.plan, l:P.plan});
-    }
-    var planSel = sel('p-plan', P.plan, shortlist);
-    var planWrap = el('div',{},[planSel]);
+    // Type-to-search across EVERYTHING the scan found. An <input> backed by
+    // a <datalist> is the native combobox: the browser filters the entries as
+    // you type, so the shortlist cap a plain <select> needed goes away, and a
+    // path can also simply be pasted. Browse and Rescan stay for the rest.
+    var planSel = inp('p-plan', P.plan, 'type to search '+RAW.length+' files…');
+    planSel.setAttribute('list','p-plan-dl');
+    planSel.setAttribute('autocomplete','off');
+    planSel.setAttribute('spellcheck','false');
+    var dl = el('datalist',{id:'p-plan-dl'});
+    RAW.forEach(function(c){
+      var o = document.createElement('option');
+      o.value = c.file;
+      o.label = c.checkboxes + ' checkbox' + (c.checkboxes===1?'':'es');
+      dl.appendChild(o);
+    });
+    var planWrap = el('div',{},[planSel,dl]);
     var planBar = el('div',{class:'bar'});
     planWrap.appendChild(planBar);
     planBar.appendChild(pathPicker(planSel,'md',E.repo));
