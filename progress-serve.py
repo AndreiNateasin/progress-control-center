@@ -1429,227 +1429,6 @@ JS = r"""
   // rows, two independent tool selects that disagreed with each other. The
   // launcher belongs in exactly one place: the action row. Here we only make
   // the raw prompt collapsible, since it is reference material, not the control.
-  // ---------------------------------------------------------- tickets -------
-  // Drafting is delegated to a CODING SESSION, not done here. The session
-  // already has the repo, the plan, the phase doc and the context providers,
-  // and it already routes through whichever model you configured — so the
-  // dashboard stays a stdlib renderer with no LLM client, no second model
-  // config and no extra credential. It asks for a draft, the session writes
-  // .pcc/ticket-<phase>.json, this picks it up.
-  function ticketControls(p, act, say, host){
-    if(p.jira) return;                       // already linked: nothing to create
-
-    // Drafting needs a launcher that can RUN and write a file. Offering it with
-    // a clipboard-only app selected produced a button that opened the app and
-    // then waited forever for a draft that could never be written.
-    var terms = terminalTools();
-    var draft = document.createElement('button');
-    draft.className = 'anu-btn'; draft.textContent = 'Draft ticket';
-    if(!terms.length){
-      draft.disabled = true;
-      draft.title = 'Needs a terminal launcher (claude or opencode) — none found on this machine';
-    } else {
-      draft.title = 'Ask the selected terminal tool to write a ticket from this phase, ' +
-                    'then review it here before anything is created';
-      draft.addEventListener('click', function(){
-        // Resolve the tool AT CLICK TIME from the row's select, so changing it
-        // takes effect. Frozen at wiring time it ignored the picker entirely.
-        var sel = act.querySelector('select');
-        var want = sel && sel.value;
-        var dtool = (want && terms.indexOf(want) >= 0) ? want
-                  : (terms.indexOf(preferredTool()) >= 0 ? preferredTool() : terms[0]);
-        draft.disabled = true; say('asking ' + LN[dtool].label + ' to draft it…');
-        api('/api/phase/draft-ticket', {phase: p.id, tool: dtool})
-          .then(function(d){
-            draft.disabled = false;
-            if(!d.ok){ say(d.error, 'err'); return; }
-            say(d.note || 'session started — it will write the draft; press Load draft when done');
-            watchDraft(p, act, say, host);
-          });
-      });
-    }
-    act.appendChild(draft);
-
-    var load = document.createElement('button');
-    load.className = 'anu-btn'; load.textContent = 'Load draft';
-    load.title = 'Read .pcc/ticket-' + p.id + '.json if a session has written it';
-    load.addEventListener('click', function(){ loadDraft(p, act, say, host, true); });
-    act.appendChild(load);
-
-    var inp = document.createElement('input');
-    inp.type = 'text'; inp.placeholder = 'PROJ-123'; inp.className = 'anu-btn';
-    inp.style.width = '110px'; inp.style.cursor = 'text';
-    var lk = document.createElement('button');
-    lk.className = 'anu-btn'; lk.textContent = 'Link ticket';
-    lk.title = 'Record an EXISTING ticket key on this phase (docs/progress.toml)';
-    function doLink(){
-      if(!inp.value.trim()){
-        say('type the key of a ticket that already exists (e.g. PROJ-123), or ' +
-            'use Draft ticket to create one', 'err');
-        inp.focus(); return;
-      }
-      lk.disabled = true;
-      api('/api/phase/jira', {phase: p.id, key: inp.value}).then(function(d){
-        lk.disabled = false;
-        if(!d.ok){ say(d.error, 'err'); return; }
-        say('linked ' + d.key + ' — reload to see the pill everywhere', 'ok');
-        window.__PCC_PHASES__[p.id].jira = d.key;
-      });
-    }
-    lk.addEventListener('click', doLink);
-    inp.addEventListener('keydown', function(ev){ if(ev.key === 'Enter') doLink(); });
-    act.appendChild(inp); act.appendChild(lk);
-
-    loadDraft(p, act, say, host, false, function(found){
-      if(!found) resumeWatch(p, act, say, host);   // a reload mid-drafting resumes
-    });
-  }
-
-  // Watch for the draft the session is writing. Recorded in sessionStorage so a
-  // reload mid-drafting resumes the watch instead of leaving you to remember to
-  // press Load draft — the session takes minutes, and nobody sits on the page.
-  function watchDraft(p, act, say, host){
-    try { sessionStorage['pccDraftWatch:' + p.id] = String(Date.now()); } catch(e){}
-    pollDraft(p, act, say, host);
-  }
-  function pollDraft(p, act, say, host){
-    var tries = 0, iv = 4000;
-    (function poll(){
-      if(++tries > 300) { clearWatch(p); return; }     // ~20 min, then give up
-      setTimeout(function(){
-        loadDraft(p, act, say, host, false, function(found){
-          if(found){ clearWatch(p); say('draft picked up automatically — review it below', 'ok'); }
-          else poll();
-        });
-      }, iv);
-    })();
-  }
-  function clearWatch(p){
-    try { delete sessionStorage['pccDraftWatch:' + p.id]; } catch(e){}
-  }
-  function resumeWatch(p, act, say, host){
-    var started;
-    try { started = sessionStorage['pccDraftWatch:' + p.id]; } catch(e){}
-    if(!started) return;
-    if(Date.now() - Number(started) > 30*60*1000){ clearWatch(p); return; }
-    say('a draft was requested for this phase — watching for it');
-    pollDraft(p, act, say, host);
-  }
-
-  function loadDraft(p, act, say, host, loud, cb){
-    api('/api/phase/ticket-draft', {phase: p.id}).then(function(d){
-      if(!d.ok || !d.draft){
-        if(loud) say(d.error || ('no draft yet at ' + (d.path || '.pcc/ticket-' + p.id + '.json')), 'err');
-        if(cb) cb(false);
-        return;
-      }
-      if(cb) cb(true);
-      showDraft(p, act, say, host, d.draft, d.jira);
-    });
-  }
-
-  // The draft is EDITABLE and nothing is created until you press the button.
-  // A ticket is outward-facing: a model wrote the words, a person sends them.
-  function showDraft(p, act, say, host, draft, jira){
-    var box = (host || act.parentNode).querySelector('.tdraft');
-    if(!box){
-      box = document.createElement('div'); box.className = 'tdraft';
-      (act.nextSibling ? act.parentNode.insertBefore(box, act.nextSibling.nextSibling)
-                       : act.parentNode.appendChild(box));
-    }
-    box.innerHTML = '';
-    var s = document.createElement('input');
-    s.type = 'text'; s.className = 'tsummary'; s.value = draft.summary || '';
-    var b = document.createElement('textarea');
-    b.className = 'tbody'; b.rows = 8; b.value = draft.description || '';
-    var why = document.createElement('div'); why.className = 'dstatus';
-    var row = document.createElement('div'); row.className = 'dact';
-
-    // Route 1 — credential-free. Opens JIRA prefilled; you press Create there.
-    // The TEMPLATE, not the pre-filled URL: jira_create already had its
-    // placeholders substituted server-side, so replacing into it does nothing
-    // and would quietly send the generic phase text instead of your draft.
-    var tmpl = p.jira_create_tmpl || '';
-    if(tmpl){
-      var open = document.createElement('button');
-      open.className = 'anu-btn'; open.textContent = 'Open prefilled JIRA form';
-      open.title = 'Opens JIRA with these fields; you press Create there. No token used.';
-      open.addEventListener('click', function(){
-        window.open(tmpl.split('{summary}').join(encodeURIComponent(s.value))
-                        .split('{description}').join(encodeURIComponent(b.value)),
-                    '_blank', 'noopener');
-        say('JIRA opened with your draft — after creating it, paste the key into Link ticket');
-      });
-      row.appendChild(open);
-    }
-
-    // Route 2 — create it directly. Outward-facing and not undoable, so it is a
-    // TWO-STEP: the first click only arms the button, and makes it name the
-    // project the issue will actually land in.
-    var apiBtn = document.createElement('button');
-    apiBtn.className = 'anu-btn run';
-    var armed = false;
-    if(jira && jira.configured){
-      apiBtn.textContent = 'Create in JIRA…';
-      apiBtn.title = 'Creates the issue over the API using ' + jira.auth_env;
-      apiBtn.addEventListener('click', function(){
-        if(!armed){
-          armed = true;
-          apiBtn.textContent = 'Confirm: create in ' + jira.project;
-          apiBtn.style.background = 'var(--crit)'; apiBtn.style.borderColor = 'var(--crit)';
-          say('this creates a real issue in ' + jira.project + ' at ' + jira.base + ' as a ' +
-              jira.issue_type + '. Click again to confirm, or edit the text first.', 'err');
-          return;
-        }
-        apiBtn.disabled = true; apiBtn.textContent = 'Creating…';
-        api('/api/phase/create-ticket',
-            {phase: p.id, summary: s.value, description: b.value}).then(function(d){
-          if(!d.ok){
-            apiBtn.disabled = false; armed = false;
-            apiBtn.textContent = 'Create in JIRA…';
-            apiBtn.style.background = ''; apiBtn.style.borderColor = '';
-            say(d.error, 'err'); return;
-          }
-          box.innerHTML = '';
-          var done = document.createElement('div'); done.className = 'dstatus ok';
-          done.innerHTML = 'Created <b>' + d.key + '</b> and recorded it on this phase' +
-            (d.linked ? '' : ' (writing it to progress.toml failed: ' + d.link_error + ')') +
-            ' — <a href="' + d.url + '" target="_blank" rel="noopener">open it ↗</a>';
-          box.appendChild(done);
-          window.__PCC_PHASES__[p.id].jira = d.key;
-          setTimeout(function(){ location.reload(); }, 2500);
-        });
-      });
-    } else {
-      apiBtn.textContent = 'Create in JIRA';
-      apiBtn.disabled = true;
-      apiBtn.title = 'Needs API configuration';
-    }
-    row.appendChild(apiBtn);
-
-    why.innerHTML = (jira && jira.configured)
-      ? 'Two routes. <b>Open prefilled JIRA form</b> uses your browser session and no token. ' +
-        '<b>Create in JIRA</b> posts to <code>' + jira.base + '</code> as <b>' + jira.project +
-        ' / ' + jira.issue_type + '</b> using <code>' + jira.auth_env + '</code>, then records ' +
-        'the key here. Two clicks, because a ticket cannot be un-created.' +
-        (jira.insecure ? ' <b>api_base is plain http — the token would cross the network ' +
-                         'unencrypted.</b>' : '')
-      : (tmpl ? 'Opens JIRA with these fields filled in; you press Create there. ' : '') +
-        'Direct creation is off: ' +
-        (((jira && jira.missing) || []).join('; ') || 'no JIRA API configured') +
-        '. Set it on <a href="/setup">/setup</a> → This project.';
-
-    var n = (draft.description || '').length;
-    var head = el('h4', 'DRAFT TICKET  ·  ' + n + ' chars');
-    if(n > 2200){
-      head.textContent += '  ·  long for a ticket — trim before sending';
-      head.style.color = 'var(--warn)';
-    }
-    box.appendChild(head);
-    box.appendChild(s); box.appendChild(b);
-    box.appendChild(row); box.appendChild(why);
-  }
-  function el(tag, text){ var n = document.createElement(tag); n.textContent = text; return n; }
 
   // Per-item start. Each checklist item is a unit of work in its own right, so
   // it gets its own session prompt — scoped to that one line, with an explicit
@@ -1976,10 +1755,15 @@ JS = r"""
                        : act.parentNode.appendChild(box));
     }
     box.innerHTML = '';
+    // Real labels: these two fields become a ticket someone else reads, and an
+    // unlabelled input announces only its current value.
+    var sid = 'tsum-' + p.id, bid = 'tbody-' + p.id;
+    var sl = document.createElement('label'); sl.htmlFor = sid; sl.textContent = 'Summary';
     var s = document.createElement('input');
-    s.type = 'text'; s.className = 'tsummary'; s.value = draft.summary || '';
+    s.type = 'text'; s.className = 'tsummary'; s.id = sid; s.value = draft.summary || '';
+    var bl = document.createElement('label'); bl.htmlFor = bid; bl.textContent = 'Description';
     var b = document.createElement('textarea');
-    b.className = 'tbody'; b.rows = 8; b.value = draft.description || '';
+    b.className = 'tbody'; b.rows = 12; b.id = bid; b.value = draft.description || '';
     var why = document.createElement('div'); why.className = 'dstatus';
     var row = document.createElement('div'); row.className = 'dact';
 
@@ -2064,7 +1848,8 @@ JS = r"""
       head.style.color = 'var(--warn)';
     }
     box.appendChild(head);
-    box.appendChild(s); box.appendChild(b);
+    box.appendChild(sl); box.appendChild(s);
+    box.appendChild(bl); box.appendChild(b);
     box.appendChild(row); box.appendChild(why);
   }
   function el(tag, text){ var n = document.createElement(tag); n.textContent = text; return n; }
@@ -2341,6 +2126,14 @@ SETUP_JS = r"""
     var v=el('div',{class:'v'}); v.appendChild(ctl);
     if(why) v.appendChild(el('div',{class:'why',html:why}));
     var r=el('div',{class:'row'+(cb.checked?'':' off')},[cb,el('label',{class:'k',text:label}),v]);
+    // Typing IS the intent to set a value. A row starts unticked when its field
+    // is empty, and only ticked rows are sent — so without this, filling in a
+    // blank field and pressing write silently discarded what you typed.
+    v.addEventListener('input',function(){
+      if(cb.checked) return;
+      cb.checked = true;
+      r.classList.remove('off');
+    });
     cb.addEventListener('change',function(){
       r.classList.toggle('off',!cb.checked);
       v.querySelectorAll('input,select').forEach(function(i){i.disabled=!cb.checked});

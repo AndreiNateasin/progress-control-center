@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visual Progress — build a self-contained HTML status report for the plan.
+"""Progress Control Center — build a self-contained HTML status report from a plan.
 
     python3 scripts/progress-report.py [-o OUT.html] [--json]
 
@@ -204,9 +204,6 @@ def setup_wizard(repo: Path, non_interactive: bool = False) -> int:
 
 
 # host:port -> (label, kind, probe path, what it is)
-# Services a control center commonly sits beside. Reachability only: a TCP
-# connect, no credential sent and no protocol spoken, so scanning is safe.
-# Add anything else with [[context]] rather than editing this list.
 KNOWN_SERVICES = [
     (7190, "Context Gateway (MCP)", "mcp-stateless-http", "/mcp",
      "capability-scoped gateway over docs + memory"),
@@ -373,6 +370,22 @@ def _section_body(text: str, header: str) -> tuple[int, int] | None:
     return None if start is None else (start, len(text))
 
 
+def _reads_as(text: str, header: str, key: str, want) -> bool:
+    """Does this key already hold this value? Parsed, not string-compared, so
+    quoting style and whitespace do not count as a difference."""
+    span = _section_body(text, header)
+    if span is None:
+        return False
+    m = re.search(r"^[ 	]*" + re.escape(key) + r"\s*=[ 	]*(.+?)[ 	]*(?:#.*)?$",
+                  text[span[0]:span[1]], re.M)
+    if not m:
+        return False
+    try:
+        return tomllib.loads("x = " + m.group(1))["x"] == want
+    except (tomllib.TOMLDecodeError, KeyError, ValueError):
+        return False
+
+
 def set_toml_key(text: str, header: str, key: str, value) -> str:
     """Set one scalar key inside one section, preserving everything else.
 
@@ -392,8 +405,13 @@ def set_toml_key(text: str, header: str, key: str, value) -> str:
         # Keep the file's column alignment: these configs are read by humans.
         head = active.group(0).split("=", 1)[0]
         pad = " " * max(0, len(head) - len(active.group(1)) - len(key))
+        # And keep any trailing comment. These files are hand-annotated, and
+        # rewriting `start_date = "..."   # first plan commit` without the note
+        # quietly destroys the reason the value is what it is.
+        tail = re.search(r"(\s+#.*)$", active.group(0))
         return text[:a] + body[:active.start()] + active.group(1) + key + pad + \
-            "= " + _toml_val(value) + body[active.end():] + text[b:]
+            "= " + _toml_val(value) + (tail.group(1) if tail else "") + \
+            body[active.end():] + text[b:]
     comm = re.search(r"^[ \t]*#\s*" + re.escape(key) + r"\s*=.*$", body, re.M)
     if comm:
         return text[:a] + body[:comm.start()] + lit + body[comm.end():] + text[b:]
@@ -706,6 +724,11 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
         val = bool(val) if typ is bool else str(val)
         if typ is str and not val.strip():
             continue                                   # empty means "leave alone"
+        # Already correct? Leave the author's line exactly as written. Rewriting
+        # an unchanged value put noise in the diff and, before the fix above,
+        # ate its trailing comment for nothing.
+        if _reads_as(text, header, _KEYNAME.get(key, key), val):
+            continue
         text = set_toml_key(text, header, _KEYNAME.get(key, key), val)
         notes.append(f"{header} {_KEYNAME.get(key, key)} = {_toml_val(val)}")
 
@@ -1797,6 +1820,26 @@ details.promptfold pre{white-space:pre-wrap;font-family:var(--mono);font-size:11
   margin-top:8px;max-height:280px;overflow:auto}
 .pactivity{margin-top:6px}
 
+/* draft ticket review — a form you read and edit before anything is created,
+   so it gets the width of the panel and a clear boundary from the actions */
+.tdraft{margin-top:16px;padding:14px 16px;background:var(--panel-2);
+  border:1px solid var(--line);border-radius:10px}
+.tdraft h4{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);margin:0 0 10px;font-weight:600}
+.tdraft label{display:block;font-family:var(--mono);font-size:11px;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:0 0 4px}
+.tdraft input.tsummary,.tdraft textarea.tbody{display:block;width:100%;box-sizing:border-box;
+  padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  color:var(--ink);font:inherit;font-size:14px}
+.tdraft input.tsummary{font-weight:600;margin-bottom:14px}
+.tdraft textarea.tbody{font-family:var(--mono);font-size:12.5px;line-height:1.6;
+  resize:vertical;min-height:220px;margin-bottom:12px}
+.tdraft input.tsummary:focus-visible,.tdraft textarea.tbody:focus-visible{
+  outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+.tdraft .dact{margin-top:0}
+.tdraft .dstatus{padding-top:8px}
+
+
 @media (max-width:720px){
   details.phase > summary{grid-template-columns:28px 1fr auto;gap:10px;padding:11px 12px}
   .pbody{padding:0 12px 14px 12px}
@@ -2215,10 +2258,28 @@ def render(d: dict) -> str:
             tmpl = d.get("jira", {}).get("browse_url", "")
             label = str(key)
             url = tmpl.replace("{key}", str(key)) if tmpl else ""
+        # In the SUMMARY this is always a plain span: an <a> nested in a
+        # <summary> is activated by the summary, so it looks like a link and
+        # cannot be followed. The clickable one lives in the phase body.
+        return f'<span class="pill">⌁ {e(label)}</span>'
+
+    def jira_body_link(p: dict) -> str:
+        """The real, clickable ticket link — rendered in the phase body, where
+        nothing swallows the click. Says why it is not a link when it cannot be
+        one, rather than looking broken."""
+        key = p.get("jira")
+        if not key:
+            return ""
+        if str(key).startswith("http"):
+            url, label = str(key), str(key).rstrip("/").rsplit("/", 1)[-1]
+        else:
+            tmpl = d.get("jira", {}).get("browse_url", "")
+            label = str(key)
+            url = tmpl.replace("{key}", str(key)) if tmpl else ""
         if url:
-            return (f'<a class="pill" style="text-decoration:none" target="_blank" rel="noopener" '
-                    f'href="{e(url)}" title="ticket">⌁ {e(label)}</a>')
-        return f'<span class="pill" title="ticket (no browse_url configured)">⌁ {e(label)}</span>'
+            return (f'<a href="{e(url)}" target="_blank" rel="noopener">{e(label)} ↗</a>')
+        return (f'{e(label)} <span class="quiet">— set '
+                f'<code>[integrations.jira].browse_url</code> to make this a link</span>')
 
     def developer_data() -> str:
         """Per-developer profiles, emitted as page data.
@@ -2382,7 +2443,8 @@ def render(d: dict) -> str:
             f'<div class="dstatus"></div>'
             f'<ul class="items">{items_html}</ul>'
             f'<dl class="pfacts">'
-            f'<dt>Exit test</dt><dd>{e(p.get("exit_test", "")) or "—"}</dd>'
+            + (f'<dt>Ticket</dt><dd>{jira_body_link(p)}</dd>' if p.get("jira") else "")
+            + f'<dt>Exit test</dt><dd>{e(p.get("exit_test", "")) or "—"}</dd>'
             f'<dt>Unlocks</dt><dd>{e(unlocks)}</dd>'
             f'<dt>Work tree</dt><dd>{e(", ".join(p.get("modules") or [])) or "—"}'
             f'<div class="pactivity"></div></dd>'
