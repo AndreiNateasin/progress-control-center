@@ -125,7 +125,7 @@ Two things:
 name       = "My Project"
 plan       = "PLAN.md"
 start_date = "2026-01-06"
-allow_artifact_publish = false      # publishing is opt-in, always explicit
+allow_artifact_publish = false      # recorded sharing policy — see docs/DESIGN.md
 
 [[phase]]
 id         = "1"

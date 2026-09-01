@@ -464,6 +464,69 @@ def project_trust(repo: Path) -> str:
     return "ready" if db.get(str(repo).lower()) == _argv_digest(acts, lchr) else "read-only"
 
 
+def browse(start: str, want: str) -> dict:
+    """List one directory for the path pickers. Read-only, loopback only.
+
+    The page cannot enumerate the filesystem and a native file picker withholds
+    real paths on purpose, so a text box was the only way to name a directory —
+    fine until you have to type C:\\Users\\you\\src\\thing from memory. This
+    server is already on the machine, so it can simply answer.
+
+    `want` is "dir" (directories only, for a checkout) or "md" (directories plus
+    markdown, for a plan file). Nothing here writes, and the caller is gated on
+    a loopback bind — on a LAN-bound dashboard this would enumerate the server's
+    disk for anyone who could reach the page.
+    """
+    try:
+        # A relative value means repo-relative - the plan file is stored that way.
+        # Resolving it against the PROCESS CWD instead opened the browser wherever
+        # the server happened to be launched from, which is nobody's project.
+        raw = Path(start).expanduser() if start else REPO
+        p = (raw if raw.is_absolute() else (REPO / raw)).resolve()
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"not a usable path: {exc}"}
+    if not p.is_dir():
+        p = p.parent if p.parent.is_dir() else REPO
+    try:
+        entries = sorted(p.iterdir(), key=lambda e: e.name.lower())
+    except PermissionError:
+        return {"ok": False, "error": f"permission denied: {p}"}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    dirs, files = [], []
+    for e in entries[:2000]:
+        try:
+            if e.is_dir():
+                if e.name.startswith(".") or e.name in _pr.SCAN_SKIP:
+                    continue
+                dirs.append({"name": e.name, "path": str(e)})
+            elif want == "md" and e.suffix.lower() == ".md":
+                files.append({"name": e.name, "path": str(e)})
+        except OSError:
+            continue          # a broken junction or a race; skip the entry
+    parent = str(p.parent) if p.parent != p else ""
+    return {"ok": True, "path": str(p), "parent": parent,
+            "dirs": dirs[:400], "files": files[:400],
+            "roots": [str(r) for r in _drive_roots()]}
+
+
+def _drive_roots() -> list[Path]:
+    """Somewhere to jump to when the current path is a dead end."""
+    out = []
+    if os.name == "nt":
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            d = Path(f"{letter}:\\")
+            if d.exists():
+                out.append(d)
+    else:
+        out.append(Path("/"))
+    home = Path.home()
+    if home.exists():
+        out.insert(0, home)
+    return out
+
+
 def switch_project(path: str) -> dict:
     """Point the running dashboard at another project."""
     try:
@@ -2082,6 +2145,24 @@ body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1
 .chip.up{background:var(--done-soft);color:var(--done);border-color:transparent}
 .chip.down{background:var(--todo-soft);color:var(--todo);border-color:transparent}
 .chip.have{background:var(--accent-soft);color:var(--accent);border-color:transparent}
+.picker{display:inline-block}
+.pbrowse{margin-top:8px;border:1px solid var(--line);border-radius:9px;
+  background:var(--panel-2);overflow:hidden;max-width:640px}
+.phere{padding:8px 11px;font-family:var(--mono);font-size:11.5px;color:var(--ink-2);
+  border-bottom:1px solid var(--line);word-break:break-all;background:var(--panel)}
+.plist{max-height:260px;overflow:auto;padding:4px}
+.pent{display:block;width:100%;text-align:left;appearance:none;border:0;background:none;
+  color:var(--ink);font:inherit;font-size:13px;padding:6px 9px;border-radius:6px;
+  cursor:pointer;min-height:24px}
+.pent:hover{background:var(--accent-soft);color:var(--accent)}
+.pent.pup{color:var(--ink-3)}
+.pfile{font-family:var(--mono);font-size:12px}
+.pempty,.perr{padding:10px 11px;font-size:12.5px;color:var(--ink-3)}
+.perr{color:var(--crit)}
+.pbar{display:flex;gap:6px;flex-wrap:wrap;padding:8px;border-top:1px solid var(--line)}
+.quietbtn{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.planboxes.nobox{color:var(--warn);background:var(--warn-soft);
+  padding:7px 10px;border-radius:7px;margin-top:6px}
 .row.stranded{background:var(--warn-soft);border-radius:8px;
   padding:8px 10px;margin-top:6px;align-items:start}
 .row.stranded .k{color:var(--warn)}
@@ -2285,10 +2366,104 @@ SETUP_JS = r"""
   // below writes docs/progress.toml, which must never carry a personal path.
   // A separate container, not an append into #sw-proj: renderProject() clears
   // that box on every load(), so anything another renderer put there is wiped.
+  // A path picker. The page cannot see the filesystem and a native file input
+  // withholds real paths on purpose, so naming a directory meant typing it from
+  // memory. The server is on this machine and answers /api/setup/browse.
+  //   target : the <input> whose value it sets
+  //   want   : 'dir' to pick a folder, 'md' to pick a markdown file
+  //   rel    : if set, store the path relative to this root (the plan file is
+  //            repo-relative in config; the checkout is absolute)
+  function pathPicker(target, want, rel){
+    var wrap = el('div',{class:'picker'});
+    var btn  = el('button',{class:'act',text:'Browse\u2026'});
+    var panel= el('div',{class:'pbrowse',style:'display:none'});
+    wrap.appendChild(btn); wrap.appendChild(panel);
+    var open = false;
+
+    function relTo(root, p){
+      if(!root) return p;
+      var r = root.replace(/[\\/]+$/,'');
+      if(p.toLowerCase().indexOf(r.toLowerCase()+'\\')===0 ||
+         p.toLowerCase().indexOf(r.toLowerCase()+'/')===0){
+        return p.slice(r.length+1).split('\\').join('/');
+      }
+      return p;                       // outside the root: keep it absolute and honest
+    }
+
+    function draw(d){
+      panel.textContent='';
+      if(!d || !d.ok){
+        panel.appendChild(el('div',{class:'perr',text:(d&&d.error)||'could not read that folder'}));
+        return;
+      }
+      panel.appendChild(el('div',{class:'phere',text:d.path}));
+      var list = el('div',{class:'plist'});
+      if(d.parent){
+        var up = el('button',{class:'pent pup',text:'\u2191  ..'});
+        up.addEventListener('click',function(){ go(d.parent) });
+        list.appendChild(up);
+      }
+      (d.dirs||[]).forEach(function(x){
+        var b = el('button',{class:'pent pdir',text:'\u{1F4C1}  '+x.name});
+        b.addEventListener('click',function(){ go(x.path) });
+        list.appendChild(b);
+      });
+      (d.files||[]).forEach(function(x){
+        var b = el('button',{class:'pent pfile',text:'\u{1F4C4}  '+x.name});
+        b.addEventListener('click',function(){ choose(x.path) });
+        list.appendChild(b);
+      });
+      if(!(d.dirs||[]).length && !(d.files||[]).length){
+        list.appendChild(el('div',{class:'pempty',text:want==='md'
+          ? 'no sub-folders and no .md files here' : 'no sub-folders here'}));
+      }
+      panel.appendChild(list);
+      var bar = el('div',{class:'pbar'});
+      if(want==='dir'){
+        var use = el('button',{class:'act pri',text:'Use this folder'});
+        use.addEventListener('click',function(){ choose(d.path) });
+        bar.appendChild(use);
+      }
+      (d.roots||[]).slice(0,6).forEach(function(r){
+        var j = el('button',{class:'act quietbtn',text:r});
+        j.addEventListener('click',function(){ go(r) });
+        bar.appendChild(j);
+      });
+      panel.appendChild(bar);
+    }
+
+    function go(p){
+      api('/api/setup/browse',{path:p,want:want}).then(draw);
+    }
+    function choose(p){
+      var v = relTo(rel, p);
+      // A <select> silently ignores a value with no matching option, so browsing
+      // to a file outside the shortlist left the field EMPTY - the one outcome
+      // worse than not offering the browser at all.
+      if(target.tagName === 'SELECT' &&
+         ![].some.call(target.options, function(o){ return o.value === v })){
+        var op = document.createElement('option');
+        op.value = v; op.textContent = v + '   (browsed)';
+        target.insertBefore(op, target.firstChild);
+      }
+      target.value = v;
+      target.dispatchEvent(new Event('input',{bubbles:true}));
+      panel.style.display='none'; open=false; btn.textContent='Browse\u2026';
+    }
+    btn.addEventListener('click',function(){
+      open = !open;
+      panel.style.display = open?'block':'none';
+      btn.textContent = open?'Close':'Browse\u2026';
+      if(open) go(target.value || rel || '');
+    });
+    return wrap;
+  }
+
   function renderMine(){
     var L=E.local, box=$('#sw-mine'); if(!box) return; box.textContent='';
+    var repoIn = inp('f-repo',L.repo_path.value,'C:\\src\\project');
     box.appendChild(row('repo_path','Your checkout',
-      inp('f-repo',L.repo_path.value,'C:\\src\\project'),
+      el('div',{},[repoIn, pathPicker(repoIn,'dir','')]),
       why(L.repo_path,'switching projects switches this. Stored in your profile, '+
         'outside this repo, so it is never committed and never published. On a '+
         'shared dashboard it describes the machine running the server, which may '+
@@ -2386,10 +2561,63 @@ SETUP_JS = r"""
       return {v:c.file,l:c.file+'   ('+c.checkboxes+' checkbox'+(c.checkboxes===1?'':'es')+')'}});
     if(!cands.some(function(c){return c.v===P.plan})) cands.unshift({v:P.plan,l:P.plan});
     var best=P.plan_candidates[0];
-    box.appendChild(row('plan','Plan file',sel('p-plan',P.plan,cands),
-      'the guess is <b>the root .md with the most checkboxes</b>'+
+    // cands is already {v,l} for the <select>; the checkbox counts stay on
+    // P.plan_candidates as {file,checkboxes}. Reading .file off cands matched
+    // nothing and quietly pushed a value-less option to the top of the list.
+    var RAW = P.plan_candidates || [];
+    function boxesFor(f){
+      for(var i=0;i<RAW.length;i++){ if(RAW[i].file === f) return RAW[i].checkboxes }
+      return null;
+    }
+    // The scan reaches below the root now, which in a big repo means hundreds of
+    // candidates - a select that long is not a chooser. So: the strongest few in
+    // the list, a browser for everything else, and the current value kept
+    // selectable even when it did not make the cut.
+    var TOP = 25;
+    var shortlist = cands.slice(0, TOP);
+    if(P.plan && !shortlist.some(function(c){ return c.v === P.plan })){
+      var mine = cands.filter(function(c){ return c.v === P.plan })[0];
+      shortlist.unshift(mine || {v:P.plan, l:P.plan});
+    }
+    var planSel = sel('p-plan', P.plan, shortlist);
+    var planWrap = el('div',{},[planSel]);
+    var planBar = el('div',{class:'bar'});
+    planWrap.appendChild(planBar);
+    planBar.appendChild(pathPicker(planSel,'md',E.repo));
+    var rescan = el('button',{class:'act',text:'Rescan'});
+    rescan.title = 'Re-read the repo - a plan file added since this page loaded is '+
+                   'not in the list until something looks again';
+    rescan.addEventListener('click',function(){
+      rescan.disabled=true; rescan.textContent='Scanning\u2026';
+      load(function(){ rescan.disabled=false; rescan.textContent='Rescan' });
+    });
+    planBar.appendChild(rescan);
+    var boxNote = el('div',{class:'why planboxes'});
+    planWrap.appendChild(boxNote);
+    function planBoxes(){
+      var f = planSel.value, n = boxesFor(f);
+      if(!f){ boxNote.textContent=''; boxNote.className='why planboxes'; return }
+      if(n === null){
+        boxNote.className='why planboxes';
+        boxNote.innerHTML='not in the last scan \u2014 press <b>Rescan</b> if you just added it';
+        return;
+      }
+      // The one failure this field exists to prevent, said BEFORE it happens
+      // rather than after it has read 0% for a week.
+      boxNote.className = 'why planboxes' + (n ? '' : ' nobox');
+      boxNote.innerHTML = n
+        ? '<b>'+n+'</b> checkbox'+(n===1?'':'es')+' in this file'
+        : '<b>No checkboxes in this file.</b> Progress is derived only from '+
+          '<code>- [ ]</code> / <code>- [x]</code> lines, so this plan would read '+
+          '<b>0% forever</b>. Choose a file that has them, or add them there.';
+    }
+    planSel.addEventListener('change', planBoxes);
+    planSel.addEventListener('input', planBoxes);
+    planBoxes();
+    box.appendChild(row('plan','Plan file', planWrap,
+      'the guess is <b>the .md with the most checkboxes</b>'+
       (best?' \u2014 '+best.file+' ('+best.checkboxes+')':'')+
-      ' \u00b7 a wrong plan file reads <b>0% forever</b> rather than failing loudly'));
+      ' \u00b7 scanned <b>'+RAW.length+'</b> file(s) under this repo'));
     box.appendChild(row('owner','Default owner',inp('p-owner',P.owner,'optional'),
       'used for phases with no explicit owner'));
     box.appendChild(row('start_date','Start date',inp('p-start',P.start_date,'YYYY-MM-DD','date'),
@@ -2397,10 +2625,13 @@ SETUP_JS = r"""
 
     var pub=el('input',{type:'checkbox',id:'p-pub'}); pub.checked=!!P.allow_artifact_publish;
     pub.style.marginTop='6px';
-    box.appendChild(row('allow_artifact_publish','Publish gate',
-      el('div',{},[pub,el('span',{class:'mono',text:'  allow publishing this plan as a shared Artifact'})]),
-      'off by default for every new project \u00b7 an Artifact leaves this machine, so turning '+
-      'this on is a deliberate, visible config change'));
+    box.appendChild(row('allow_artifact_publish','Sharing policy',
+      el('div',{},[pub,el('span',{class:'mono',text:'  cleared to share this report outside this machine'})]),
+      'A recorded answer, <b>not an enforced one</b>: this tool has no publish '+
+      'button, so nothing here can stop a share. It is the committed note a '+
+      'person \u2014 or an agent acting for you \u2014 checks before putting the '+
+      'generated HTML somewhere others can read it. Off for every new project, '+
+      'so clearing it is a deliberate change with a name on it in git.'));
 
     // ONE JIRA section. There were nine fields, seven of which are derivable
     // from the site URL and the project key: the browse and create URLs, the
@@ -2550,7 +2781,7 @@ SETUP_JS = r"""
   }
 
   // ------------------------------------------------------------------ wire ---
-  function load(){
+  function load(done){
     fetch('/api/setup',{headers:{'X-PCC-Token':T}}).then(function(r){return r.json()})
       .then(function(d){
         E=d;
@@ -2572,6 +2803,7 @@ SETUP_JS = r"""
         if(d.config_error) say('#sw-pmsg','config unreadable: '+d.config_error,'err');
         $('#sw-host').value=(d.host_default||'127.0.0.1');
         renderLocal(); renderProject(); renderMine(); renderProjects(); renderSecrets();
+        if(typeof done === 'function') done();
       });
   }
   document.addEventListener('click',function(ev){
@@ -3136,6 +3368,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/sync-context":
             self._json(sync_context(CFG))
+            return
+
+        if path == "/api/setup/browse":
+            # Read-only, but it enumerates this machine's disk. On a non-loopback
+            # bind the page belongs to someone else, and so would the listing.
+            if not _pr.LOCAL_SURFACE:
+                self._json({"ok": False, "error":
+                            "browsing is disabled on a non-loopback dashboard"})
+                return
+            self._json(browse(str(body.get("path", "")), str(body.get("want", "dir"))))
             return
 
         if path == "/api/setup/switch":

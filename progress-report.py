@@ -611,22 +611,62 @@ def write_user_profile(prof: dict) -> Path:
     return p
 
 
+# Directories whose markdown is never anybody's plan, and which are big enough
+# to make a recursive scan feel broken if walked.
+SCAN_SKIP = {".git", ".hg", ".svn", "node_modules", "vendor", "__pycache__",
+             ".venv", "venv", "env", ".tox", ".mypy_cache", ".pytest_cache",
+             "dist", "build", "target", ".next", ".nuxt", "site-packages",
+             ".idea", ".vscode", ".terraform", "coverage", ".cache"}
+SCAN_MAX_DEPTH = 4
+SCAN_MAX_FILES = 400
+
+
 def plan_candidates(repo: Path) -> list[dict]:
-    """Every root markdown file that could be the plan, with its checkbox count.
-    The wizard shows this list because '--init picked PLAN.md' is a guess,
-    and a wrong guess renders 0% forever rather than failing loudly."""
-    out = []
-    for md in sorted(repo.glob("*.md")):
-        try:
-            text = md.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        # Per LINE: CHECK is anchored ^...$ without re.M, so findall over a whole
-        # file silently returns nothing — which would have shown every candidate
-        # as "0 checkboxes" and made the guess look arbitrary.
-        n = sum(1 for line in text.splitlines() if CHECK.match(line))
-        out.append({"file": md.name, "checkboxes": n})
-    return sorted(out, key=lambda r: -r["checkboxes"])
+    """Every markdown file that could be the plan, with its checkbox count.
+
+    The wizard shows this list because '--init picked PLAN.md' is a guess, and a
+    wrong guess renders 0% forever rather than failing loudly. Scans below the
+    root too: a plan under docs/ or docs/ai-memory/ is completely ordinary, and
+    a root-only glob left it looking as though the file did not exist.
+
+    BREADTH-first, because the cap has to bite somewhere and a depth-first walk
+    spends it on whatever directory sorts early - in one real repo the budget was
+    gone before the walk came back for the root, so the configured plan was
+    missing from its own list.
+    """
+    out, root = [], Path(repo).resolve()
+    queue, depth = [root], 0
+    while queue and depth <= SCAN_MAX_DEPTH and len(out) < SCAN_MAX_FILES:
+        nxt = []
+        for d in queue:
+            try:
+                entries = sorted(d.iterdir(), key=lambda e: e.name.lower())
+            except OSError:
+                continue                      # unreadable directory; skip it
+            for e in entries:
+                try:
+                    if e.is_dir():
+                        if not e.name.startswith(".") and e.name not in SCAN_SKIP:
+                            nxt.append(e)
+                    elif e.suffix.lower() == ".md" and len(out) < SCAN_MAX_FILES:
+                        try:
+                            text = e.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        # Per LINE: CHECK is anchored ^...$ without re.M, so
+                        # findall over a whole file silently returns nothing -
+                        # which would show every candidate as "0 checkboxes".
+                        n = sum(1 for line in text.splitlines() if CHECK.match(line))
+                        out.append({"file": e.relative_to(root).as_posix(),
+                                    "checkboxes": n, "depth": depth})
+                except OSError:
+                    continue                  # broken junction, or a race
+        queue, depth = nxt, depth + 1
+
+    # Most checkboxes first, then shallowest, then alphabetical: the likeliest
+    # plan is the one with the most boxes, and among ties the least buried.
+    out.sort(key=lambda r: (-r["checkboxes"], r["depth"], r["file"]))
+    return out
 
 
 def detect_environment(repo: Path) -> dict:
@@ -1085,8 +1125,10 @@ plan       = "{plan_file}"
 start_date = "{date.today().isoformat()}"
 {f'owner      = "{owner}"' if owner else '# owner    = "your-name"'}
 
-# Publishing this repo's dashboard as a claude.ai Artifact is OFF by default for
-# new projects. Flip only with an explicit policy answer recorded next to it.
+# Cleared to share this report outside this machine? OFF for new projects.
+# This is a RECORDED answer, not an enforced one: nothing in this tool publishes,
+# so nothing here can stop a share. It is the note a person - or an agent acting
+# for you - checks before putting the generated HTML where others can read it.
 allow_artifact_publish = false
 
 {chr(10).join(phase_blocks)}

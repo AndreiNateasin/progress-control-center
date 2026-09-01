@@ -53,7 +53,8 @@ start_date = "2026-01-06"          # the schedule is projected forward from here
 owner      = "alice"               # default owner for phases without one
 subtitle   = "one line under the title"
 workdays_only = true
-allow_artifact_publish = false     # publishing is opt-in and always explicit
+allow_artifact_publish = false     # a RECORDED sharing policy, not enforcement:
+                                   # the note checked before the HTML leaves the machine
 
 [[phase]]
 id         = "1"
