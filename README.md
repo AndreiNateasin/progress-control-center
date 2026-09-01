@@ -83,10 +83,12 @@ python progress-serve.py --repo /path/to/project
 ```
 
 With no `docs/progress.toml` it opens on **`/setup`**, whose two tabs are
-*This machine* (your name, tool, shell, checkout path — written to a profile
-outside every repo) and *This project* (name, plan file, owner, integrations and
-tokens — the first three written to the committed config, tokens to a gitignored
-env file beside it). Every autodiscovered value shows the evidence behind it and
+*This machine* (your name, tool, shell — written to a profile outside every
+repo) and *This project* (name, plan file, owner, integrations, tokens, and your
+checkout of this project). Not all of that tab is committed: the config fields go
+to `docs/progress.toml`, tokens to a gitignored env file beside it, and the
+checkout to your profile, keyed by this repo — it is per project, but it is
+yours, so it never enters git. Every autodiscovered value shows the evidence behind it and
 can be changed or switched off. Nothing reaches the committed config until you
 preview the diff.
 

@@ -134,6 +134,15 @@ They are merged at render time: the roster supplies the team, your profile overr
 your own row, and a checkout path never has to be committed to be useful. A teammate
 opening the same page sees their own.
 
+`[repos]` is a map keyed by the path the dashboard is serving, so the checkout is
+already per project: switching projects switches it, and a project you have not
+answered for falls back to its own path rather than the previous one's. The wizard
+shows the row on the **This project** tab for that reason, with its own Save, while
+the value stays in the profile. Storing it inside the project would be
+self-referential on a single machine — the file's own directory is the answer — and
+on a shared dashboard the file is on the server's disk, so it would describe the
+wrong machine for every viewer.
+
 This matters when the dashboard runs on a **server**. The server has no VS Code and
 no CLI, and launching there would be useless — the developer is elsewhere. But the
 *page* is already on the developer's machine, so the server hands out a launch

@@ -2163,7 +2163,13 @@ SETUP_JS = r"""
   function val(id){var n=$('#'+id); return n?n.value.trim():''}
   function esc(x){var n=document.createElement('div'); n.textContent=x==null?'':x;
     return n.innerHTML}
-  function on(key){var c=document.querySelector('input[data-k="'+key+'"]'); return !c||c.checked}
+  // Scope matters: key 'name' exists in BOTH panes ("Your name" / "Project
+  // name"), and a document-wide lookup returns whichever is first in the DOM
+  // \u00b7 the machine tab. Unscoped, unticking "Your name" silently dropped
+  // the project name from the config save.
+  function on(key,scope){
+    var r=scope?$(scope):document;
+    var c=r?r.querySelector('input[data-k="'+key+'"]'):null; return !c||c.checked}
 
   function diff(pre,text){
     pre.textContent='';
@@ -2178,8 +2184,12 @@ SETUP_JS = r"""
   // ---------------------------------------------------------------- local ---
   // Evidence line. A saved answer is labelled as saved AND still shows what was
   // detected, so you can always see the assumption you are overriding.
-  function why(a,extra){
-    return (a.saved?'<b>saved in your profile</b> \u00b7 detected: ':'assumed from: ')+
+  function why(a,extra,savedAs){
+    // savedAs names what the value was saved FOR. "saved in your profile"
+    // reads as machine-wide; "saved for <project>" is the word that carries the
+    // per-project scope the user could not otherwise see.
+    return (a.saved?'<b>saved '+(savedAs||'in your profile')+'</b> \u00b7 detected: '
+                   :'assumed from: ')+
            a.why+(extra?' \u00b7 '+extra:'');
   }
 
@@ -2255,8 +2265,6 @@ SETUP_JS = r"""
       why(L.tool)));
     box.appendChild(row('shell','Shell',sel('f-shell',L.shell.value,L.shell.options),
       why(L.shell,'decides the prompt-transport syntax (here-string vs heredoc)')));
-    box.appendChild(row('repo_path','Your checkout',inp('f-repo',L.repo_path.value,'C:\\src\\project'),
-      why(L.repo_path,'yours may differ from the server\u2019s path; this stays out of git')));
 
     var tl=$('#sw-tools'); tl.textContent='';
     var names=Object.keys(E.tools);
@@ -2264,6 +2272,22 @@ SETUP_JS = r"""
     names.forEach(function(k){ tl.appendChild(el('div',{},[
       el('span',{text:k+'  '}), el('span',{class:'p',text:E.tools[k]})])) });
 
+  }
+
+  // Personal, but scoped to THIS project: the value lives in your profile's
+  // [repos] map keyed by this repo's path, so switching projects switches it.
+  // Its own card and its own Save on purpose \u00b7 the sticky "Save config"
+  // below writes docs/progress.toml, which must never carry a personal path.
+  // A separate container, not an append into #sw-proj: renderProject() clears
+  // that box on every load(), so anything another renderer put there is wiped.
+  function renderMine(){
+    var L=E.local, box=$('#sw-mine'); if(!box) return; box.textContent='';
+    box.appendChild(row('repo_path','Your checkout',
+      inp('f-repo',L.repo_path.value,'C:\\src\\project'),
+      why(L.repo_path,'switching projects switches this. Stored in your profile, '+
+        'outside this repo, so it is never committed and never published. On a '+
+        'shared dashboard it describes the machine running the server, which may '+
+        'not be yours.', 'for '+esc(E.project.name||E.repo))));
   }
 
   function renderSecrets(){
@@ -2495,7 +2519,7 @@ SETUP_JS = r"""
   }
   function projFields(){
     var f={};
-    if(on('name')) f.name=val('p-name');
+    if(on('name','#sw-proj')) f.name=val('p-name');
     if(on('plan')) f.plan=val('p-plan');
     if(on('owner')) f.owner=val('p-owner');
     if(on('start_date')) f.start_date=val('p-start');
@@ -2529,11 +2553,20 @@ SETUP_JS = r"""
         $('#sw-where').innerHTML = (pname ? '<b>'+pname+'</b> \u00b7 ' : '')+
           d.repo+' \u00b7 '+d.platform+' \u00b7 python '+d.python+
           ' \u00b7 <a href="/">back to dashboard</a>';
+          // Every confirmation on this page is about the project that was
+          // being served when it was written. load() runs on a project
+          // switch, so leaving one standing lets "saved for this project"
+          // sit under a row belonging to a different project.
+          ['#sw-lmsg','#sw-mmsg','#sw-smsg','#sw-imsg'].forEach(function(s){
+            var n=$(s); if(n){ n.textContent=''; n.className='msg' }
+          });
+          say('#sw-pmsg','No unsaved changes.','');
         $('#sw-lpath').textContent=d.profile_path;
+        $('#sw-mpath').textContent=d.profile_path;
         $('#sw-ppath').textContent=d.config_path;
         if(d.config_error) say('#sw-pmsg','config unreadable: '+d.config_error,'err');
         $('#sw-host').value=(d.host_default||'127.0.0.1');
-        renderLocal(); renderProject(); renderProjects(); renderSecrets();
+        renderLocal(); renderProject(); renderMine(); renderProjects(); renderSecrets();
       });
   }
   document.addEventListener('click',function(ev){
@@ -2544,15 +2577,27 @@ SETUP_JS = r"""
   document.addEventListener('DOMContentLoaded',function(){
     load();
     $('#sw-save-local').addEventListener('click',function(){
-      var b={}; ['name','tool','shell','repo_path'].forEach(function(k){
-        if(!on(k)) return;
-        b[k]=val({name:'f-name',tool:'f-tool',shell:'f-shell',repo_path:'f-repo'}[k]);
+      var b={}; ['name','tool','shell'].forEach(function(k){
+        if(!on(k,'#sw-local')) return;  // repo_path has its own Save, on the project tab
+        b[k]=val({name:'f-name',tool:'f-tool',shell:'f-shell'}[k]);
       });
       api('/api/setup/local',b).then(function(d){
         say('#sw-lmsg', d.ok?('written to '+d.path+' \u2014 reload the dashboard to see it'):d.error,
             d.ok?'ok':'err');
       });
     });
+
+      // The checkout lives on the project tab now, so it needs a Save there.
+      // Same endpoint: the value still goes to the profile's [repos] map,
+      // keyed by this repo. Only its position on screen changed.
+      $('#sw-save-mine').addEventListener('click',function(){
+        var b={};
+        if(!on('repo_path','#sw-mine')){ say('#sw-mmsg','row unticked \u2014 nothing sent',''); return }
+        b.repo_path=val('f-repo');
+        api('/api/setup/local',b).then(function(d){
+          say('#sw-mmsg', d.ok?('saved for this project in '+d.path):d.error, d.ok?'ok':'err');
+        });
+      });
     $('#sw-add').addEventListener('click',function(){
       var v = $('#sw-addpath').value.trim();
       if(!v){ say('#sw-pmsg2','type a path first','err'); return; }
@@ -2651,10 +2696,17 @@ SETUP_JS = r"""
         });
     });
     // Editing after arming invalidates the diff you were just shown.
-    $('#pane-proj').addEventListener('input',function(){
-      if(armed){ disarm(); diff($('#sw-diff'),''); }
-      say('#sw-pmsg','Unsaved changes.','');
-      $('#sw-writecard').classList.add('dirty');
+    // Bind to the containers that actually feed the committed save, not the
+    // whole pane: the Tokens and checkout cards live here too, and neither
+    // writes docs/progress.toml. Unscoped, typing a token claimed the config
+    // was dirty and disarmed an armed confirm.
+    ['#sw-proj','#sw-svc'].forEach(function(sel){
+      var node=$(sel); if(!node) return;
+      node.addEventListener('input',function(){
+        if(armed){ disarm(); diff($('#sw-diff'),''); }
+        say('#sw-pmsg','Unsaved changes.','');
+        $('#sw-writecard').classList.add('dirty');
+      });
     });
   });
 })();
@@ -2706,8 +2758,10 @@ def setup_page(token: str) -> str:
         '<div class="card"><h2>Your profile</h2>'
         '<p class="note">Personal and never committed. Written to '
         '<code id="sw-lpath">…</code>, then overlaid on the team roster in '
-        '<code>docs/progress.toml</code> — your paths and your tool, without '
-        'proposing them as a commit. Untick a row to leave it as it is.</p>'
+        '<code>docs/progress.toml</code> — your name, your tool and your shell, '
+        'without proposing them as a commit. Your checkout is personal too, but '
+        'it is saved <i>per project</i>, so it is on the <b>This project</b> tab. '
+        'Untick a row to leave it as it is.</p>'
         '<div id="sw-local"></div>'
         '<div class="bar" style="margin-top:14px">'
         '<button class="act pri" id="sw-save-local">Save profile</button>'
@@ -2725,6 +2779,17 @@ def setup_page(token: str) -> str:
         '<p class="note">Shared settings, written to <code id="sw-ppath">…</code> — a '
         '<b>committed</b> file. Save shows you the change and asks once before writing.</p>'
         '<div id="sw-proj"></div></div>'
+
+        '<div class="card"><h2>Your checkout</h2>'
+        '<p class="note"><b>Personal, not shared.</b> Saved per project to '
+        '<code id="sw-mpath">…</code> — outside this repo, so it is never '
+        'committed and never reaches a published report. Switching projects '
+        'switches this value. <b>Save config</b> below writes the committed '
+        'file only and does not carry this field — use <b>Save checkout</b> here.</p>'
+        '<div id="sw-mine"></div>'
+        '<div class="bar" style="margin-top:14px">'
+        '<button class="act pri" id="sw-save-mine">Save checkout</button>'
+        '<span class="msg" id="sw-mmsg"></span></div></div>'
 
         '<div class="card"><h2>Services on this host</h2>'
         '<p class="note">Reachability only: a TCP connect, no credential sent, no protocol '
