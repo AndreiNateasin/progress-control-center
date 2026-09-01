@@ -657,8 +657,10 @@ def plan_candidates(repo: Path) -> list[dict]:
                         # findall over a whole file silently returns nothing -
                         # which would show every candidate as "0 checkboxes".
                         n = sum(1 for line in text.splitlines() if CHECK.match(line))
+                        ph = len(re.findall(r"^###\s+Phase\s+[0-9A-Za-z]+\s*[—\-–]",
+                                            text, re.M))
                         out.append({"file": e.relative_to(root).as_posix(),
-                                    "checkboxes": n, "depth": depth})
+                                    "checkboxes": n, "phases": ph, "depth": depth})
                 except OSError:
                     continue                  # broken junction, or a race
         queue, depth = nxt, depth + 1
@@ -748,6 +750,7 @@ def detect_environment(repo: Path) -> dict:
         # --- project scope: what the committed config says now ----------------
         "project": {
             "name": proj.get("name", repo.name),
+            "phase_count": len(cfg.get("phase", []) or []),
             "plan": proj.get("plan", (cands[0]["file"] if cands else "PLAN.md")),
             "plan_candidates": cands,
             "owner": proj.get("owner", ""),

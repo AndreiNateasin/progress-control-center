@@ -2603,12 +2603,35 @@ SETUP_JS = r"""
       }
       // The one failure this field exists to prevent, said BEFORE it happens
       // rather than after it has read 0% for a week.
-      boxNote.className = 'why planboxes' + (n ? '' : ' nobox');
-      boxNote.innerHTML = n
-        ? '<b>'+n+'</b> checkbox'+(n===1?'':'es')+' in this file'
+      var hit = RAW.filter(function(c){ return c.file === f })[0] || {};
+      var ph = hit.phases || 0, declared = P.phase_count || 0;
+      var head = n
+        ? '<b>'+n+'</b> checkbox'+(n===1?'':'es')+
+          (ph ? ' · <b>'+ph+'</b> phase heading'+(ph===1?'':'s') : '')+' in this file'
         : '<b>No checkboxes in this file.</b> Progress is derived only from '+
           '<code>- [ ]</code> / <code>- [x]</code> lines, so this plan would read '+
           '<b>0% forever</b>. Choose a file that has them, or add them there.';
+      // Checkboxes alone render an EMPTY dashboard: phases are declared in
+      // docs/progress.toml ([[phase]] id/days/depends_on - what markdown cannot
+      // say), and each pulls its checklist from its "### Phase <id>" section.
+      // Without saying so here, "31 checkboxes but no phases" is a mystery.
+      var tail = '';
+      if(n && !declared){
+        tail = '<div class="ready no">The dashboard will show <b>no phases</b>: '+
+          'this project’s <code>docs/progress.toml</code> declares none. '+
+          (ph ? 'This file has <b>'+ph+'</b> <code>### Phase …</code> heading'+
+                (ph===1?'':'s')+' — add a matching <code>[[phase]]</code> block '+
+                'per heading (id, days, depends_on) and each phase picks up its '+
+                'checklist from its section.'
+              : 'It also has no <code>### Phase &lt;id&gt; — …</code> headings, '+
+                'so add those to the plan AND <code>[[phase]]</code> blocks to the config.')+
+          '</div>';
+      } else if(n && declared && ph){
+        tail = '<div class="why" style="margin-top:4px">'+declared+' phase'+
+          (declared===1?'':'s')+' declared in the config</div>';
+      }
+      boxNote.className = 'why planboxes' + (n ? '' : ' nobox');
+      boxNote.innerHTML = head + tail;
     }
     planSel.addEventListener('change', planBoxes);
     planSel.addEventListener('input', planBoxes);
