@@ -319,6 +319,17 @@ def build_launchers(cfg: dict | None = None) -> dict:
                                   "mode": "terminal",
                                   "cmd": "opencode run -c (Get-Content -Raw -Encoding UTF8 {pf})",
                                   "cmd_blank": "opencode"}
+    if shutil.which("codex"):
+        # Positional prompt per the Codex CLI docs. The resume flags are NOT
+        # verified against --help on this machine (codex absent here) - if the
+        # continue launcher misbehaves, that is the first thing to check.
+        L["codex"] = {"label": "Codex - new session", "mode": "terminal",
+                      "cmd": "codex (Get-Content -Raw -Encoding UTF8 {pf})",
+                      "cmd_blank": "codex"}
+        L["codex-continue"] = {"label": "Codex - resume last session",
+                               "mode": "terminal",
+                               "cmd": "codex resume --last (Get-Content -Raw -Encoding UTF8 {pf})",
+                               "cmd_blank": "codex resume --last"}
     appid = _detect_claude_app()
     if appid:
         L["claude-app"] = {"label": "Claude app (prompt → clipboard)",

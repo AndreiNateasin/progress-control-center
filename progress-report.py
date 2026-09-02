@@ -110,6 +110,7 @@ def _detect_tools() -> dict:
     import shutil
     found = {}
     for exe, tool in (("claude", "claude"), ("opencode", "opencode"),
+                      ("codex", "codex"),
                       ("code", "vscode"), ("cursor", "cursor")):
         w = shutil.which(exe)
         if w:
@@ -1123,7 +1124,7 @@ def scaffold_init(target: Path, name: str | None, *, owner: str | None = None,
         except (OSError, subprocess.SubprocessError):
             owner = ""
 
-    tools = [t for t in ("claude", "opencode", "code", "cursor") if shutil.which(t)]
+    tools = [t for t in ("claude", "opencode", "codex", "code", "cursor") if shutil.which(t)]
 
     phase_blocks = []
     prev = None
@@ -2491,6 +2492,18 @@ TOOL_CMD = {
     "claude (continue)": {
         "bash": "cd '{repo}' && claude --continue \"$(cat <<'PCC_PROMPT'\n{p}\nPCC_PROMPT\n)\"",
         "powershell": "cd '{repo}'; claude --continue @'\n{p}\n'@",
+    },
+    # Codex CLI takes the initial prompt as a positional argument. The
+    # continue variant uses `codex resume --last` per the Codex CLI docs;
+    # neither is verified against --help on this machine - codex is not
+    # installed here - so check both on first real use.
+    "codex": {
+        "bash": "cd '{repo}' && codex \"$(cat <<'PCC_PROMPT'\n{p}\nPCC_PROMPT\n)\"",
+        "powershell": "cd '{repo}'; codex @'\n{p}\n'@",
+    },
+    "codex (continue)": {
+        "bash": "cd '{repo}' && codex resume --last \"$(cat <<'PCC_PROMPT'\n{p}\nPCC_PROMPT\n)\"",
+        "powershell": "cd '{repo}'; codex resume --last @'\n{p}\n'@",
     },
     "opencode": {
         "bash": "cd '{repo}' && opencode --prompt \"$(cat <<'PCC_PROMPT'\n{p}\nPCC_PROMPT\n)\"",
