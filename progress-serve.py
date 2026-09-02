@@ -1340,10 +1340,24 @@ def create_jira_issue(phase_id: str, summary: str, description: str) -> dict:
                             [f"{k}: {v}" for k, v in (detail.get("errors") or {}).items()])
         except (ValueError, OSError):
             msg = ""
+        # The single most common 401/403 here is not permissions at all: a
+        # Cloud site with auth_mode = bearer. Cloud API tokens only work as
+        # basic auth with the ACCOUNT EMAIL - and this exact misconfiguration
+        # sat in a real config and produced a generic "check permissions".
+        hint = " (check project_key, issue_type and the token's permissions)"
+        if exc.code in (401, 403) and ".atlassian.net" in t["base"]                 and not auth.startswith("Basic "):
+            hint = (" — this is a JIRA Cloud site, and Cloud rejects bearer "
+                    "tokens. Set your Account email in /setup → This project "
+                    "→ Advanced and press Save config: the wizard flips "
+                    "auth_mode to basic automatically.")
+        elif exc.code == 401 and auth.startswith("Basic "):
+            hint = (" — basic auth was refused: the account email and the "
+                    "token in $" + t.get("auth_env", "JIRA_PAT") +
+                    " must belong to the same Atlassian account.")
+        elif exc.code not in (400, 401, 403):
+            hint = ""
         return {"ok": False, "error": f"JIRA said {exc.code} {exc.reason}" +
-                (f" — {msg}" if msg else "") +
-                (" (check project_key, issue_type and the token's permissions)"
-                 if exc.code in (400, 401, 403) else "")}
+                (f" — {msg}" if msg else "") + hint}
     except urllib.error.URLError as exc:
         return {"ok": False, "error": f"could not reach {t['base']}: {exc.reason}. "
                 "An internal JIRA behind a private CA needs that CA trusted by Python."}
