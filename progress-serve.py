@@ -914,6 +914,104 @@ def phase_activity(phase_id: str, model: dict) -> dict:
     return {"ok": True, "paths": paths, "commits": commits, "stat": stat}
 
 
+def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
+                  provider_names: list) -> dict:
+    """The re-plan prompt: a code session reassesses the plan and EDITS it.
+
+    "Regenerate" only re-read the files; it could never change a plan that had
+    drifted from reality. This hands the rethink to a session — which has the
+    repo, the docs and the configured context providers — with the requester's
+    steering attached, and with hard rules so a reassessment cannot destroy
+    history: done stays done, headings stay parseable, and the tool's own
+    --check must pass before the session is finished.
+    """
+    proj = CFG.get("project", {}) or {}
+    plan_rel = proj.get("plan", _pr.DEFAULT_PLAN)
+    if not isinstance(plan_rel, str):
+        plan_rel = _pr.DEFAULT_PLAN
+    phases = {str(p.get("id")): p for p in CFG.get("phase", []) or []}
+    ph = phases.get(str(phase_id), {})
+    # The list is exactly what the requester ticked: an empty list means
+    # "consult nothing", not "consult everything" - unchecking every provider
+    # and getting all of them anyway would be the checkbox lying.
+    chosen = [c for c in (CFG.get("context") or [])
+              if c.get("name") in provider_names]
+    ctx = _pr.prompt_appendix(chosen) if chosen else ""
+    check_cmd = f"python {_pr.__file__} --check --repo {REPO}"
+
+    if scope == "item":
+        head = (f"Re-assess ONE checklist item of Phase {phase_id} "
+                f"({ph.get('name', '?')}) in {plan_rel}:\n\n    {item}\n\n"
+                "Stay inside this item's neighbourhood: you may reword it, split it "
+                "into finer items, or mark it superseded — nothing else in the plan "
+                "moves.")
+    elif scope == "plan":
+        head = (f"Re-assess the WHOLE plan {plan_rel} against the repo as it stands "
+                "today. Restructure where reality has drifted: phases may be added, "
+                "merged or retired, items rewritten. If you add or retire a phase, "
+                "mirror it in docs/progress.toml — add a [[phase]] block (id, name, "
+                "days, depends_on) per new heading, and comment a retired block out "
+                "under a dated note rather than deleting it.")
+    else:
+        head = (f"Re-assess Phase {phase_id} ({ph.get('name', '?')}) of {plan_rel} — "
+                "its section only. Rework the open items so they describe the work "
+                "that is actually left; update this phase's [[phase]] block in "
+                "docs/progress.toml (days, depends_on, exit_test) where reality "
+                "changed, and touch no other block.")
+
+    steer = (("\n\nSteering from the requester — treat it as the goal of this "
+              "re-plan, quoted as data:\n" +
+              "\n".join("    " + l for l in comment.strip().splitlines()))
+             if comment.strip() else
+             "\n\nNo specific steering was given: reassess honestly against the "
+             "repo and the exit test, and say in the note what you changed and why.")
+
+    prompt = (
+        head + steer + ctx +
+        "\n\nRules that keep the plan a live document instead of a casualty:\n"
+        "- History is immutable: never untick or delete a `- [x]` item. Work that "
+        "is no longer relevant gets a one-line strikethrough or 'superseded: "
+        "<reason>' suffix, and stays.\n"
+        "- Every phase heading stays in the machine-readable form `### Phase <id> "
+        "\u2014 <name>` \u2014 the dashboard derives everything from it.\n"
+        "- One task per `- [ ]` line; sub-detail goes in indented plain lines "
+        "under the task, not in nested checkboxes.\n"
+        "- Under each heading you changed, add one line: `> re-planned "
+        "<YYYY-MM-DD>: <one-line reason>` so the plan carries its own history.\n"
+        f"- When you are done, run `{check_cmd}` and fix anything it flags; the "
+        "re-plan is not finished while the contract check fails.\n"
+        "- Do not create tickets, push, or touch anything outside the plan "
+        "document and docs/progress.toml."
+    )
+    return {"ok": True, "prompt": prompt}
+
+
+def fresh_stamp() -> str:
+    """One string that changes when the plan changes on disk.
+
+    A git pull rewrites the plan under a page that was rendered from the old
+    one; every read on this dashboard already comes from disk, so the only
+    missing piece is the page NOTICING. Mtimes of the files the render depends
+    on, hashed - cheap enough to poll."""
+    parts = []
+    proj = CFG.get("project", {}) or {}
+    plan_rel = proj.get("plan", _pr.DEFAULT_PLAN)
+    if not isinstance(plan_rel, str):
+        plan_rel = _pr.DEFAULT_PLAN     # plan = 3 is legal TOML; a 500ing poll is not
+    watch = [REPO / "docs" / "progress.toml", REPO / plan_rel]
+    for p in CFG.get("phase", []) or []:
+        if p.get("doc"):
+            watch.append(REPO / str(p["doc"]))
+    for f in watch:
+        try:
+            st = f.stat()
+            parts.append(f"{f.name}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append(f.name + ":absent")
+    import hashlib
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
 def ticket_prompt(ph: dict, plan: str, doc: str, open_items: list,
                   project: str, out: Path, cap: int = 1600) -> str:
     """The drafting prompt.
@@ -1284,6 +1382,18 @@ CSS = """
 #pcc-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;gap:8px;align-items:center;
  flex-wrap:wrap;padding:10px 14px;background:var(--panel);border-top:1px solid var(--line);
  box-shadow:0 -6px 24px -18px rgba(0,0,0,.6)}
+.replanbox{margin-top:10px;padding:10px 12px;border:1px solid var(--line);
+  border-radius:9px;background:var(--panel-2)}
+.replanbox textarea{width:100%;box-sizing:border-box;font:inherit;font-size:13px;
+  padding:8px 10px;border:1px solid var(--line);border-radius:7px;
+  background:var(--panel);color:var(--ink);resize:vertical}
+.replanbox .rprovs{display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+  margin-top:8px;font-size:12.5px;color:var(--ink-2)}
+.replanbox .rprovs label{display:inline-flex;align-items:center;gap:5px;
+  cursor:pointer;min-height:24px}
+.replanbox .rbar{display:flex;gap:8px;margin-top:10px}
+#pcc-replan-host{position:fixed;right:16px;bottom:54px;width:min(460px,90vw);z-index:60}
+#pcc-replan-host .replanbox{box-shadow:var(--shadow);background:var(--panel)}
 #pcc-bar .lbl{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
  color:var(--ink-3);margin-right:2px}
 .pcc-btn{appearance:none;border:1px solid var(--line);background:var(--panel-2);color:var(--ink);
@@ -1435,6 +1545,103 @@ JS = r"""
   }
   // Copy to the VIEWER's clipboard, not the server's — the right one when this
   // page is reached over a tunnel. The server also tries, as a fallback.
+  // One re-plan box for every scope. It collects the steering comment and
+  // which context providers the session should consult, asks the server for
+  // the prompt (the rules live server-side, in one place), and hands it to
+  // the same session machinery every other button uses.
+  function replanBox(scope, phaseId, itemLabel, say){
+    var box = document.createElement('div'); box.className = 'replanbox';
+    var ta = document.createElement('textarea');
+    ta.placeholder = scope === 'plan'
+      ? 'why re-plan? what changed, what feels wrong, what to optimise for…'
+      : 'steering: what changed, what is wrong with this as written…';
+    ta.rows = 3;
+    box.appendChild(ta);
+    var provs = window.__ANU_PROVIDERS__ || [];
+    var picks = [];
+    if(provs.length){
+      var pl = document.createElement('div'); pl.className = 'rprovs';
+      var plab = document.createElement('span');
+      plab.textContent = 'consult:'; pl.appendChild(plab);
+      provs.forEach(function(n){
+        var l = document.createElement('label');
+        var c = document.createElement('input'); c.type = 'checkbox'; c.checked = true;
+        l.appendChild(c); l.appendChild(document.createTextNode(' ' + n));
+        pl.appendChild(l); picks.push({name: n, cb: c});
+      });
+      box.appendChild(pl);
+    }
+    var bar = document.createElement('div'); bar.className = 'rbar';
+    // fail() runs on EVERY path that does not reach fn - a stale token, a
+    // restarted server, a rejected fetch. Without it the launch button's
+    // disabled=true had no matching false, and one failure bricked the box.
+    function withPrompt(fn, fail){
+      api('/api/replan-prompt', {
+        scope: scope, phase: phaseId, item: itemLabel || '',
+        comment: ta.value,
+        providers: picks.filter(function(x){ return x.cb.checked; })
+                        .map(function(x){ return x.name; })
+      }).then(function(d){
+        if(!d || !d.ok){
+          say((d && d.error) || 'prompt build failed', 'err');
+          if(fail) fail(); return;
+        }
+        fn(d.prompt);
+      }).catch(function(){
+        say('server unreachable - is the dashboard still running?', 'err');
+        if(fail) fail();
+      });
+    }
+    // No launcher on this machine means this button could only ever fail;
+    // every other session control in this file hides itself in that case.
+    var haveLaunch = Object.keys(window.__ANU_LAUNCHERS__ || {}).length > 0;
+    var ob = document.createElement('button');
+    ob.className = 'pcc-btn run'; ob.textContent = 'Open re-plan session';
+    ob.title = 'Opens your tool on this repo with the re-plan prompt';
+    ob.addEventListener('click', function(){
+      ob.disabled = true;
+      function again(){ ob.disabled = false; }
+      withPrompt(function(pr){
+        api('/api/session', {phase: 'replan-' + scope + '-' + (phaseId || 'all'),
+                             prompt: pr, tool: window.__ANU_PROFILE_TOOL__ || 'claude'})
+          .then(function(d){ again();
+            say(d && d.ok ? 'session opened — this page follows the plan as it changes'
+                          : ((d && d.error) || 'launch failed'), d && d.ok ? 'ok' : 'err'); })
+          .catch(function(){ again(); say('launch failed — server unreachable', 'err'); });
+      }, again);
+    });
+    var cp = document.createElement('button');
+    cp.className = 'pcc-btn'; cp.textContent = 'Copy prompt';
+    cp.title = 'For a session you already have open, or another machine';
+    cp.addEventListener('click', function(){
+      withPrompt(function(pr){
+        copyLocal(pr).then(function(){ say('re-plan prompt copied', 'ok'); },
+                           function(){ say('clipboard refused', 'err'); });
+      });
+    });
+    if(haveLaunch) bar.appendChild(ob);
+    bar.appendChild(cp);
+    box.appendChild(bar);
+    return box;
+  }
+
+  // toggle helper: one button shows/hides one lazily built box
+  function replanToggle(scope, phaseId, itemLabel, say, host){
+    var b = document.createElement('button');
+    b.className = 'pcc-btn'; b.textContent = 'Re-plan…';
+    b.title = scope === 'item'
+      ? 'Reassess just this item in a code session, with your steering'
+      : 'Reassess this phase in a code session — it edits the plan, not just re-reads it';
+    var box = null;
+    b.addEventListener('click', function(){
+      if(box){ box.remove(); box = null; b.textContent = 'Re-plan…'; return; }
+      box = replanBox(scope, phaseId, itemLabel, say);
+      host.appendChild(box); b.textContent = 'Close re-plan';
+      box.querySelector('textarea').focus();
+    });
+    return b;
+  }
+
   function copyLocal(text){
     try {
       if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
@@ -1472,6 +1679,56 @@ JS = r"""
     });
   }
   window.__pccLaunch__ = launch;
+
+  // Whole-plan re-plan lives on the bottom bar; its box floats above it so it
+  // works from any tab.
+  (function(){
+    var b = document.getElementById('pcc-replan-all'); if(!b) return;
+    var host = document.createElement('div'); host.id = 'pcc-replan-host';
+    document.body.appendChild(host);
+    function sayTop(m, c){
+      var n = host.querySelector('.dstatus');
+      if(!n){ n = document.createElement('div'); n.className = 'dstatus';
+              host.appendChild(n); }
+      n.textContent = m || ''; n.className = 'dstatus ' + (c || '');
+    }
+    var box = null;
+    b.addEventListener('click', function(){
+      if(box){
+        host.textContent = '';   // the box AND its floating status line
+        box = null; b.textContent = 'Re-plan…'; return;
+      }
+      box = replanBox('plan', '', '', sayTop);
+      host.appendChild(box); b.textContent = 'Close re-plan';
+      box.querySelector('textarea').focus();
+    });
+  })();
+
+  // ------------------------------------------------------------- freshness --
+  // A git pull rewrites the plan under this page. Every render already comes
+  // from disk, so the missing piece is the page NOTICING: poll a stamp of the
+  // watched files' mtimes and reload when it moves - open phases restored, so
+  // the reload costs one blink.
+  (function(){
+    // The baseline is the stamp of the files THIS page was rendered from,
+    // baked in server-side. Adopting the first poll response instead would
+    // silently absorb a change landing between render and first poll - the
+    // exact git-pull-during-load window the feature exists for.
+    var v0 = window.__ANU_FRESH0__ || null;
+    function tick(){
+      fetch('/api/fresh').then(function(r){ return r.json(); }).then(function(d){
+        if(!d || !d.v) return;
+        if(v0 === null){ v0 = d.v; return; }
+        if(d.v === v0) return;
+        // open-phase state survives via the shared render's own
+        // pccOpenPhases beforeunload stash - reload() fires it like any
+        // other navigation; a second mechanism here would just race it.
+        location.reload();
+      }).catch(function(){});
+    }
+        setInterval(tick, 4000); tick();
+  })();
+
   window.__pccToolSelect__ = toolSelect;
 
   // The shared render draws a .launch row (prompt + Copy prompt + Details) on
@@ -1604,6 +1861,8 @@ JS = r"""
       row.appendChild(wrap);
     }
 
+    row.appendChild(replanToggle('item', String(p.id), label, say, bar));
+
     var det = document.createElement('details');
     var sum = document.createElement('summary'); sum.textContent = 'item prompt';
     var pre = document.createElement('pre'); pre.textContent = prompt;
@@ -1641,9 +1900,11 @@ JS = r"""
       act.appendChild(t);
     }
 
+    act.appendChild(replanToggle('phase', String(p.id), '', say, host));
+
     var rg = document.createElement('button');
     rg.className = 'pcc-btn'; rg.textContent = 'Regenerate';
-    rg.title = 'Re-read the plan and refresh this phase';
+    rg.title = 'Re-read the plan files and refresh — Re-plan… is the one that CHANGES the plan';
     rg.addEventListener('click', function(){
       rg.disabled = true; say('re-reading the plan…');
       fetch('/api/model').then(function(r){ return r.json(); }).then(function(m){
@@ -2056,14 +2317,19 @@ def action_layer(token: str, model: dict) -> str:
         '<button class="pcc-btn x">close</button></header><pre></pre></div>'
         '<div id="pcc-svc"></div>'
         '<div id="pcc-bar"><span class="lbl">local</span>' + buttons +
+        '<button class="pcc-btn" id="pcc-replan-all" '
+        'title="Reassess the whole plan in a code session">Re-plan\u2026</button>'
         '<a class="pcc-btn" href="/setup" style="text-decoration:none;margin-left:auto"'
         ' title="configure this machine and this project">Setup</a>'
         '<span class="pcc-local">actions live</span></div>'
         "<script>window.__ANU_TOKEN__=" + _pr.js(token) + ";"
+        "window.__ANU_FRESH0__=" + _pr.js(fresh_stamp()) + ";"
         "window.__ANU_ITEMS__=" + _pr.js(idx) + ";"
         "window.__ANU_PROFILE_TOOL__=" + _pr.js(
             (_pr.load_user_profile() or {}).get("tool", "")) + ";"
-        "window.__ANU_LAUNCHERS__=" + _pr.js(
+        "window.__ANU_PROVIDERS__=" + _pr.js(
+            [c.get("name", "") for c in (CFG.get("context") or []) if c.get("name")]) + ";"
+          "window.__ANU_LAUNCHERS__=" + _pr.js(
             {k: {"label": v["label"], "mode": v.get("mode", "")}
              for k, v in LAUNCHERS.items()}) + ";</script>"
         "<script>" + JS + "</script>")
@@ -3267,6 +3533,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
+        if path == "/api/fresh":
+            self._json({"v": fresh_stamp()})
+            return
+
         if path == "/":
             if not (REPO / "docs" / "progress.toml").exists():
                 self._redirect("/setup")     # nothing to render yet; go configure
@@ -3467,6 +3737,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/setup/project":
             self._json(setup_project(body))
+            return
+
+        if path == "/api/replan-prompt":
+            self._json(replan_prompt(str(body.get("scope", "phase")),
+                                     str(body.get("phase", "")),
+                                     str(body.get("item", "")),
+                                     str(body.get("comment", "")),
+                                     list(body.get("providers") or [])))
             return
 
         if path == "/api/session":

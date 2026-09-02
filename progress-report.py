@@ -853,6 +853,27 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
                               url, str(c.get("auth_env", "")), bool(c.get("probe", True)))
         notes.append(f"[[context]] + {nm} -> {url}")
 
+    # The plan drives the phases: after every save the effective plan's
+    # headings are reconciled into [[phase]] blocks, so picking a plan is
+    # enough — no second, manual step to make the dashboard show it.
+    try:
+        cur = tomllib.loads(text).get("project", {})
+        prev_plan = (tomllib.loads(before).get("project", {}) or {}).get("plan", "")
+        plan_rel = cur.get("plan", "") or prev_plan
+        # a non-string plan value (plan = 3 is legal TOML) would TypeError on
+        # the path join below, uncaught, and take the whole save down with it
+        if not isinstance(plan_rel, str) or not isinstance(prev_plan, str):
+            plan_rel = ""
+        plan_path = Path(repo) / plan_rel if plan_rel else None
+        if plan_path and plan_path.is_file():
+            import datetime
+            text, sync_notes = sync_phases_with_plan(
+                text, plan_path.read_text(encoding="utf-8", errors="replace"),
+                plan_rel, prev_plan, datetime.date.today().isoformat())
+            notes.extend(sync_notes)
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        notes.append(f"phase sync skipped: {exc}")
+
     # "proposed" only while nothing has been written. A one-click save shows
     # this diff AFTER the write, where calling it proposed would understate it.
     diff = "".join(difflib.unified_diff(
@@ -897,7 +918,7 @@ def check_config(repo: Path) -> int:
     for key in ("name", "start_date"):
         if not proj.get(key):
             problems.append(f"[project] is missing required key {key!r}")
-    plan_rel = proj.get("plan", "PLAN.md")
+    plan_rel = proj.get("plan", DEFAULT_PLAN)
     plan_p = repo / plan_rel
     sections: dict[str, str] = {}
     if not plan_p.exists():
@@ -1228,6 +1249,11 @@ allow_artifact_publish = false
 
 # ---------------------------------------------------------------- parsing ---
 
+# The plan file when [project] names none. ONE constant: the renderer, the
+# freshness stamp and the re-plan prompts must all watch the SAME file, or
+# a plan-less config renders one file while the tools track another.
+DEFAULT_PLAN = "PLAN.md"
+
 CHECK = re.compile(r"^\s*[-*]\s*\[([ xX~/-])\]\s*(.+?)\s*$")
 
 
@@ -1254,6 +1280,140 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
             out.append({"state": _state(m.group(1)), "label": label.strip(),
                         "file": file, "raw": line})
     return out
+
+
+def _phase_block_spans(lines: list[str]) -> list[tuple[int, int]]:
+    """Line spans of every [[phase]] block, string-aware.
+
+    A naive column-0-bracket terminator ends a block at any column-0 bracket — including
+    one INSIDE a multi-line TOML string (an exit_test that quotes "[ok] ..."),
+    which truncated the block mid-string and produced invalid TOML on retire.
+    So this tracks basic/literal multi-line string state line by line, treats a
+    header as a header only OUTSIDE a string, and uses the SAME rule for block
+    start and block end.
+    """
+    spans, in_str, delim, start = [], False, "", None
+    header = re.compile(r"^\s*\[")
+    phase_header = re.compile(r"^\s*\[\[phase\]\]\s*(#.*)?$")
+    for i, line in enumerate(lines):
+        if not in_str and header.match(line):
+            if start is not None:
+                spans.append((start, i))
+                start = None
+            if phase_header.match(line):
+                start = i
+        # toggle multi-line string state AFTER header handling: a header line
+        # cannot open a string, and a string opened on a value line may close
+        # on the same line (an odd count of the delimiter toggles).
+        for d in ('"' * 3, "'" * 3):
+            if in_str and d != delim:
+                continue
+            n = line.count(d)
+            if n % 2:
+                in_str, delim = (not in_str), (d if not in_str else "")
+    if start is not None:
+        spans.append((start, len(lines)))
+    return spans
+
+
+def sync_phases_with_plan(cfg_text: str, plan_text: str, plan_rel: str,
+                          old_plan_rel: str, today: str) -> tuple[str, list[str]]:
+    """Make the [[phase]] blocks follow the plan's "### Phase <id>" headings.
+
+    Selecting a plan full of phase headings used to leave the dashboard at
+    "0 of 0 phases" until [[phase]] blocks were written by hand. So, on save:
+
+      - a heading with no [[phase]] block gets a generated stub (days is a
+        placeholder, depends_on chains natural id order — both marked TODO);
+      - a block whose id matches a heading is LEFT ALONE — it holds days,
+        depends_on and exit_test somebody chose;
+      - when the plan FILE changed, blocks whose ids no longer resolve and that
+        name no per-phase doc are commented out under a dated banner — history
+        kept in the file, never deleted. Same file: nothing is retired.
+
+    What is DECLARED comes from tomllib — the only judge of what the file
+    means — paired positionally with the string-aware line spans; the text
+    layer only ever appends or comments lines. If the two disagree about how
+    many blocks exist, retirement is skipped entirely: adding a missing phase
+    is always safe, commenting out the wrong lines never is.
+    """
+    desired: dict[str, str] = {}
+    for pid, sec in plan_phase_sections(plan_text).items():
+        m = re.match(r"^###\s+Phase\s+\S+\s*[\u2014\-\u2013]\s*(.*)$",
+                     sec.splitlines()[0])
+        name = (m.group(1).strip() if m else "") or f"Phase {pid}"
+        name = re.sub(r"\s*\*\(.*?\)\*\s*$", "", name).strip() or f"Phase {pid}"
+        desired[pid] = name
+    if not desired:
+        return cfg_text, []                    # a plan with no headings syncs nothing
+
+    try:
+        declared_tables = tomllib.loads(cfg_text).get("phase", []) or []
+    except tomllib.TOMLDecodeError as exc:
+        return cfg_text, [f"phase sync skipped: config unparsable ({exc})"]
+    declared = {str(p.get("id", "")) for p in declared_tables}
+    notes: list[str] = []
+    lines = cfg_text.splitlines(keepends=True)
+
+    # retire only on a REAL plan switch — normalised, so './PLAN.md' over
+    # 'PLAN.md' (or a case respelling on a case-insensitive filesystem) is the
+    # same file, not a switch that disables hand-added phases.
+    def _norm(p: str) -> str:
+        return os.path.normcase(os.path.normpath(str(p or "")))
+    if old_plan_rel and _norm(old_plan_rel) != _norm(plan_rel):
+        spans = _phase_block_spans(lines)
+        if len(spans) != len(declared_tables):
+            notes.append("phase sync: block scan and parser disagree — "
+                         "retirement skipped, additions still applied")
+        else:
+            for (start, end), tbl in sorted(zip(spans, declared_tables),
+                                            key=lambda x: -x[0][0]):
+                pid = str(tbl.get("id", ""))
+                if pid in desired or "doc" in tbl:
+                    continue
+                # the tail of a span is often the banner introducing the NEXT
+                # section: trailing blanks and comment lines stay uncommented.
+                e = end
+                while e > start + 1 and (not lines[e - 1].strip()
+                                         or lines[e - 1].lstrip().startswith("#")):
+                    e -= 1
+                banner = (f"# --- phase {pid!r} of the previous plan ({old_plan_rel}), "
+                          f"retired {today} when the plan moved to {plan_rel}. "
+                          "History, not config. ---\n")
+                lines[start:e] = [banner] + ["# " + l if l.strip() else l
+                                             for l in lines[start:e]]
+                notes.append(f"[[phase]] {pid}: retired (was in {old_plan_rel})")
+                declared.discard(pid)
+
+    # chain in natural id order, not document order: an addendum phase can sit
+    # anywhere in the file, and "0 depends on 5" is a bad guess.
+    def _nat(pid):
+        return (0, int(pid)) if pid.isdigit() else (1, pid)
+    ordered = sorted(desired, key=_nat)
+    missing = [pid for pid in ordered if pid not in declared]
+    if missing:
+        add = ["\n",
+               f"# --- phases generated {today} from the \"### Phase\" headings of "
+               f"{plan_rel}. days and depends_on are guesses - adjust. ---\n"]
+        prev = None
+        for pid in ordered:
+            if pid not in missing:
+                prev = pid
+                continue
+            dep = f'["{prev}"]' if prev is not None else "[]"
+            add.append(
+                "\n[[phase]]\n"
+                f'id         = "{pid}"\n'
+                f'name       = {_toml_str(desired[pid])}\n'
+                "days       = 1                  # TODO: working days of focused effort\n"
+                f"depends_on = {dep}             # TODO: the REAL technical dependency\n")
+            notes.append(f"[[phase]] {pid}: generated from {plan_rel}")
+            prev = pid
+        body = "".join(lines)
+        if not body.endswith("\n"):
+            body += "\n"
+        return body + "".join(add), notes
+    return "".join(lines), notes
 
 
 def plan_phase_sections(plan_text: str) -> dict[str, str]:
@@ -1453,7 +1613,7 @@ def _overlay_user_profile(devs: list, repo: Path) -> list:
 def build(repo: Path) -> dict:
     cfg = tomllib.loads((repo / "docs" / "progress.toml").read_text(encoding="utf-8"))
     proj = cfg["project"]
-    plan_text = (repo / proj.get("plan", "PLAN.md")).read_text(encoding="utf-8", errors="replace")
+    plan_text = (repo / proj.get("plan", DEFAULT_PLAN)).read_text(encoding="utf-8", errors="replace")
     sections = plan_phase_sections(plan_text)
 
     phases = []
@@ -1469,7 +1629,7 @@ def build(repo: Path) -> dict:
             items = parse_checklist((repo / doc).read_text(encoding="utf-8", errors="replace"), doc)
             src = doc
         if not items and pid in sections:
-            items = parse_checklist(sections[pid], proj.get("plan", "PLAN.md"))
+            items = parse_checklist(sections[pid], proj.get("plan", DEFAULT_PLAN))
             src = f"{proj.get('plan')} §6"
 
         done = sum(1 for i in items if i["state"] == "done")
@@ -3082,7 +3242,7 @@ def main() -> int:
             watch = [REPO / "docs" / "progress.toml"]
             try:
                 cfg = tomllib.loads((REPO / "docs" / "progress.toml").read_text(encoding="utf-8"))
-                watch.append(REPO / cfg.get("project", {}).get("plan", "PLAN.md"))
+                watch.append(REPO / cfg.get("project", {}).get("plan", DEFAULT_PLAN))
                 watch += [REPO / p["doc"] for p in cfg.get("phase", []) if p.get("doc")]
             except (OSError, tomllib.TOMLDecodeError):
                 watch.append(REPO / "PLAN.md")
