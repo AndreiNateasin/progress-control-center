@@ -3065,19 +3065,25 @@ SETUP_JS = r"""
     var t=$('#sw-svc tbody'); t.textContent='';
     var leftover = {}; Object.keys(KEPT).forEach(function(k){ leftover[k]=KEPT[k] });
     rows.forEach(function(s){
+      // "configured" alone hid reachability - you could not see your own
+      // tunnel working - and never said WHAT covers the row, so an already
+      // adopted service read as one you were being refused. Both, always:
+      var live = s.up ? 'up '+s.ms+'ms' : 'no answer';
+      var chip = s.configured ? 'configured · '+live : live;
+      var cls  = s.configured ? 'have' : (s.up ? 'up' : 'down');
+      var what = s.configured
+        ? s.what+' · already adopted as “'+(s.configured_as||s.name)+
+          '” — nothing to add here; sessions use it whenever the probe is green'
+        : s.what;
       var kept = KEPT[s.name];
       if(kept && kept.host === host){
         // same service, same host: show it with the edits it was kept with
         delete leftover[s.name];
-        scanRow(t, s.name, s.label, s.what,
-                s.configured?'configured':(s.up?'up '+s.ms+'ms':'no answer'),
-                s.configured?'have':(s.up?'up':'down'),
+        scanRow(t, s.name, s.label, what, chip, cls,
                 kept, host, s.configured, !s.configured);
         return;
       }
-      scanRow(t, s.name, s.label, s.what,
-              s.configured?'configured':(s.up?'up '+s.ms+'ms':'no answer'),
-              s.configured?'have':(s.up?'up':'down'),
+      scanRow(t, s.name, s.label, what, chip, cls,
               {url:s.url, kind:s.kind, auth_env:s.auth_env},
               host, s.configured, s.up && !s.configured);
     });
@@ -3755,15 +3761,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "not a hostname or address"})
                 return
             # Match by name OR URL: the committed entry may carry its own
-            # name while the scan invents one from the label - name-only
-            # matching showed an already-adopted service as adoptable.
+            # name (project-context) while the scan invents one from the
+            # label - name-only matching showed an already-adopted service
+            # as adoptable, which is an invitation to configure it twice.
             have = {c.get("name") for c in CFG.get("context", [])}
             have_urls = {str(c.get("url", "")).rstrip("/")
                          for c in CFG.get("context", []) if c.get("url")}
+            by_url = {str(c.get("url", "")).rstrip("/"): c.get("name")
+                      for c in CFG.get("context", []) if c.get("url")}
             rows = _pr.scan_services(host)
             for r in rows:
                 r["configured"] = (r["name"] in have
                                    or r["url"].rstrip("/") in have_urls)
+                if r["configured"]:
+                    r["configured_as"] = (r["name"] if r["name"] in have
+                                          else by_url.get(r["url"].rstrip("/"), r["name"]))
             self._json({"ok": True, "host": host, "services": rows})
             return
 
