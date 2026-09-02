@@ -1271,15 +1271,34 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
     since this model was built, the match simply fails and the caller re-reads,
     instead of silently ticking whatever now sits at that line.
     """
-    out = []
-    for line in text.splitlines():
-        m = CHECK.match(line)
-        if m:
-            label = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(2))
-            label = re.sub(r"`([^`]+)`", r"\1", label)
-            label = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", label)
-            out.append({"state": _state(m.group(1)), "label": label.strip(),
-                        "file": file, "raw": line})
+    out, lines = [], text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = CHECK.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        raw, i = lines[i], i + 1
+        parts = [m.group(2)]
+        # A task wrapped across lines is ONE task: markdown continuation lines
+        # (indented, not a new bullet, not a quote) belong to the label. Only
+        # the first physical line rendered otherwise, which cut items
+        # mid-sentence with no way to read the rest. `raw` stays the checkbox
+        # line alone - write-back still matches the verbatim source line.
+        while i < len(lines):
+            nxt = lines[i]
+            if CHECK.match(nxt) or not nxt.strip():
+                break
+            if not re.match(r"^\s{2,}(?![-*>]\s)\S", nxt):
+                break
+            parts.append(nxt.strip())
+            i += 1
+        label = " ".join(parts)
+        label = re.sub(r"\*\*(.+?)\*\*", r"\1", label)
+        label = re.sub(r"`([^`]+)`", r"\1", label)
+        label = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", label)
+        out.append({"state": _state(m.group(1)), "label": label.strip(),
+                    "file": file, "raw": raw})
     return out
 
 
@@ -2049,6 +2068,9 @@ details.idet > summary:hover::after,details.idet > summary:focus-visible::after,
 details.idet[open] > summary::after{opacity:1}
 details.idet[open] > summary::after{content:"close"}
 details.idet > summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+details.idet > summary .lbl{min-width:0;flex:0 1 auto;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+details.idet[open] > summary .lbl{white-space:normal;overflow:visible}
 li.item[data-s="done"] .lbl{color:var(--ink-3);text-decoration:line-through;
   text-decoration-color:var(--line)}
 .ibar{margin:8px 0 10px;padding:10px 12px;background:var(--panel-2);
@@ -2693,7 +2715,7 @@ def render(d: dict) -> str:
             f'<button class="tick" type="button" data-next="{NEXT.get(i["state"], "done")}"'
             f' aria-label="{e(i["state"])}: {e(i["label"])}. Change state."'
             f'><span aria-hidden="true">{GLYPH.get(i["state"], "")}</span></button>'
-            f'<details class="idet"><summary><span class="lbl">{e(i["label"])}</span></summary>'
+            f'<details class="idet"><summary><span class="lbl" title="{e(i["label"])}">{e(i["label"])}</span></summary>'
             f'<div class="ibar"></div></details></li>'
             for i in p["items"]) or \
             '<li class="item empty"><span></span><span class="lbl quiet">'\
