@@ -12,7 +12,54 @@ python progress-serve.py --repo /path/to/your/project
 
 An unconfigured project opens the setup wizard; a configured one opens the dashboard.
 
+![The plan view: derived progress, computed schedule, phases with their status](docs/img/overview.png)
+
+> **See it in 30 seconds.** This repo is configured with its own
+> [ROADMAP.md](ROADMAP.md) as its plan, so cloning it and running
+> `python progress-serve.py --repo .` gives you the dashboard above — the tool
+> tracking its own roadmap. Every screenshot on this page is that.
+
 ---
+
+## What it solves
+
+**Plans go stale, and status gets retyped.** A plan is written once, drifts within a
+week, and the truth about progress moves into standups, spreadsheets and someone's
+head. Every status update is a human re-reading the repo and typing what they found.
+
+This inverts that. The markdown checkboxes you already write **are** the status —
+there is nothing to update — and the plan itself is editable from the dashboard by a
+coding session that can re-assess it against the repo as it stands today. The plan
+stops being a document you maintain and becomes one that maintains itself.
+
+**And the gap between "I know what to do" and "the agent knows what to do."** Opening
+a coding session on a piece of work means re-explaining the phase, its exit test, its
+open items, and which knowledge sources to consult. Here that prompt is already
+built, from the plan, per phase or per checklist item.
+
+## Where it saves time
+
+| Instead of | You |
+|---|---|
+| writing a status report | open the page — progress is derived, nothing to update |
+| working out what can start now | read *Ready* — dependencies are resolved for you |
+| guessing the finish date | read the projected finish and the critical path |
+| pasting context into an AI session | click **Open session** — the prompt is built from the phase |
+| writing a ticket from scratch | click **Draft ticket**, review, create — key written back |
+| rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
+| chasing "is your checkout the same as mine?" | teammates get a launch command for *their* machine |
+| a standup document | `--standup` writes it from the snapshot diff |
+
+## What it integrates
+
+| | |
+|---|---|
+| **Coding agents** | Claude Code, Codex, opencode, Cursor, VS Code — new session or continue, detected on PATH |
+| **Issue tracking** | JIRA Cloud and Server/DC — draft, review, create over the API, key recorded on the phase |
+| **Knowledge** | any MCP provider (stateless or stateful HTTP) as a `[[context]]`, its usage rules injected into every session prompt |
+| **Your repo** | git activity per phase, checkbox write-back, `--check` contract lint |
+| **Your services** | TCP reachability probes across one or more hosts, adopted as context providers |
+| **Nothing else** | Python ≥ 3.11 stdlib. No pip install, no daemon, no account, no telemetry |
 
 ## The one rule
 
@@ -44,8 +91,43 @@ output stream in. Open a coding session — new or continuing an existing one �
 a prompt already scoped to the phase, or to one checklist item. Ask a session to
 draft a JIRA ticket, review it, and create it.
 
+**A plan that stays current.** *Re-plan…* on any item, phase, or the whole plan hands
+the rethink to a coding session with your steering attached and your context
+providers consulted — it edits the plan and the config, under rules that keep done
+work done and headings machine-readable. Saving the config reconciles `[[phase]]`
+blocks with the plan's headings, so adding a phase to the markdown is enough. And the
+page reloads itself when the plan changes on disk, so a `git pull` from a teammate
+lands on your screen instead of going unnoticed.
+
 **A risk register** derived from the schedule: what is on the critical path, what
 external blockers will stall which phase, and how much slack is left.
+
+### A phase, expanded
+
+Every action sits on the phase itself — run its exit test, open a session scoped to
+it, re-plan it, draft its ticket. The checklist is the plan's own checkboxes; ticking
+one here rewrites that line in the markdown.
+
+![A phase expanded: its action row, checklist, exit test and what it unlocks](docs/img/phase-expanded.png)
+
+### The schedule you did not write
+
+`depends_on` and `days` are all you supply. The critical path, the parallel groups,
+each phase's earliest start and the projected finish are computed.
+
+![Timeline: scheduled windows per phase, with parallel groups](docs/img/timeline.png)
+
+### Risks, derived rather than maintained
+
+![Risk register: what is waiting on what, and the external blockers](docs/img/risks.png)
+
+### Setup that shows its reasoning
+
+Every autodiscovered value is shown *with the evidence for it* and can be changed or
+switched off. Nothing reaches the committed config until you save, and the diff of
+what landed is shown afterwards.
+
+![The project tab of the setup wizard](docs/img/setup-project.png)
 
 ## Two surfaces, different powers
 
@@ -178,6 +260,12 @@ disclosure so its keyboard behaviour and announced state come from the platform.
 
 Automated checks catch perhaps a third of real issues. This has not been tested with
 a screen reader.
+
+## Where it is going
+
+[ROADMAP.md](ROADMAP.md) — six phases, ordered cheapest-truth-first, with the
+non-goals written down. It is also this repo's plan file, so the roadmap and the
+dashboard cannot disagree.
 
 ## Licence
 

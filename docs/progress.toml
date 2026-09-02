@@ -1,0 +1,75 @@
+# Progress Control Center — its own roadmap, tracked by itself.
+# Progress is DERIVED from the checkboxes in ROADMAP.md; this file holds only
+# what markdown cannot express.
+
+[project]
+name       = "Progress Control Center"
+plan       = "ROADMAP.md"
+start_date = "2026-09-02"
+allow_artifact_publish = false
+
+# depends_on is the REAL technical dependency, not the order in the file.
+# Most of these are genuinely parallel; only the shared-server work needs the
+# multi-project change first, because serving several repos from one process
+# is what makes a shared dashboard coherent.
+
+[[phase]]
+id         = "1"
+name       = "Show the history already being collected"
+days       = 4
+depends_on = []
+exit_test  = "a repo with >=3 snapshots renders a burn-up whose final point equals the current percentage"
+
+[[phase]]
+id         = "2"
+name       = "A plan that shows its own history"
+days       = 3
+depends_on = []
+exit_test  = "re-plan a phase, reload, and the reason and date show without opening the markdown"
+
+[[phase]]
+id         = "3"
+name       = "Exit tests where they actually run"
+days       = 5
+depends_on = []
+exit_test  = "a phase with a failing CI run shows red though its boxes are ticked, with a link to the run"
+
+[[phase]]
+id         = "4"
+name       = "More than one project at a time"
+days       = 6
+depends_on = []
+exit_test  = "two configured projects render in one overview and switching needs no restart"
+
+[[phase]]
+id         = "5"
+name       = "The shared-server story, finished"
+days       = 5
+depends_on = ["4"]
+exit_test  = "three developers on three machines each get a launch command that runs on their own box"
+
+[[phase]]
+id         = "6"
+name       = "Operational honesty"
+days       = 3
+depends_on = []
+exit_test  = "an unreachable context provider is visible before a session is launched against it"
+
+[[blocker]]
+id        = "codex-machine"
+name      = "A machine with Codex installed (to verify resume flags)"
+owner     = "you"
+lead_days = 2
+status    = "todo"
+
+# The team roster: who exists and their default tool. Personal paths never
+# land here - each developer's own checkout lives in their profile.
+[[developer]]
+name  = "alex"
+tool  = "claude"
+shell = "bash"
+
+[[developer]]
+name  = "sam"
+tool  = "codex"
+shell = "powershell"
