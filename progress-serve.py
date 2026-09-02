@@ -1449,7 +1449,14 @@ JS = r"""
       method:'POST',
       headers:{'Content-Type':'application/json','X-PCC-Token':T},
       body: JSON.stringify(body||{})
-    }).then(function(r){ return r.json(); });
+    }).then(function(r){ return r.json(); }).then(function(d){
+        // The per-run token died with the old server process. The raw error
+        // reads like a bug; what happened is the dashboard restarted.
+        if(d && d.error === 'bad or missing token'){
+          d.error = 'the dashboard was restarted since this page loaded \u2014 reload the page and try again';
+        }
+        return d;
+      });
   }
 
   var out = document.getElementById('pcc-out'),
@@ -3020,35 +3027,82 @@ SETUP_JS = r"""
     if(!E.configured) $('#sw-ppath').textContent = E.config_path+'  (does not exist yet)';
   }
 
-  function renderScan(rows){
-    SCAN=rows; var t=$('#sw-svc tbody'); t.textContent='';
-    rows.forEach(function(s,i){
-      var cb=el('input',{type:'checkbox'});
-      cb.checked = s.up && !s.configured; cb.disabled = s.configured;
-      var st = s.configured ? el('span',{class:'chip have',text:'configured'})
-             : s.up ? el('span',{class:'chip up',text:'up '+s.ms+'ms'})
-                    : el('span',{class:'chip down',text:'no answer'});
-      var url=inp('u-'+i,s.url); url.disabled=s.configured;
-      var kind=sel('k-'+i,s.kind,['mcp-stateless-http','mcp-stateful-http','prompt-only']);
-      kind.disabled=s.configured;
-      var auth=inp('a-'+i,s.auth_env,'env var name'); auth.disabled=s.configured;
-      var tr=el('tr',{class:cb.checked?'':'off'},[
-        el('td',{},[cb]),
-        el('td',{},[el('div',{text:s.label}),el('div',{class:'why',text:s.what})]),
-        el('td',{},[st]), el('td',{},[url]), el('td',{},[kind]), el('td',{},[auth])]);
-      cb.addEventListener('change',function(){tr.classList.toggle('off',!cb.checked)});
-      tr.dataset.i=i; t.appendChild(tr);
+    // Rows adopted from one host survive a scan of another: harvest ticked
+  // rows into KEPT before each scan, and render leftovers as sticky rows.
+  // One resource can live on one IP and the rest on another - the scan host
+  // is just a probe convenience, never the shape of the config.
+  var KEPT = {};
+  function harvestScan(){
+    document.querySelectorAll('#sw-svc tbody tr').forEach(function(tr){
+      if(!tr._name || tr._configured) return;
+      if(tr._cb.checked){
+        KEPT[tr._name] = {label: tr._label, what: tr._what, host: tr._host,
+                          url: tr._url.value, kind: tr._kind.value,
+                          auth_env: tr._auth.value};
+      } else {
+        delete KEPT[tr._name];
+      }
     });
-    $('#sw-svc').style.display = rows.length?'table':'none';
+  }
+  function scanRow(t, name, label, what, chip, chipCls, vals, host, configured, ticked){
+    var cb=el('input',{type:'checkbox'});
+    cb.checked = ticked; cb.disabled = configured;
+    var st = el('span',{class:'chip '+chipCls, text:chip});
+    var url=inp('', vals.url); var kind=sel('', vals.kind,
+      ['mcp-stateless-http','mcp-stateful-http','prompt-only']);
+    var auth=inp('', vals.auth_env,'env var name');
+    url.disabled=kind.disabled=auth.disabled=configured;
+    var tr=el('tr',{class:cb.checked?'':'off'},[
+      el('td',{},[cb]),
+      el('td',{},[el('div',{text:label}),el('div',{class:'why',text:what})]),
+      el('td',{},[st]), el('td',{},[url]), el('td',{},[kind]), el('td',{},[auth])]);
+    cb.addEventListener('change',function(){tr.classList.toggle('off',!cb.checked)});
+    tr._name=name; tr._label=label; tr._what=what; tr._host=host;
+    tr._configured=configured; tr._cb=cb; tr._url=url; tr._kind=kind; tr._auth=auth;
+    t.appendChild(tr);
+  }
+  function renderScan(rows, host){
+    var t=$('#sw-svc tbody'); t.textContent='';
+    var leftover = {}; Object.keys(KEPT).forEach(function(k){ leftover[k]=KEPT[k] });
+    rows.forEach(function(s){
+      var kept = KEPT[s.name];
+      if(kept && kept.host === host){
+        // same service, same host: show it with the edits it was kept with
+        delete leftover[s.name];
+        scanRow(t, s.name, s.label, s.what,
+                s.configured?'configured':(s.up?'up '+s.ms+'ms':'no answer'),
+                s.configured?'have':(s.up?'up':'down'),
+                kept, host, s.configured, !s.configured);
+        return;
+      }
+      scanRow(t, s.name, s.label, s.what,
+              s.configured?'configured':(s.up?'up '+s.ms+'ms':'no answer'),
+              s.configured?'have':(s.up?'up':'down'),
+              {url:s.url, kind:s.kind, auth_env:s.auth_env},
+              host, s.configured, s.up && !s.configured);
+    });
+    // rows adopted from OTHER hosts stay on screen and stay picked
+    Object.keys(leftover).forEach(function(name){
+      var k = leftover[name];
+      scanRow(t, name, k.label, k.what, 'kept \u00b7 '+k.host, 'up',
+              k, k.host, false, true);
+    });
+    $('#sw-svc').style.display =
+      (rows.length || Object.keys(leftover).length) ? 'table' : 'none';
   }
   function pickedContexts(){
-    var out=[];
+    var out=[], seen={};
     document.querySelectorAll('#sw-svc tbody tr').forEach(function(tr){
-      var i=tr.dataset.i, cb=tr.querySelector('input[type=checkbox]');
-      if(!cb.checked||cb.disabled) return;
-      var s=SCAN[i];
-      out.push({name:s.name,label:s.label,kind:val('k-'+i),url:val('u-'+i),
-                auth_env:val('a-'+i),probe:true});
+      if(!tr._name || tr._configured || !tr._cb.checked) return;
+      var name = tr._name;
+      if(seen[name]){
+        // the same service adopted from two hosts: both are real, so the
+        // second keeps its identity by carrying the host in its name
+        name = name + '-' + String(tr._host||'').replace(/[^A-Za-z0-9-]+/g,'-');
+      }
+      seen[name]=1;
+      out.push({name:name, label:tr._label, kind:tr._kind.value,
+                url:tr._url.value, auth_env:tr._auth.value, probe:true});
     });
     return out;
   }
@@ -3153,14 +3207,14 @@ SETUP_JS = r"""
       if(ev.key === 'Enter') $('#sw-add').click();
     });
     $('#sw-scan').addEventListener('click',function(){
-      var btn=this; btn.disabled=true; say('#sw-smsg','scanning\u2026');
+      var btn=this; harvestScan(); btn.disabled=true; say('#sw-smsg','scanning\u2026');
       api('/api/setup/scan',{host:$('#sw-host').value.trim()||'127.0.0.1'}).then(function(d){
         btn.disabled=false;
         if(!d.ok){say('#sw-smsg',d.error,'err');return}
         var up=d.services.filter(function(s){return s.up}).length;
         say('#sw-smsg',up+' of '+d.services.length+' answered \u00b7 a port that answers proves '+
             'something is listening, not that it is what we named it','');
-        renderScan(d.services);
+        renderScan(d.services, d.host);
       });
     });
     $('#sw-init').addEventListener('click',function(){
