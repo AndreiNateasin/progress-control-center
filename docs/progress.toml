@@ -49,6 +49,13 @@ depends_on = ["4"]
 exit_test  = "three developers on three machines each get a launch command that runs on their own box"
 
 [[phase]]
+id         = "7"
+name       = "The plan answers questions (MCP)"
+days       = 4
+depends_on = []                 # independent; pairs naturally with Phase 6's honesty items
+exit_test  = "an agent ticks an item over MCP, dashboard reflects it, stale tick refused, tools/list works in a real runtime"
+
+[[phase]]
 id         = "6"
 name       = "Operational honesty"
 days       = 3

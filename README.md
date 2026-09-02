@@ -268,7 +268,7 @@ a screen reader.
 
 ## Where it is going
 
-[ROADMAP.md](ROADMAP.md) — six phases, ordered cheapest-truth-first, with the
+[ROADMAP.md](ROADMAP.md) — seven phases, ordered cheapest-truth-first, with the
 non-goals written down. It is also this repo's plan file, so the roadmap and the
 dashboard cannot disagree.
 

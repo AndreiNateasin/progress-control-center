@@ -133,6 +133,57 @@ Small, independent items that each remove a way the dashboard can mislead.
 **Exit test:** an unreachable context provider is visible on the dashboard before a
 session is launched against it.
 
+### Phase 7 — The plan answers questions (MCP)
+
+Sessions get the plan pushed once, at launch, and are on their own after that: they
+re-derive state by re-reading markdown and tick items by hand-editing lines. An MCP
+server makes the plan queryable and actable mid-session — through the same derived
+model and the same write-back the dashboard uses, so the files stay the only store.
+
+Design decisions, made up front:
+
+- **A lens, not a store.** Every tool call re-runs the derivation from disk; the
+  server holds no state. The moment it holds anything the files do not, the one
+  rule is dead.
+- **stdio transport, spawned per session** (`progress-serve.py --mcp`). Stateless
+  by design makes a process per agent free, and stdio needs no port, no token and
+  no bind-address story. Still two files, still stdlib: MCP's stdio transport is
+  newline-delimited JSON-RPC.
+- **No privilege escalation.** The MCP surface may never exceed what the agent
+  could do by editing files it already has. Ticks route through the existing
+  verbatim-line write-back (stale reads refused); no command execution, no config
+  writes, no secrets, no ticket creation.
+- **Registered by the tool itself.** The wizard's managed `.mcp.json` block —
+  built for `[[context]]` providers — gains an opt-in self-entry, so the plan
+  becomes one more knowledge source a session consults.
+
+- [ ] stdio JSON-RPC loop behind `--mcp`: initialize handshake, `tools/list`,
+  `tools/call` — stdlib only, one process per session, nothing cached.
+- [ ] Read tools over the derived model: `get_plan_overview` (phases, status,
+  critical path, projected finish), `get_phase` (items with states, exit test,
+  dependencies), `list_ready`, and `check_plan` wrapping the contract lint so a
+  re-plan session can verify itself.
+- [ ] `tick_item` through the existing write-back: verbatim-line matching, a line
+  changed since read is refused, same three states the dashboard offers.
+- [ ] Opt-in self-registration in the wizard: a managed `.mcp.json` entry pointing
+  at this install's own script path, removed when toggled off.
+- [ ] Session prompts advertise the tools when the entry exists — the brief-first
+  flow tells the agent to verify its proposed steps against `get_phase` before
+  asking for confirmation.
+- [ ] The parity guard, written down and tested: an agent with the MCP surface can
+  do nothing an agent with file access could not already do — the server only
+  makes it correct.
+
+**Exit test:** an agent session ticks an item over MCP and the dashboard reflects
+it without the agent touching markdown; a tick against a line changed since read
+is refused; `tools/list` shows the five tools from inside a real agent runtime.
+
+**Composes with, not replaced by:** a knowledge-platform mirror (e.g. publishing
+checkbox transitions one-way into a shared memory so checkout-less agents can
+recall project state) is the *recall* surface to this phase's *acting* surface.
+The mirror stays a rebuildable cache; nothing ever reads progress back from it as
+authority.
+
 ---
 
 ## Non-goals
