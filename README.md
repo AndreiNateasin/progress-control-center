@@ -45,6 +45,7 @@ built, from the plan, per phase or per checklist item.
 | working out what can start now | read *Ready* — dependencies are resolved for you |
 | guessing the finish date | read the projected finish and the critical path |
 | pasting context into an AI session | click **Open session** — the prompt is built from the phase |
+| an agent running off in the wrong direction | the session must post its steps and acceptance criteria, and **wait for your confirmation**, before touching anything |
 | writing a ticket from scratch | click **Draft ticket**, review, create — key written back |
 | rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
 | chasing "is your checkout the same as mine?" | teammates get a launch command for *their* machine |
@@ -88,8 +89,12 @@ are exactly where the parallelism shows up.
 
 **Actions on the phase, not beside it.** Run that phase's exit test and watch the
 output stream in. Open a coding session — new or continuing an existing one — with
-a prompt already scoped to the phase, or to one checklist item. Ask a session to
-draft a JIRA ticket, review it, and create it.
+a prompt already scoped to the phase, or to one checklist item. Every session opens
+**brief-first**: it must post its proposed steps (each naming the checklist item it
+serves) and acceptance criteria decidable by inspecting a named thing or running a
+named command, then ask *"confirm these steps, or redirect me?"* and wait — no code,
+no file edits, until you confirm. Ask a session to draft a JIRA ticket, review it,
+and create it.
 
 **A plan that stays current.** *Re-plan…* on any item, phase, or the whole plan hands
 the rethink to a coding session with your steering attached and your context
