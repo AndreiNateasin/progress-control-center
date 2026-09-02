@@ -3700,10 +3700,16 @@ class Handler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"[A-Za-z0-9._:\[\]-]{1,255}", host):
                 self._json({"ok": False, "error": "not a hostname or address"})
                 return
+            # Match by name OR URL: the committed entry may carry its own
+            # name while the scan invents one from the label - name-only
+            # matching showed an already-adopted service as adoptable.
             have = {c.get("name") for c in CFG.get("context", [])}
+            have_urls = {str(c.get("url", "")).rstrip("/")
+                         for c in CFG.get("context", []) if c.get("url")}
             rows = _pr.scan_services(host)
             for r in rows:
-                r["configured"] = r["name"] in have
+                r["configured"] = (r["name"] in have
+                                   or r["url"].rstrip("/") in have_urls)
             self._json({"ok": True, "host": host, "services": rows})
             return
 
