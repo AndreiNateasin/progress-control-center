@@ -335,7 +335,19 @@ def _toml_val(v) -> str:
     return _toml_str(v)
 
 
-def _append_in_body(body: str, key: str, value) -> str:
+def _aligned_kv(body: str, key: str, value) -> str:
+    """`key = value` padded to the column its siblings in this table already use.
+
+    docs/progress.toml is committed and hand-read; a key written flush against
+    its `=` in a block where everything else lines up is a visible seam, and
+    rewriting one after an edit round-trip is how it happens.
+    """
+    pads = [len(m.group(1)) for m in re.finditer(r"^([A-Za-z_][\w-]*\s*)=", body, re.M)]
+    width = max(pads) if pads else len(key) + 1
+    return key.ljust(max(width, len(key) + 1)) + "= " + _toml_val(value)
+
+
+
     """Add `key = value` to a table body without disturbing anything else.
 
     Two details that matter on a file people hand-edit: the blank line that
@@ -343,9 +355,7 @@ def _append_in_body(body: str, key: str, value) -> str:
     visually), and the new key should adopt the column alignment its siblings
     already use.
     """
-    pads = [len(m.group(1)) for m in re.finditer(r"^([A-Za-z_][\w-]*\s*)=", body, re.M)]
-    width = max(pads) if pads else len(key) + 1
-    lit = key.ljust(max(width, len(key) + 1)) + "= " + _toml_val(value)
+    lit = _aligned_kv(body, key, value)
     lines = body.splitlines(keepends=True)
     last = 0
     for i, l in enumerate(lines):
@@ -448,7 +458,7 @@ def set_phase_key(text: str, phase_id: str, key: str, value) -> str:
         if not want.search(text[a:b]):
             continue
         body = text[a:b]
-        lit = f"{key} = {_toml_val(value)}"
+        lit = _aligned_kv(body, key, value)
         active = re.search(r"^([ \t]*)" + re.escape(key) + r"\s*=.*$", body, re.M)
         if active:
             return text[:a] + body[:active.start()] + active.group(1) + lit + \
@@ -457,6 +467,48 @@ def set_phase_key(text: str, phase_id: str, key: str, value) -> str:
         if comm:
             return text[:a] + body[:comm.start()] + lit + body[comm.end():] + text[b:]
         return text[:a] + _append_in_body(body, key, value) + text[b:]
+    raise KeyError(f"no [[phase]] with id = {phase_id!r}")
+
+
+def del_phase_key(text: str, phase_id: str, key: str, note: str = "") -> str:
+    """Comment out one key inside the `[[phase]]` whose id matches.
+
+    Commented, not deleted: the committed config keeps the record that this
+    phase once carried that value - the same instinct as retiring a phase
+    rather than removing it - and `set_phase_key` looks for a commented line
+    before appending, so re-linking lands back in the original slot instead of
+    at the bottom of the block.
+
+    Raises KeyError if the phase does not exist. A phase without the key is not
+    an error: the caller wants it gone, and it is gone.
+    """
+    lines = text.splitlines(keepends=True)
+    spans, start, off = [], None, 0
+    for line in lines:
+        s = line.strip()
+        if s == "[[phase]]":
+            if start is not None:
+                spans.append((start, off))
+            start = off + len(line)
+        elif s.startswith("[") and not s.startswith("#") and start is not None:
+            spans.append((start, off))
+            start = None
+        off += len(line)
+    if start is not None:
+        spans.append((start, len(text)))
+
+    want = re.compile(r'^\s*id\s*=\s*["\']' + re.escape(str(phase_id)) + r'["\']', re.M)
+    for a, b in spans:
+        if not want.search(text[a:b]):
+            continue
+        body = text[a:b]
+        active = re.search(r"^([ \t]*)(" + re.escape(key) + r"\s*=.*?)(\r?\n|$)", body, re.M)
+        if not active:
+            return text                      # already absent; nothing to do
+        tail = f"    # {note}" if note else ""
+        return (text[:a] + body[:active.start()]
+                + f"{active.group(1)}# {active.group(2).rstrip()}{tail}{active.group(3)}"
+                + body[active.end():] + text[b:])
     raise KeyError(f"no [[phase]] with id = {phase_id!r}")
 
 

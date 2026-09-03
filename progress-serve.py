@@ -1294,7 +1294,9 @@ def create_jira_issue(phase_id: str, summary: str, description: str) -> dict:
         return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
     if ph_cfg.get("jira"):
         return {"ok": False, "error": f"phase {phase_id} already has ticket "
-                                      f"{ph_cfg['jira']} — unlink it first"}
+                f"{ph_cfg['jira']} — use Unlink on this phase first if you "
+                "meant to raise a different one"}
+
     summary = str(summary or "").strip()
     description = str(description or "").strip()
     if not summary:
@@ -1401,7 +1403,38 @@ def link_ticket(phase_id: str, key: str) -> dict:
     return {"ok": True, "key": key, "path": str(cfgp)}
 
 
-# ---------------------------------------------------------------- action layer
+def unlink_ticket(phase_id: str) -> dict:
+    """Remove a phase's ticket link. The ISSUE is untouched - only the pointer.
+
+    Deliberately not two-step, unlike creating: creating a ticket is outward
+    facing and cannot be undone, while this edits one line of a local file that
+    git already tracks, and the button names the key it will remove before you
+    press it.
+    """
+    ph_cfg = next((p for p in CFG.get("phase", []) if str(p.get("id")) == str(phase_id)), None)
+    if ph_cfg is None:
+        return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
+    had = str(ph_cfg.get("jira", "") or "")
+    if not had:
+        return {"ok": False, "error": f"phase {phase_id} has no ticket linked"}
+    cfgp = REPO / "docs" / "progress.toml"
+    try:
+        import datetime
+        text = cfgp.read_text(encoding="utf-8")
+        new = _pr.del_phase_key(text, str(phase_id), "jira",
+                                f"unlinked {datetime.date.today().isoformat()}")
+        tomllib.loads(new)                      # never write a file we just broke
+        cfgp.write_text(new, encoding="utf-8")
+    except KeyError:
+        return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r} in progress.toml"}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    CFG.clear()
+    CFG.update(tomllib.loads(cfgp.read_text(encoding="utf-8")))
+    return {"ok": True, "was": had, "path": str(cfgp)}
+
+
+
 
 CSS = """
 #pcc-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;gap:8px;align-items:center;
@@ -1978,68 +2011,40 @@ JS = r"""
   // config and no extra credential. It asks for a draft, the session writes
   // .pcc/ticket-<phase>.json, this picks it up.
   function ticketControls(p, act, say, host){
-    if(p.jira) return;                       // already linked: nothing to create
-
-    // Drafting needs a launcher that can RUN and write a file. Offering it with
-    // a clipboard-only app selected produced a button that opened the app and
-    // then waited forever for a draft that could never be written.
-    var terms = terminalTools();
-    var draft = document.createElement('button');
-    draft.className = 'pcc-btn'; draft.textContent = 'Draft ticket';
-    if(!terms.length){
-      draft.disabled = true;
-      draft.title = 'Needs a terminal launcher (claude or opencode) — none found on this machine';
-    } else {
-      draft.title = 'Ask the selected terminal tool to write a ticket from this phase, ' +
-                    'then review it here before anything is created';
-      draft.addEventListener('click', function(){
-        // Resolve the tool AT CLICK TIME from the row's select, so changing it
-        // takes effect. Frozen at wiring time it ignored the picker entirely.
-        var sel = act.querySelector('select');
-        var want = sel && sel.value;
-        var dtool = (want && terms.indexOf(want) >= 0) ? want
-                  : (terms.indexOf(preferredTool()) >= 0 ? preferredTool() : terms[0]);
-        draft.disabled = true; say('asking ' + LN[dtool].label + ' to draft it…');
-        api('/api/phase/draft-ticket', {phase: p.id, tool: dtool})
-          .then(function(d){
-            draft.disabled = false;
-            if(!d.ok){ say(d.error, 'err'); return; }
-            say(d.note || 'session started — it will write the draft; press Load draft when done');
-            watchDraft(p, act, say, host);
-          });
-      });
+    // One slot, two states. A phase that has a ticket offers to remove it, with
+    // the key in the button so it says what it will do; a phase without one
+    // offers the key input. Either action swaps the slot in place - no reload
+    // to get back the control you now need.
+    var slot = document.createElement('span');
+    function currentKey(){
+      var rec = (window.__PCC_PHASES__ || {})[p.id];
+      return String((rec && rec.jira) || p.jira || '');
     }
-    act.appendChild(draft);
-
-    var load = document.createElement('button');
-    load.className = 'pcc-btn'; load.textContent = 'Load draft';
-    load.title = 'Read .pcc/ticket-' + p.id + '.json if a session has written it';
-    load.addEventListener('click', function(){ loadDraft(p, act, say, host, true); });
-    act.appendChild(load);
-
-    var inp = document.createElement('input');
-    inp.type = 'text'; inp.placeholder = 'PROJ-123'; inp.className = 'pcc-btn';
-    inp.style.width = '110px'; inp.style.cursor = 'text';
-    var lk = document.createElement('button');
-    lk.className = 'pcc-btn'; lk.textContent = 'Link ticket';
-    lk.title = 'Record an EXISTING ticket key on this phase (docs/progress.toml)';
-    function doLink(){
-      if(!inp.value.trim()){
-        say('type the key of a ticket that already exists (e.g. PROJ-123), or ' +
-            'use Draft ticket to create one', 'err');
-        inp.focus(); return;
+    function renderTicketSlot(){
+      slot.textContent = '';
+      var cur = currentKey();
+      if(cur){
+        var un = document.createElement('button');
+        un.className = 'anu-btn'; un.textContent = 'Unlink ' + cur;
+        un.title = 'Remove this ticket from the phase in docs/progress.toml. The '
+                 + 'issue itself is not touched - only the link.';
+        un.addEventListener('click', function(){
+          un.disabled = true;
+          api('/api/phase/unlink-jira', {phase: p.id}).then(function(d){
+            un.disabled = false;
+            if(!d || !d.ok){ say((d && d.error) || 'unlink failed', 'err'); return; }
+            if(window.__PCC_PHASES__ && window.__PCC_PHASES__[p.id])
+              window.__PCC_PHASES__[p.id].jira = '';
+            p.jira = '';
+            say('unlinked ' + d.was + ' \u2014 the issue still exists in JIRA; '
+                + 'reload to clear its pill', 'ok');
+            renderTicketSlot();
+          }).catch(function(){ un.disabled = false; say('server unreachable', 'err'); });
+        });
+        slot.appendChild(un);
+        return;
       }
-      lk.disabled = true;
-      api('/api/phase/jira', {phase: p.id, key: inp.value}).then(function(d){
-        lk.disabled = false;
-        if(!d.ok){ say(d.error, 'err'); return; }
-        say('linked ' + d.key + ' — reload to see the pill everywhere', 'ok');
-        window.__PCC_PHASES__[p.id].jira = d.key;
-      });
-    }
-    lk.addEventListener('click', doLink);
-    inp.addEventListener('keydown', function(ev){ if(ev.key === 'Enter') doLink(); });
-    act.appendChild(inp); act.appendChild(lk);
+      act.appendChild(slot);
 
     loadDraft(p, act, say, host, false, function(found){
       if(!found) resumeWatch(p, act, say, host);   // a reload mid-drafting resumes
@@ -3822,6 +3827,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(create_jira_issue(str(body.get("phase", "")),
                                          body.get("summary", ""),
                                          body.get("description", "")))
+            return
+
+        if path == "/api/phase/unlink-jira":
+            self._json(unlink_ticket(str(body.get("phase", ""))))
             return
 
         if path == "/api/phase/jira":
