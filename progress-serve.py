@@ -266,6 +266,100 @@ def tick(rel_file: str, raw: str, state: str) -> dict:
     return out
 
 
+def _focus_app_window(needle: str, timeout: float = 6.0) -> bool:
+    """Pull a visible top-level window of a matching process to the foreground.
+
+    `needle` is matched against the owning process's executable PATH, not its
+    title: the packaged Claude app and the Claude Code CLI are both `claude.exe`
+    and a title match would be a coin toss, while the path carries the package
+    identity.
+
+    SetForegroundWindow is refused for a process that does not own the
+    foreground - which is exactly this server, since the click happened in the
+    browser. Attaching our input queue to the foreground thread lifts that for
+    the duration of the call. This is the documented workaround rather than a
+    way around a security boundary: the user asked for this window by pressing
+    a button, and the alternative is a page that says "opened" about a window
+    still buried behind the browser.
+
+    Windows only. Everything is best-effort: a False return costs the caller
+    nothing but a more careful message.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+    try:
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        PROC_QUERY_LIMITED, SW_RESTORE, SW_SHOW = 0x1000, 9, 5
+
+        def exe_of(pid: int) -> str:
+            h = k32.OpenProcess(PROC_QUERY_LIMITED, False, pid)
+            if not h:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(32768)
+                n = wintypes.DWORD(len(buf))
+                return buf.value if k32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(n)) else ""
+            finally:
+                k32.CloseHandle(h)
+
+        def find() -> int:
+            found = []
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def cb(hwnd, _):
+                if found or not u32.IsWindowVisible(hwnd):
+                    return True
+                if not u32.GetWindowTextLengthW(hwnd):
+                    return True            # a title-less window is not the app
+                pid = wintypes.DWORD()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if needle.lower() in exe_of(pid.value).lower():
+                    found.append(hwnd)
+                return True
+
+            u32.EnumWindows(cb, 0)
+            return found[0] if found else 0
+
+        # A cold start needs time to put a window up; an app already running is
+        # found on the first pass.
+        deadline = time.monotonic() + timeout
+        hwnd = find()
+        while not hwnd and time.monotonic() < deadline:
+            time.sleep(0.25)
+            hwnd = find()
+        if not hwnd:
+            return False
+
+        fg = u32.GetForegroundWindow()
+        fg_tid = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        cur_tid = k32.GetCurrentThreadId()
+        attached = bool(fg_tid) and fg_tid != cur_tid and \
+            bool(u32.AttachThreadInput(cur_tid, fg_tid, True))
+        try:
+            u32.ShowWindow(hwnd, SW_RESTORE if u32.IsIconic(hwnd) else SW_SHOW)
+            u32.BringWindowToTop(hwnd)
+            u32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                u32.AttachThreadInput(cur_tid, fg_tid, False)
+        # Report what HAPPENED, not what was attempted: the window is only
+        # focused if it is now the foreground window.
+        return bool(u32.GetForegroundWindow() == hwnd)
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 def _detect_claude_app() -> str | None:
     """AppUserModelID of the Claude desktop app, when installed as a Store
     package. One Get-StartApps probe at startup — the family-hash in the id
@@ -334,6 +428,7 @@ def build_launchers(cfg: dict | None = None) -> dict:
     if appid:
         L["claude-app"] = {"label": "Claude app (prompt → clipboard)",
                            "mode": "clipboard",
+                           "focus": appid.split("!")[0].split("_")[-1],
                            "open": ["explorer.exe", "shell:AppsFolder\\" + appid]}
     code_path = shutil.which("code")
     if code_path:
@@ -341,6 +436,7 @@ def build_launchers(cfg: dict | None = None) -> dict:
         # resolution, so Popen(["code", ...]) cannot find the code.cmd shim.
         L["vscode"] = {"label": "VS Code (repo + prompt → clipboard)",
                        "mode": "clipboard",
+                       "focus": "Microsoft VS Code",
                        "open": [code_path, str(REPO)]}
     return L
 
@@ -877,9 +973,15 @@ def open_session(phase_id: str, prompt: str, tool: str = "claude",
     # clipboard mode: the tool takes no prompt argument, so paste is the delivery.
     try:
         subprocess.Popen(spec["open"], cwd=str(REPO), creationflags=NO_WINDOW)
+        # Launching activates the app, but a background process may not take the
+        # foreground - so an already-running app just blinked in the taskbar
+        # while this said "opened". Pull it forward, and say which happened.
+        focused = _focus_app_window(spec["focus"]) if spec.get("focus") else False
+        where = ("— paste it into the session" if focused
+                 else "— the app is in your taskbar; paste it there")
         return {"ok": True, "via": spec["open"][0], "tool": tool, "copied": copied,
-                "mode": "clipboard",
-                "note": ("prompt on your clipboard — paste it into the session" if copied
+                "mode": "clipboard", "focused": focused,
+                "note": ("prompt on your clipboard " + where if copied
                          else "opened, but the clipboard copy failed — use `view prompt`")}
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
