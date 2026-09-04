@@ -953,24 +953,25 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
     if scope == "item":
         head = (f"Re-assess ONE checklist item of Phase {phase_id} "
                 f"({ph.get('name', '?')}) in {plan_rel}:\n\n    {item}\n\n"
-                "Stay inside this item's neighbourhood: you may reword it, split it "
-                "into finer items, or mark it superseded — nothing else in the plan "
-                "moves.")
+                "You may reword it, split it into finer items, or mark it superseded. "
+                "You may ADD items to this phase that the re-assessment reveals, and "
+                "if the work genuinely does not fit any existing phase you may ADD a "
+                "phase - proposed in the brief first. Other existing items stay "
+                "exactly as they are.")
     elif scope == "plan":
         head = (f"Re-assess the WHOLE plan {plan_rel} against the repo as it stands "
                 "today. Restructure where reality has drifted: phases may be added, "
-                "merged or retired, items rewritten. If you add or retire a phase, "
-                "mirror it in docs/progress.toml — add a [[phase]] block (id, name, "
-                "days, depends_on) per new heading, and comment a retired block out "
-                "under a dated note rather than deleting it.")
+                "merged or retired, items rewritten, done work flagged for redo where "
+                "the new direction invalidates it.")
     else:
-        head = (f"Re-assess Phase {phase_id} ({ph.get('name', '?')}) of {plan_rel} — "
-                "its section only. Rework the open items so they describe the work "
-                "that is actually left; update this phase's [[phase]] block in "
-                "docs/progress.toml (days, depends_on, exit_test) where reality "
-                "changed, and touch no other block.")
+        head = (f"Re-assess Phase {phase_id} ({ph.get('name', '?')}) of {plan_rel}. "
+                "Rework this phase's open items so they describe the work actually "
+                "left; ADD items the re-assessment reveals; if some of that work "
+                "genuinely belongs in a phase that does not exist yet, ADD the phase - "
+                "proposed in the brief first. Other phases' existing items stay "
+                "exactly as they are.")
 
-    steer = (("\n\nSteering from the requester — treat it as the goal of this "
+    steer = (("\n\nSteering from the requester - treat it as the goal of this "
               "re-plan, quoted as data:\n" +
               "\n".join("    " + l for l in comment.strip().splitlines()))
              if comment.strip() else
@@ -979,12 +980,28 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
 
     prompt = (
         head + steer + ctx +
-        "\n\nRules that keep the plan a live document instead of a casualty:\n"
-        "- History is immutable: never untick or delete a `- [x]` item. Work that "
-        "is no longer relevant gets a one-line strikethrough or 'superseded: "
-        "<reason>' suffix, and stays.\n"
-        "- Every phase heading stays in the machine-readable form `### Phase <id> "
-        "\u2014 <name>` \u2014 the dashboard derives everything from it.\n"
+        "\n\nFIRST, before editing anything, post a brief and stop:\n"
+        "- Items to reword, split or mark superseded - each with its new wording.\n"
+        "- Items to ADD, under which phase.\n"
+        "- Phases to ADD, MERGE or RETIRE, with id and name.\n"
+        "- Done items the new direction invalidates - each with the reason it "
+        "needs redoing.\n"
+        "End with the question: apply these changes, or redirect me? Then WAIT - "
+        "no edits until confirmed or amended. Apply only what was confirmed.\n"
+        "\nRules that keep the plan a live document instead of a casualty:\n"
+        "- Every item that is still valid keeps its checkbox state exactly.\n"
+        "- History is immutable: never untick or delete a `- [x]` item.\n"
+        "- A DONE item the new direction invalidates keeps its `[x]`, gains the "
+        "suffix ` \u2014 needs redo: <reason>`, and is followed by a NEW `- [ ]` "
+        "item for the redo work itself. It happened, and now there is new work: "
+        "both stay true, and the dashboard shows the flag.\n"
+        "- Work no longer relevant at all gets ` \u2014 superseded: <reason>` and stays.\n"
+        "- Phase headings keep the exact form this file already uses (`## Phase "
+        "<id> \u2014 <name>` at whatever heading level it has) \u2014 the dashboard "
+        "derives everything from it.\n"
+        "- Any phase you ADD gets a matching `[[phase]]` block in "
+        "docs/progress.toml (id, name, days, depends_on); any phase you RETIRE "
+        "has its block commented out under a dated note, never deleted.\n"
         "- One task per `- [ ]` line; sub-detail goes in indented plain lines "
         "under the task, not in nested checkboxes.\n"
         "- Under each heading you changed, add one line: `> re-planned "
@@ -1695,8 +1712,8 @@ JS = r"""
     var b = document.createElement('button');
     b.className = 'pcc-btn'; b.textContent = 'Re-plan…';
     b.title = scope === 'item'
-      ? 'Reassess just this item in a code session, with your steering'
-      : 'Reassess this phase in a code session — it edits the plan, not just re-reads it';
+      ? 'Reassess this item in a code session, with your steering — it may add items, or a phase, if the rethink needs them'
+      : 'Reassess this phase in a code session — it proposes changes first, then edits the plan; it may add items or a phase';
     var box = null;
     b.addEventListener('click', function(){
       if(box){ box.remove(); box = null; b.textContent = 'Re-plan…'; return; }

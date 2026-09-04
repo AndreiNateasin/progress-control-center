@@ -98,8 +98,11 @@ and create it.
 
 **A plan that stays current.** *Re-plan…* on any item, phase, or the whole plan hands
 the rethink to a coding session with your steering attached and your context
-providers consulted — it edits the plan and the config, under rules that keep done
-work done and headings machine-readable. Saving the config reconciles `[[phase]]`
+providers consulted. It proposes its changes first and waits for your go-ahead, then
+edits the plan and the config under rules that keep history intact: valid items keep
+their state, a done item the new direction invalidates is flagged *needs redo* with
+the redo added as new work, and headings stay machine-readable. Re-planning one item
+or phase may add items — or a whole phase — when the rethink needs them. Saving the config reconciles `[[phase]]`
 blocks with the plan's headings, so adding a phase to the markdown is enough. And the
 page reloads itself when the plan changes on disk, so a `git pull` from a teammate
 lands on your screen instead of going unnoticed.

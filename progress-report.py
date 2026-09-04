@@ -1349,8 +1349,13 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
         label = re.sub(r"\*\*(.+?)\*\*", r"\1", label)
         label = re.sub(r"`([^`]+)`", r"\1", label)
         label = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", label)
-        out.append({"state": _state(m.group(1)), "label": label.strip(),
-                    "file": file, "raw": raw})
+        state = _state(m.group(1))
+        # A done item a re-plan has invalidated: it stays done (it happened),
+        # and the flag says the new direction wants it redone. The redo itself
+        # is a separate open item, so the maths stays honest either way.
+        redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
+        out.append({"state": state, "label": label.strip(),
+                    "file": file, "raw": raw, "redo": redo})
     return out
 
 
@@ -2143,6 +2148,9 @@ details.idet > summary:focus-visible{outline:2px solid var(--accent);outline-off
 details.idet > summary .lbl{min-width:0;flex:0 1 auto;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 details.idet[open] > summary .lbl{white-space:normal;overflow:visible}
+.redo{flex:none;margin-left:8px;font-family:var(--mono);font-size:10px;letter-spacing:.08em;
+  text-transform:uppercase;padding:2px 7px;border-radius:5px;background:var(--warn-soft);
+  color:var(--warn)}
 li.item[data-s="done"] .lbl{color:var(--ink-3);text-decoration:line-through;
   text-decoration-color:var(--line)}
 .ibar{margin:8px 0 10px;padding:10px 12px;background:var(--panel-2);
@@ -2787,7 +2795,11 @@ def render(d: dict) -> str:
             f'<button class="tick" type="button" data-next="{NEXT.get(i["state"], "done")}"'
             f' aria-label="{e(i["state"])}: {e(i["label"])}. Change state."'
             f'><span aria-hidden="true">{GLYPH.get(i["state"], "")}</span></button>'
-            f'<details class="idet"><summary><span class="lbl" title="{e(i["label"])}">{e(i["label"])}</span></summary>'
+            f'<details class="idet"><summary><span class="lbl" title="{e(i["label"])}">{e(i["label"])}</span>'
+            + ('<span class="redo" title="done, but a re-plan says this must be '
+               'redone \u2014 the redo is the next open item">needs redo</span>'
+               if i.get("redo") else "")
+            + f'</summary>'
             f'<div class="ibar"></div></details></li>'
             for i in p["items"]) or \
             '<li class="item empty"><span></span><span class="lbl quiet">'\
