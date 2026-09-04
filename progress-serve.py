@@ -3600,6 +3600,27 @@ def setup_project(body: dict) -> dict:
     return r
 
 
+# What a client that went away looks like from this side, on every platform.
+CLIENT_GONE = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
+class QuietServer(ThreadingHTTPServer):
+    """socketserver prints a full traceback for any exception in a handler.
+
+    For a client that hung up mid-response that is routine - this page reloads
+    itself by design - and the traceback reads like a crash. Those become one
+    line; everything else still prints in full, because a real handler bug
+    must not be silenced by the same net.
+    """
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_GONE):
+            print(f"  client {client_address[0]}:{client_address[1]} went away "
+                  f"mid-response ({type(exc).__name__}) - fine", file=sys.stderr)
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "progress-control-center/1.0"
     token = ""
@@ -3627,11 +3648,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj, code: int = 200) -> None:
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except CLIENT_GONE:
+            # The browser dropped the socket - a reload, a closed tab, a
+            # navigation - while this response was in flight. Nothing to
+            # deliver and nobody to deliver it to; not an error of ours.
+            pass
 
     # -- routes ---------------------------------------------------------------
     def do_GET(self) -> None:
@@ -3906,9 +3933,9 @@ def main() -> int:
     # bind one that is already listening; both then run, requests go to whichever
     # the OS picks, and you read stale pages from an old build while believing
     # you restarted. Failing loudly here is worth more than the convenience.
-    ThreadingHTTPServer.allow_reuse_address = False
+    QuietServer.allow_reuse_address = False
     try:
-        srv = ThreadingHTTPServer((a.host, a.port), Handler)
+        srv = QuietServer((a.host, a.port), Handler)
     except OSError as exc:
         print(f"cannot bind {a.host}:{a.port} — {exc}", file=sys.stderr)
         print("  another dashboard is probably already running there. Stop it, or "
