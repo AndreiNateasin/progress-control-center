@@ -35,7 +35,8 @@ stops being a document you maintain and becomes one that maintains itself.
 **And the gap between "I know what to do" and "the agent knows what to do."** Opening
 a coding session on a piece of work means re-explaining the phase, its exit test, its
 open items, and which knowledge sources to consult. Here that prompt is already
-built, from the plan, per phase or per checklist item.
+built, from the plan, per phase or per checklist item — and the phase is explained
+once: a session that already holds it gets only the next item.
 
 ## Where it saves time
 
@@ -45,6 +46,8 @@ built, from the plan, per phase or per checklist item.
 | working out what can start now | read *Ready* — dependencies are resolved for you |
 | guessing the finish date | read the projected finish and the critical path |
 | pasting context into an AI session | click **Open session** — the prompt is built from the phase |
+| re-explaining the phase to a session that already knows it | click **Send to phase session** — only the item goes, into the same conversation |
+| leaving the terminal to fetch the next item | type `/next-item 0` — the session pulls it from the live checklist |
 | an agent running off in the wrong direction | the session must post its steps and acceptance criteria, and **wait for your confirmation**, before touching anything |
 | writing a ticket from scratch | click **Draft ticket**, review, create — key written back |
 | rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
@@ -55,7 +58,7 @@ built, from the plan, per phase or per checklist item.
 
 | | |
 |---|---|
-| **Coding agents** | Claude Code, Codex, opencode, Cursor, VS Code — new session or continue, detected on PATH |
+| **Coding agents** | Claude Code, Codex, opencode, Cursor, VS Code — detected on PATH; one phase session per tool, resumed by id (Claude Code, opencode) or as the last session (Codex) |
 | **Issue tracking** | JIRA Cloud and Server/DC — draft, review, create over the API, key recorded on the phase |
 | **Knowledge** | any MCP provider (stateless or stateful HTTP) as a `[[context]]`, its usage rules injected into every session prompt |
 | **Your repo** | git activity per phase, checkbox write-back, `--check` contract lint |
@@ -88,13 +91,30 @@ finish. Phases whose real technical dependency differs from their order in the p
 are exactly where the parallelism shows up.
 
 **Actions on the phase, not beside it.** Run that phase's exit test and watch the
-output stream in. Open a coding session — new or continuing an existing one — with
-a prompt already scoped to the phase, or to one checklist item. Every session opens
-**brief-first**: it must post its proposed steps (each naming the checklist item it
-serves) and acceptance criteria decidable by inspecting a named thing or running a
-named command, then ask *"confirm these steps, or redirect me?"* and wait — no code,
-no file edits, until you confirm. Ask a session to draft a JIRA ticket, review it,
-and create it.
+output stream in. Open a coding session with a prompt already scoped to the phase, or
+to one checklist item. Every session opens **brief-first**: it must post its proposed
+steps (each naming the checklist item it serves) and acceptance criteria decidable by
+inspecting a named thing or running a named command, then ask *"confirm these steps,
+or redirect me?"* and wait — no code, no file edits, until you confirm. Ask a session
+to draft a JIRA ticket, review it, and create it.
+
+**One phase session, told the phase once.** Every prompt has two shapes. The *cold*
+one carries the phase — doc, exit test, modules, open items, the protocol — and goes
+out once, on *Start phase session*; the session acknowledges and waits for the first
+item. Each item after that is a *warm* prompt of about 560 characters, sent into the
+same conversation by *Send to phase session*, which resumes that phase's session by
+id rather than whichever conversation was most recent in the directory. If the
+session's terminal tab is still open, the text goes to the clipboard and the tab is
+focused instead of a second process being started on the same transcript. On the
+project this was measured on, a 19-item phase used to send 29,902 characters of
+prompt, 27,400 of them repeats; now it sends one brief and then the items. A strip on
+the phase shows what the page can honestly tell you about that session — tool and
+id, when it started, the last item sent, whether the terminal is live and the
+transcript still exists, and exactly what *Send* will do next — plus an amber line
+when the item last sent is still open in the plan, which is the one thing the page
+can verify. None of that is progress; the checkboxes stay the only store. The
+session can also pull for itself: `/next-item 0` inside Claude Code or opencode
+reads the next open item from the live checklist, with no dashboard click.
 
 **A plan that stays current.** *Re-plan…* on any item, phase, or the whole plan hands
 the rethink to a coding session with your steering attached and your context
@@ -150,6 +170,8 @@ A published copy is static: it cannot reach localhost, so it must never show a R
 button that only pretends to work. It says `snapshot · read-only` in its header; the
 live one says `live · actions enabled`. Where the live page launches a session, the
 static one hands you the exact shell command instead — honest about what it can do.
+Each open item carries its own prompt there too, and the command for a *continue*
+tool carries the warm shape.
 
 ## Install
 

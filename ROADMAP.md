@@ -129,14 +129,29 @@ Small, independent items that each remove a way the dashboard can mislead.
   rather than re-prompting for the whole set.
 - [ ] Verify the Codex `resume --last` flags against a machine that actually has
   Codex installed — they came from documentation, not from `--help`.
+- [x] Two prompt shapes: a cold one that carries the phase once, and a warm "Next
+  item" of ~560 characters for the session that already holds it — a 19-item phase
+  went from 29,902 characters sent (27,400 of them repeats) to one brief plus the
+  items.
+- [x] A phase session addressed by id — Claude Code minted and resumed by uuid,
+  opencode by its discovered id, Codex last-only — recorded in `.pcc/sessions.json`
+  as a launch fact, never progress; "continue" now means this phase's conversation.
+- [x] Liveness before a warm launch: a live tab gets the text on the clipboard and
+  focus; a dead one is resumed by id in a new tab; a gone transcript is said so and
+  falls back to the tool's continue.
+- [x] A generated per-phase brief file, pinned as appended system prompt on Claude
+  Code launches, deliberately carrying no checklist.
+- [x] The pull path: `--next <phase>` prints the warm prompt from the live checklist,
+  and `--install-skills` writes `/next-item` for Claude Code and opencode.
 
 **Exit test:** an unreachable context provider is visible on the dashboard before a
 session is launched against it.
 
 ### Phase 7 — The plan answers questions (MCP)
 
-Sessions get the plan pushed once, at launch, and are on their own after that: they
-re-derive state by re-reading markdown and tick items by hand-editing lines. An MCP
+Sessions get the plan pushed at launch and can pull their next item with `/next-item`,
+but they are otherwise on their own: they re-derive state by re-reading markdown and
+tick items by hand-editing lines. An MCP
 server makes the plan queryable and actable mid-session — through the same derived
 model and the same write-back the dashboard uses, so the files stay the only store.
 
@@ -173,10 +188,13 @@ Design decisions, made up front:
 - [ ] The parity guard, written down and tested: an agent with the MCP surface can
   do nothing an agent with file access could not already do — the server only
   makes it correct.
+- [ ] `next_item` returns the warm prompt over MCP, and the per-checkout
+  `.pcc/sessions.json` record becomes server-side session context — the
+  cross-machine continuity a local launch fact cannot give.
 
 **Exit test:** an agent session ticks an item over MCP and the dashboard reflects
 it without the agent touching markdown; a tick against a line changed since read
-is refused; `tools/list` shows the five tools from inside a real agent runtime.
+is refused; `tools/list` shows the six tools from inside a real agent runtime.
 
 **Composes with, not replaced by:** a knowledge-platform mirror (e.g. publishing
 checkbox transitions one-way into a shared memory so checkout-less agents can

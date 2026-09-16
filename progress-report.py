@@ -985,11 +985,23 @@ def check_config(repo: Path) -> int:
     ids = [str(p.get("id", "")) for p in phases]
     for dup in {i for i in ids if ids.count(i) > 1}:
         problems.append(f"duplicate phase id {dup!r}")
+    seen_safe: dict[str, str] = {}
     for p in phases:
         pid = str(p.get("id", ""))
         if not pid:
             problems.append("a [[phase]] has no id")
             continue
+        # A phase id names files and a terminal tab. Anything beyond a plain
+        # token is refused here rather than sanitised downstream in three
+        # different ways - and two ids that sanitise to the same stem would
+        # overwrite each other's prompt and launch files.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", pid):
+            problems.append(f"phase id {pid!r}: use letters, digits, '.', '_' or '-' only "
+                            "(it names files and a terminal tab)")
+        if seen_safe.get(safe_id(pid), pid) != pid:
+            problems.append(f"phase ids {seen_safe[safe_id(pid)]!r} and {pid!r} name the "
+                            "same files - make them distinct")
+        seen_safe.setdefault(safe_id(pid), pid)
         doc = p.get("doc")
         n_items = 0
         if doc and (repo / doc).exists():
@@ -1306,6 +1318,20 @@ allow_artifact_publish = false
 # freshness stamp and the re-plan prompts must all watch the SAME file, or
 # a plan-less config renders one file while the tools track another.
 DEFAULT_PLAN = "PLAN.md"
+# Generated, gitignored, rebuildable: prompt files, launch scripts, phase
+# briefs, session records. One name, shared with the local server.
+WORK_DIR = ".pcc"
+
+
+def safe_id(pid) -> str:
+    """ONE sanitiser for every file named after a phase id - prompt, launch
+    script, brief, ticket draft. Keeps '-' and '_' so `1-a` and `1a` stay
+    different files; drops anything a shell or a tab title could misread."""
+    return "".join(c for c in str(pid) if c.isalnum() or c in "-_") or "x"
+
+
+def brief_name(pid) -> str:
+    return f"phase-{safe_id(pid)}.md"
 
 CHECK = re.compile(r"^\s*[-*]\s*\[([ xX~/-])\]\s*(.+?)\s*$")
 
@@ -1550,68 +1576,295 @@ def prompt_appendix(providers: list) -> str:
     return "\n".join(lines)
 
 
-def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
-    """The session prompt for one phase. Built for EVERY phase, not just the
-    startable ones: the drill-down lets you open a session on anything, and a
-    blocked phase is exactly when you want to read yourself in."""
+def tick_file_of(p: dict, plan_name: str) -> str:
+    """The one file this phase's checkboxes live in.
+
+    A session is told exactly where to tick. "The plan" was wrong for every
+    phase with its own doc, and an agent guessing between two files is how a
+    box gets ticked in the one the dashboard does not read.
+    """
+    for i in p.get("items") or []:
+        if i.get("file"):
+            return str(i["file"])
+    return str(p.get("doc") or plan_name)
+
+
+def protocol_block(tick_file: str) -> str:
+    """The standing rules of a working session, stated ONCE per session.
+
+    Every cold shape carries them - the item prompt, the phase opening brief,
+    the generated phase brief a launcher can pin as system prompt. The warm
+    follow-up restates them in one paragraph rather than dropping them: a
+    follow-up that skipped the bullet counts and the exact closing question
+    bought drift, not savings.
+    """
+    return (
+        "Protocol for every checklist item in this session:\n"
+        "1. Brief first, then WAIT. Before changing anything, post Proposed steps "
+        "(2-5 bullets, one line each, just this item) and Acceptance criteria "
+        "(2-4 bullets, each decidable by inspecting a named thing or running a "
+        "named command). End with exactly: confirm these steps, or redirect me? "
+        "Then stop - no code, no file edits - until confirmed or amended; "
+        "implement only what was confirmed.\n"
+        "2. Only this item. Name neighbouring work in the brief instead of doing it.\n"
+        "3. Claim only what you verified against those acceptance criteria.\n"
+        f"4. Tick only in {tick_file}: change that item's `- [ ]` to `- [x]` on its "
+        "exact line, nothing else, no other file.")
+
+
+def _phase_context(p: dict, plan_name: str) -> str:
     doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
-    jira = (f" This work is tracked as ticket {p['jira']} — reference it in commits "
-            f"and keep its status in mind." if p.get("jira") else "")
-    blocked = ""
+    bits = [f"Context: {doc} (if absent, the Phase {p['id']} section of {plan_name})."]
+    if p.get("modules"):
+        bits.append("Modules: " + ", ".join(p["modules"]) + ".")
+    if p.get("jira"):
+        bits.append(f"Ticket: {p['jira']}.")
+    return " ".join(bits)
+
+
+def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
+    """The OPENING brief of a phase session - sent once.
+
+    It reads the session in (doc, exit test, modules, the open items) and
+    states the protocol once; every later item arrives as a short "Next item"
+    message that relies on both. Built for EVERY phase, not just the startable
+    ones: a blocked phase is exactly when you want to read yourself in.
+    """
+    doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
+    tick = tick_file_of(p, plan_name)
+    items = p.get("items") or []
+    open_items = [i for i in items if i["state"] != "done"]
+    lines = [f"- Phase doc: {doc} - read it now (if absent, the Phase {p['id']} "
+             f"section of {plan_name}).",
+             f"- Exit test: {p.get('exit_test') or 'see plan'}",
+             "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
+    if p.get("jira"):
+        lines.append(f"- Ticket: {p['jira']} - reference it in commits.")
     if p.get("blocked_by"):
-        blocked = (f" NOTE: this phase depends on Phase "
-                   f"{', Phase '.join(p['blocked_by'])}, which is not finished — "
-                   f"read in and prepare, but expect to be gated.")
-    mods = (f" Its modules are: {', '.join(p['modules'])}." if p.get("modules") else "")
-    return (f"Work on Phase {p['id']} ({p['name']}) of {plan_name}. "
-            f"Read {doc} if it exists, otherwise the "
-            f"Phase {p['id']} section of {plan_name}, and the open checklist items.\n"
-            "\n"
-            "FIRST, before changing anything, post a brief and stop:\n"
-            "- Proposed steps: 3-7 bullets, one line each, in the order you would "
-            "do them; name the checklist item each step serves.\n"
-            "- Acceptance criteria: 3-6 bullets, each decidable by inspecting a "
-            "named thing or running a named command - derived from the exit test "
-            "and the items, never invented scope.\n"
-            "End the brief with the question: confirm these steps, or redirect me? "
-            "Then WAIT - no code, no file edits, until the steps are confirmed or "
-            "amended. Implement only what was confirmed.\n"
-            "\n"
-            f"Exit test for the phase: {p.get('exit_test', 'see plan')}. "
-            f"Tick items in the plan as you complete them so the progress report stays accurate."
-            + mods + jira + blocked + prompt_appendix(providers))
+        lines.append("- NOTE: depends on Phase " + ", Phase ".join(p["blocked_by"]) +
+                     ", not finished - read in and prepare, but expect to be gated.")
+    if open_items:
+        lines.append(f"- Open items ({len(open_items)} of {len(items)}), in plan order:")
+        for n, i in enumerate(open_items[:40], 1):
+            lines.append(f"  {n}. {i['label']}")
+        if len(open_items) > 40:
+            lines.append(f"  ... and {len(open_items) - 40} more - see {tick}.")
+    elif not items:
+        # No checklist at all is not "done" - a continuous phase (a standing
+        # ritual) or a phase whose doc has no boxes yet.
+        lines.append(f"- Open items: none - no checklist found in {tick}"
+                     + (" (a standing ritual, not a phase you finish)" if p.get("continuous") else "")
+                     + f"; read {doc} for the backlog and WAIT for instructions.")
+    else:
+        lines.append(f"- Open items: none of {len(items)} - this phase reads as done; "
+                     "verify, do not rebuild.")
+    # "If present": the published page carries this text too, and a teammate's
+    # clone has no generated folder until something writes it.
+    lines.append(f"- Working brief: {WORK_DIR}/{brief_name(p['id'])} if present (generated by "
+                 "the control center on render, or by `--write-briefs`); "
+                 f"the checkboxes in {tick} are the truth.")
+    return (f"You are the working session for Phase {p['id']} ({p['name']}) of {plan_name}. "
+            'Items will be sent to you one at a time as messages beginning "Next item"; '
+            "this message opens the session.\n\nPHASE BRIEF\n" + "\n".join(lines) + "\n\n"
+            + protocol_block(tick) + "\n\n"
+            'Later "Next item" messages rely on this brief and this protocol; do not ask '
+            "for them again. If the plan may have changed since you read it, re-read the "
+            "item's section before briefing."
+            + prompt_appendix(providers) + "\n\n"
+            "No item yet: acknowledge this brief in one line - what the phase is for and "
+            'how many items are open - then WAIT for the first "Next item".')
+
+
+def phase_prompt_warm(p: dict, plan_name: str) -> str:
+    """What a CONTINUING phase session gets at phase level: a re-sync, not a
+    re-explanation. It already holds the brief."""
+    tick = tick_file_of(p, plan_name)
+    return (f"Phase {p['id']} ({p['name']}) - same session, same protocol. Re-read the "
+            f"checklist in {tick}: items may have been ticked elsewhere. Reply in one line "
+            'with what is still open, then WAIT for the next "Next item" message.')
 
 
 ITEM_SLOT = "␀ITEM␀"          # a character no plan text will contain
 
 
 def phase_item_prompt_tmpl(p: dict, plan_name: str, providers: list) -> str:
-    """A prompt template for ONE checklist item, with a slot for the label.
+    """The COLD prompt for ONE checklist item, with a slot for the label.
 
-    Emitted per phase rather than per item: the appendix and phase context are
-    identical across a phase's items, so shipping one template and substituting
-    client-side keeps the page from carrying the same 800 characters 19 times.
+    For a session that has nothing yet: context pointers, the protocol once,
+    and the declaration that this conversation is the phase session, so the
+    warm follow-ups that come later need no preamble.
+
+    Emitted per phase rather than per item: everything but the slot is
+    identical across a phase's items, so the page carries one template and
+    substitutes client-side instead of the same 1,300 characters nineteen times.
     """
-    doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
-    jira = (f" The phase is tracked as ticket {p['jira']}." if p.get("jira") else "")
-    mods = (f" Its modules are: {', '.join(p['modules'])}." if p.get("modules") else "")
+    tick = tick_file_of(p, plan_name)
     return (f"In Phase {p['id']} ({p['name']}) of {plan_name}, work on exactly one "
             f"checklist item:\n\n    {ITEM_SLOT}\n\n"
-            f"Read {doc} if it exists, otherwise the Phase {p['id']} section of "
-            f"{plan_name}, for the context around it.\n"
-            "\n"
-            "FIRST, before changing anything, post a brief and stop:\n"
-            "- Proposed steps: 2-5 bullets, one line each, covering just this item.\n"
-            "- Acceptance criteria: 2-4 bullets, each decidable by inspecting a "
-            "named thing or running a named command.\n"
-            "End the brief with the question: confirm these steps, or redirect me? "
-            "Then WAIT - no code, no file edits, until the steps are confirmed or "
-            "amended. Implement only what was confirmed.\n"
-            "\n"
-            "Do only this item - if you find neighbouring work that also needs "
-            "doing, say so in the brief rather than silently widening the scope. "
-            "Tick this item in the plan when it is done, and leave the others alone."
-            + mods + jira + prompt_appendix(providers))
+            + _phase_context(p, plan_name) + "\n\n"
+            + protocol_block(tick) + "\n\n"
+            f"This is the Phase {p['id']} session: later items arrive as short "
+            '"Next item" messages naming only the item; apply the same protocol '
+            "without asking for it again."
+            + prompt_appendix(providers))
+
+
+def phase_item_prompt_warm_tmpl(p: dict, plan_name: str) -> str:
+    """The WARM prompt for the next item of a session that already holds the
+    phase context. Names the item, restates the protocol in one paragraph,
+    asks for a re-read of the checklist only - and tells a session that is
+    NOT the phase session to say so rather than guess."""
+    tick = tick_file_of(p, plan_name)
+    return (f"Next item, Phase {p['id']} ({p['name']}) - same session, same protocol:\n\n"
+            f"    {ITEM_SLOT}\n\n"
+            f"Re-read the checklist in {tick} first (another session may have ticked items). "
+            "Then brief and stop: 2-5 proposed steps, 2-4 acceptance criteria, end with "
+            '"confirm these steps, or redirect me?", and WAIT. Only this item; when done, '
+            f"tick its exact line in {tick} and nothing else.\n\n"
+            f"If this conversation has not already read {tick}, you are not the Phase "
+            f"{p['id']} session: say so, read it, then post the brief.")
+
+
+def phase_brief(p: dict, plan_name: str, providers: list) -> str:
+    """The generated per-phase brief: WORK_DIR/phase-<id>.md.
+
+    Protocol, phase context and provider rules - NOT the checklist. The
+    checklist has one home and this file points at it; a copy here would be
+    the second store of progress the whole tool exists to avoid. A launcher
+    can pin this file as appended system prompt so the rules survive
+    compaction, and /next-item reads the live checklist, never this.
+    """
+    doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
+    tick = tick_file_of(p, plan_name)
+    facts = [f"- Plan: {plan_name}",
+             f"- Phase doc: {doc} (if absent, the Phase {p['id']} section of {plan_name})",
+             f"- Exit test: {p.get('exit_test') or 'see plan'}",
+             "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
+    if p.get("jira"):
+        facts.append(f"- Ticket: {p['jira']}")
+    if p.get("depends_on"):
+        facts.append("- Depends on: Phase " + ", Phase ".join(str(x) for x in p["depends_on"]))
+    if p.get("dependents"):
+        facts.append("- Unlocks: Phase " + ", Phase ".join(str(x) for x in p["dependents"]))
+    facts.append(f"- Checklist: {tick} - read the live state there.")
+    return (f"# Phase {p['id']} \u2014 {p['name']}\n\n"
+            f"Generated by the control center from {plan_name} and docs/progress.toml; "
+            "rewritten on every launch, so do not edit it. The checklist and its state "
+            f"live in {tick}: read them there, tick there, never here.\n\n"
+            + "\n".join(facts) + "\n\n" + protocol_block(tick)
+            + prompt_appendix(providers) + "\n")
+
+
+def write_briefs(d: dict, repo: Path) -> list[Path]:
+    """Render every phase's brief under WORK_DIR; rewrite only what changed.
+
+    Bytes, not text: write_text on Windows would turn every newline into CRLF
+    and make the next comparison fail forever, rewriting on every call.
+    """
+    out, wd = [], repo / WORK_DIR
+    for p in d.get("phases", []):
+        if not p.get("brief"):
+            continue
+        f = wd / brief_name(p["id"])
+        body = p["brief"].encode("utf-8")
+        try:
+            if f.exists() and f.read_bytes() == body:
+                continue
+            wd.mkdir(exist_ok=True)
+            f.write_bytes(body)
+            out.append(f)
+        except OSError as exc:
+            print(f"  brief: could not write {f}: {exc}", file=sys.stderr)
+    return out
+
+
+def next_item_prompt(d: dict, phase_id: str, words: list[str]) -> tuple[int, str]:
+    """The pull path: the warm prompt for a phase's next open item, read from
+    the LIVE checklist. `words` pick one open item by its text; without them
+    the first open item in plan order is next. Returns (rc, text) - the text
+    is always something a session can act on, including "nothing to pull".
+    """
+    p = next((x for x in d.get("phases", []) if str(x["id"]) == str(phase_id)), None)
+    if p is None:
+        known = ", ".join(str(x["id"]) for x in d.get("phases", []))
+        return 2, f"No Phase {phase_id} in this plan - nothing to pull. Known phases: {known}."
+    open_items = [i for i in p.get("items") or [] if i["state"] != "done"]
+    if not open_items:
+        return 1, (f"Phase {p['id']} ({p['name']}) has no open items - nothing to pull. "
+                   "Say so and stop.")
+    if words:
+        needle = [w.lower() for w in words]
+        pick = [i for i in open_items if all(w in i["label"].lower() for w in needle)]
+        if not pick:
+            return 1, (f"No open item of Phase {p['id']} matches {' '.join(words)!r} - "
+                       "nothing to pull. Open items:\n" +
+                       "\n".join("  - " + i["label"] for i in open_items))
+        if len(pick) > 1:
+            return 1, (f"{len(pick)} open items of Phase {p['id']} match "
+                       f"{' '.join(words)!r} - be more specific:\n" +
+                       "\n".join("  - " + i["label"] for i in pick))
+        item = pick[0]
+    else:
+        item = open_items[0]
+    tmpl = p.get("item_prompt_warm_tmpl") or ""
+    return 0, tmpl.replace(ITEM_SLOT, item["label"])
+
+
+SKILL_MARK = "Generated by the control center"
+
+
+def install_skills(repo: Path) -> int:
+    """Write the /next-item entry point for Claude Code and opencode into the
+    repo. Both tools substitute $ARGUMENTS and inject a shell command's output
+    with !`...`, so the skill IS the warm prompt: the session runs the
+    generator and receives the next item's text, nothing pasted.
+
+    Refuses to overwrite a file it did not generate - the repo's own skills
+    are not this tool's to rewrite.
+    """
+    gen = Path(__file__).resolve()
+    try:
+        gen_s = gen.relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        gen_s = str(gen)
+    cmd = f'!`python "{gen_s}" --next $ARGUMENTS`' if " " in gen_s else f"!`python {gen_s} --next $ARGUMENTS`"
+    note = (f"<!-- {SKILL_MARK}: `python {gen_s} --install-skills`. "
+            "Regenerate rather than edit. -->")
+    files = {
+        repo / ".claude" / "skills" / "next-item" / "SKILL.md": (
+            "---\n"
+            "name: next-item\n"
+            "description: Work the next open checklist item of a plan phase, brief-first, "
+            "through the control center. Usage - /next-item <phase-id> [words that pick a "
+            "specific open item].\n"
+            "disable-model-invocation: true\n"
+            "---\n" + note + "\n" + cmd + "\n"),
+        repo / ".opencode" / "commands" / "next-item.md": (
+            "---\n"
+            "description: Work the next open checklist item of a plan phase, brief-first "
+            "(control center). Usage - /next-item <phase-id> [words]\n"
+            "---\n" + note + "\n" + cmd + "\n"),
+    }
+    rc = 0
+    for f, body in files.items():
+        rel = f.relative_to(repo).as_posix()
+        try:
+            if f.exists():
+                cur = f.read_bytes().decode("utf-8", "replace")
+                if SKILL_MARK not in cur:
+                    print(f"  {rel}: exists and is not ours - left alone")
+                    rc = 1
+                    continue
+                if cur == body:
+                    print(f"  {rel}: up to date")
+                    continue
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(body.encode("utf-8"))
+            print(f"  {rel}: written")
+        except OSError as exc:
+            print(f"  {rel}: {exc}", file=sys.stderr)
+            rc = 1
+    return rc
 
 
 def git(*args: str) -> str:
@@ -1931,9 +2184,17 @@ def build(repo: Path) -> dict:
         p["blocked_by"] = b["unmet"] if b else []
         p["blocked_reason"] = b["reason"] if b else ""
         p["startable"] = p["id"] in ready_ids
-        p["prompt"] = phase_prompt(p, proj.get("plan", "the plan"), cfg.get("context", []))
-        p["item_prompt_tmpl"] = phase_item_prompt_tmpl(
-            p, proj.get("plan", "the plan"), cfg.get("context", []))
+        # Two shapes of every prompt. COLD is for a session that has nothing
+        # yet; WARM is for the one already holding the phase context, and
+        # carries only the delta. Which one a launch sends is decided where
+        # the launcher is known - here both are just built.
+        plan_name, providers = proj.get("plan", "the plan"), cfg.get("context", [])
+        p["tick_file"] = tick_file_of(p, plan_name)
+        p["prompt"] = phase_prompt(p, plan_name, providers)
+        p["prompt_warm"] = phase_prompt_warm(p, plan_name)
+        p["item_prompt_tmpl"] = phase_item_prompt_tmpl(p, plan_name, providers)
+        p["item_prompt_warm_tmpl"] = phase_item_prompt_warm_tmpl(p, plan_name)
+        p["brief"] = phase_brief(p, plan_name, providers)
         # A phase's Test names an [[action]] BY ID. Phases deliberately cannot
         # carry an argv of their own: that would make every phase a place new
         # commands can enter, and the trust gate hashes actions, not phases.
@@ -2333,7 +2594,28 @@ DEV_JS = r"""
   var devs = window.__PCC_DEVS__ || [], cmds = window.__PCC_TOOLCMD__ || {};
   var sel = document.getElementById('pcc-dev'), mine = document.getElementById('pcc-mine'),
       hint = document.getElementById('pcc-devhint');
+  var PH = window.__PCC_PHASES__ || {};
+
+  // Item prompt folds are rendered empty and filled here from the phase's
+  // template; the text is the same for every item of a phase but the label.
+  document.querySelectorAll('.launch[data-item]').forEach(function(l){
+    var code = l.querySelector('code'), p = PH[l.dataset.phase];
+    if(!code || code.textContent || !p || !p.item_tmpl) return;
+    code.textContent = p.item_tmpl.split(p.slot).join(l.dataset.item);
+  });
   if(!sel) return;
+
+  // A "(continue)" tool appends to a session that already holds the phase
+  // context, so it gets the WARM shape - the item alone, protocol in one
+  // paragraph - not the full brief again.
+  function promptFor(dev, l, code){
+    if(!/\(continue\)$/.test(dev.tool || '')) return code.textContent;
+    var p = PH[l.dataset.phase];
+    if(!p) return code.textContent;
+    if(l.dataset.item && p.item_tmpl_warm) return p.item_tmpl_warm.split(p.slot).join(l.dataset.item);
+    if(!l.dataset.item && p.prompt_warm) return p.prompt_warm;
+    return code.textContent;
+  }
 
   function current(){
     var n = sel.value;
@@ -2363,7 +2645,8 @@ DEV_JS = r"""
       var oldPre = l.querySelector('.pcc-cmd');
       if(oldPre) oldPre.remove();
       if(!dev || !code) return;
-      var cmd = launchCmd(dev, code.textContent);
+      var warm = /\(continue\)$/.test(dev.tool || '');
+      var cmd = launchCmd(dev, promptFor(dev, l, code));
       if(!cmd) return;
       var id = 'cmd-' + (code.id || Math.random().toString(36).slice(2));
       var pre = document.createElement('code');
@@ -2372,7 +2655,8 @@ DEV_JS = r"""
       var b = document.createElement('button');
       b.className = 'copy pcc-launch'; b.dataset.t = id;
       b.textContent = 'Copy ' + dev.tool + ' command';
-      b.title = 'Paste in your own terminal (' + dev.shell + ') — runs on YOUR machine';
+      b.title = 'Paste in your own terminal (' + dev.shell + ') — runs on YOUR machine' +
+                (warm ? ' — the short follow-up for a session that already has the phase context' : '');
       b.addEventListener('click', function(){
         var txt = pre.textContent, done = function(){
           var was = b.textContent; b.textContent = 'Copied'; b.classList.add('ok');
@@ -2800,7 +3084,16 @@ def render(d: dict) -> str:
                'redone \u2014 the redo is the next open item">needs redo</span>'
                if i.get("redo") else "")
             + f'</summary>'
-            f'<div class="ibar"></div></details></li>'
+            # The published page cannot launch anything, so the item's prompt
+            # is the deliverable there. The fold is rendered EMPTY and filled
+            # client-side from the per-phase template - the same text inlined
+            # per item would double the file. A done item gets no fold: a
+            # "go and build this" prompt next to a ticked box invites a redo.
+            + (f'<div class="ibar"><details class="promptfold"><summary>item prompt</summary>'
+               f'<div class="launch" data-phase="{e(p["id"])}" data-item="{e(i["label"])}">'
+               f'<code></code></div></details></div>'
+               if i["state"] != "done" else '<div class="ibar"></div>')
+            + '</details></li>'
             for i in p["items"]) or \
             '<li class="item empty"><span></span><span class="lbl quiet">'\
             'No checklist items found for this phase.</span></li>'
@@ -2845,7 +3138,7 @@ def render(d: dict) -> str:
               # "Copy <tool> command" button built from the SELECTED developer's
               # tool, shell and checkout. Rendered as a bare <pre> this element
               # never existed, so that button was never built.
-              f'<div class="launch"><code>{e(p["prompt"])}</code></div></details>'
+              f'<div class="launch" data-phase="{e(p["id"])}"><code>{e(p["prompt"])}</code></div></details>'
             f'</div></details>')
 
     # gantt
@@ -3002,6 +3295,8 @@ def render(d: dict) -> str:
             # into it again is a no-op that silently sends the generic text.
             "jira_create_tmpl": (ctmpl_all if not p.get("jira") else ""),
             "item_tmpl": p.get("item_prompt_tmpl", ""), "slot": ITEM_SLOT,
+            "item_tmpl_warm": p.get("item_prompt_warm_tmpl", ""),
+            "prompt_warm": p.get("prompt_warm", ""), "tick_file": p.get("tick_file", ""),
         }
     names = {p["id"]: p["name"] for p in d["phases"]}
     # The per-phase payload the action layer reads: prompts, the item-prompt
@@ -3320,6 +3615,18 @@ def main() -> int:
                     help="non-interactive (with --setup: report and exit)")
     ap.add_argument("--check", action="store_true",
                     help="lint the repo against the control-center contract and exit")
+    ap.add_argument("--brief", default=None, metavar="PHASE",
+                    help="print one phase's generated brief (what a launcher pins as "
+                         "context) and exit")
+    ap.add_argument("--next", nargs="*", default=None, metavar=("PHASE", "WORD"),
+                    help="print the 'Next item' prompt for PHASE's next open item, or "
+                         "the open item matching WORDs, and exit 0 (what /next-item "
+                         "injects into a session)")
+    ap.add_argument("--write-briefs", action="store_true", dest="write_briefs",
+                    help="write " + WORK_DIR + "/phase-<id>.md for every phase and exit")
+    ap.add_argument("--install-skills", action="store_true", dest="install_skills",
+                    help="write the /next-item skill for Claude Code and opencode into "
+                         "the repo and exit")
     ap.add_argument("--if-stale", action="store_true", dest="if_stale",
                     help="no-op unless a source file is newer than the report (for hooks)")
     a = ap.parse_args()
@@ -3377,6 +3684,32 @@ def main() -> int:
     if a.json:
         print(json.dumps(d, indent=2, default=str))
         return 0
+    if a.brief is not None:
+        p = next((x for x in d["phases"] if str(x["id"]) == str(a.brief)), None)
+        if p is None:
+            print(f"no Phase {a.brief} in this plan", file=sys.stderr)
+            return 2
+        sys.stdout.write(p["brief"])
+        return 0
+    if a.next is not None:
+        # Always exit 0: a skill injects this output into the session, and the
+        # "nothing to pull" text is the useful answer in that case, not an error.
+        # A bare `/next-item` must not inject an argparse usage dump either.
+        if not a.next:
+            known = ", ".join(str(x["id"]) for x in d.get("phases", []))
+            print("No phase given - nothing to pull. Usage: /next-item <phase-id> [words that "
+                  f"pick one open item]. Known phases: {known}.")
+            return 0
+        rc, text = next_item_prompt(d, a.next[0], a.next[1:])
+        print(text)
+        return 0
+    if a.write_briefs:
+        wrote = write_briefs(d, REPO)
+        print(f"{len(wrote)} brief(s) (re)written under {WORK_DIR}/"
+              + ("" if wrote else " - all up to date"))
+        return 0
+    if a.install_skills:
+        return install_skills(REPO)
     if a.ready:
         print_ready(d)
         return 0

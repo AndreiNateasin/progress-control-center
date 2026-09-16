@@ -60,7 +60,7 @@ SELF_DIR = Path(__file__).resolve().parent      # where THIS install lives
 REPO = _pr.REPO                                 # re-pointed by init_repo()
 BIND_HOST = "127.0.0.1"                         # set by main() before init_repo
 DISTRO = os.environ.get("PCC_DISTRO", "Ubuntu-24.04")
-PROMPT_DIR = REPO / ".pcc"
+PROMPT_DIR = REPO / _pr.WORK_DIR                # generated, gitignored; one name, shared
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
@@ -391,37 +391,55 @@ def build_launchers(cfg: dict | None = None) -> dict:
     """
     import shutil
     L: dict[str, dict] = {}
+    # Placeholders: {pf} the prompt file (already a quoted PowerShell literal),
+    # {sid} the phase session id, {sys} the optional pinned brief - all three
+    # filled in open_session, which is where launcher and prompt shape meet.
+    #
+    # `base` groups a tool's launchers; `warm` marks the one that appends to a
+    # conversation that already holds the phase context, and so receives the
+    # WARM prompt (the item alone) instead of the full brief again.
     if shutil.which("claude"):
+        # A COLD launch mints the session id (--session-id) and a WARM one
+        # resumes exactly it (--resume <id>) - both verified interactively on
+        # this machine - so "continue" means THIS phase's conversation, not
+        # whichever one was most recent in the directory (which after a ticket
+        # draft or a re-plan is not it). With no id on record the warm launcher
+        # falls back to --continue, and the result says so.
         L["claude"] = {"label": "Claude Code — new session", "mode": "terminal",
-                       "cmd": "claude (Get-Content -Raw -Encoding UTF8 {pf})", "cmd_blank": "claude"}
-        # "Append to the session I already have open." Verified against
-        # `claude --help`: -c/--continue continues the most recent conversation
-        # in this directory, and still accepts a prompt argument — so the phase
-        # prompt lands in the conversation that is already going rather than
-        # starting a cold one that has to re-read everything.
-        L["claude-continue"] = {"label": "Claude Code — continue last session",
-                                "mode": "terminal",
-                                "cmd": "claude --continue (Get-Content -Raw -Encoding UTF8 {pf})",
+                       "base": "claude",
+                       "cmd": "claude {sys}--session-id {sid} (Get-Content -Raw -Encoding UTF8 {pf})",
+                       "cmd_blank": "claude"}
+        L["claude-continue"] = {"label": "Claude Code — continue phase session",
+                                "mode": "terminal", "base": "claude", "warm": True,
+                                "cmd": "claude {sys}--resume {sid} (Get-Content -Raw -Encoding UTF8 {pf})",
+                                "cmd_fallback": "claude {sys}--continue (Get-Content -Raw -Encoding UTF8 {pf})",
                                 "cmd_blank": "claude --continue"}
     if shutil.which("opencode"):
-        # --prompt verified against `opencode --help` (v as of 2026-08-30).
+        # --prompt, -s/--session and -c/--continue are TUI flags per
+        # `opencode --help`; `run -s <id> <msg>` was verified to append a turn to
+        # a named session here, the TUI form is taken from --help. opencode mints
+        # its own ids, so a cold launch records the session that appears in
+        # `opencode session list` for this directory right after it.
         L["opencode"] = {"label": "opencode — new session", "mode": "terminal",
+                         "base": "opencode",
                          "cmd": "opencode --prompt (Get-Content -Raw -Encoding UTF8 {pf})",
                          "cmd_blank": "opencode"}
-        # `opencode run -c <message>` continues the last session.
-        L["opencode-continue"] = {"label": "opencode — continue last session",
-                                  "mode": "terminal",
-                                  "cmd": "opencode run -c (Get-Content -Raw -Encoding UTF8 {pf})",
-                                  "cmd_blank": "opencode"}
+        L["opencode-continue"] = {"label": "opencode — continue phase session",
+                                  "mode": "terminal", "base": "opencode", "warm": True,
+                                  "cmd": "opencode -s {sid} --prompt (Get-Content -Raw -Encoding UTF8 {pf})",
+                                  "cmd_fallback": "opencode -c --prompt (Get-Content -Raw -Encoding UTF8 {pf})",
+                                  "cmd_blank": "opencode -c"}
     if shutil.which("codex"):
         # Positional prompt per the Codex CLI docs. The resume flags are NOT
         # verified against --help on this machine (codex absent here) - if the
-        # continue launcher misbehaves, that is the first thing to check.
+        # continue launcher misbehaves, that is the first thing to check. Codex
+        # resumes "last" only, so its warm launcher has no id to address.
         L["codex"] = {"label": "Codex - new session", "mode": "terminal",
+                      "base": "codex",
                       "cmd": "codex (Get-Content -Raw -Encoding UTF8 {pf})",
                       "cmd_blank": "codex"}
         L["codex-continue"] = {"label": "Codex - resume last session",
-                               "mode": "terminal",
+                               "mode": "terminal", "base": "codex", "warm": True,
                                "cmd": "codex resume --last (Get-Content -Raw -Encoding UTF8 {pf})",
                                "cmd_blank": "codex resume --last"}
     appid = _detect_claude_app()
@@ -460,7 +478,20 @@ def _merge_config_launchers(L: dict, cfg: dict) -> None:
             # config written against the old contract ('{pf}') would end up with
             # doubled quotes. Strip the author's quotes rather than break them.
             cmd = str(c["cmd"]).replace("'{pf}'", "{pf}").replace('"{pf}"', "{pf}")
-            L[lid] = {"label": c.get("label", lid), "mode": "terminal", "cmd": cmd}
+            # `warm = true` marks a launcher that appends to an existing session
+            # (it then receives the warm prompt); `{sid}` in its cmd is filled
+            # with the phase session id, and refused when none is recorded.
+            # `base` reaches a tab title and picks session behaviour, so it is
+            # held to the same charset as an id and hashed when it is declared.
+            base = str(c.get("base") or lid)
+            if not _ID.match(base):
+                print(f"  config: skipping launcher {lid!r} with bad base {base!r}", file=sys.stderr)
+                continue
+            L[lid] = {"label": c.get("label", lid), "mode": "terminal", "cmd": cmd,
+                      "base": base, "warm": bool(c.get("warm"))}
+            if c.get("cmd_fallback"):
+                L[lid]["cmd_fallback"] = str(c["cmd_fallback"]).replace(
+                    "'{pf}'", "{pf}").replace('"{pf}"', "{pf}")
         elif mode == "clipboard" and c.get("open"):
             L[lid] = {"label": c.get("label", lid), "mode": "clipboard",
                       "open": [_expand(str(x)) for x in c["open"]]}
@@ -488,7 +519,13 @@ def _argv_digest(actions: dict, launchers: dict | None = None) -> str:
         # this server spawns. They were never hashed or shown, so a cloned repo
         # could introduce a command through `open`/`cmd` without ever tripping
         # the gate that exists precisely to stop that.
-        payload["l"] = {k: (v.get("open") or [v.get("cmd", "")])
+        # A launcher's warm flag and fallback change what runs, so they are
+        # hashed too - appended only when present, so launchers written before
+        # they existed keep the digest they were approved under.
+        payload["l"] = {k: (v.get("open") or [v.get("cmd", "")]
+                            + ([v["cmd_fallback"]] if v.get("cmd_fallback") else [])
+                            + (["warm"] if v.get("warm") else [])
+                            + (["base=" + str(v["base"])] if v.get("base") and v["base"] != k else []))
                         for k, v in sorted(launchers.items())}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -791,7 +828,7 @@ def init_repo(path: Path) -> None:
     # bake in describes this server's machine, not the viewer's - a checkout
     # they do not have and a shell whose syntax breaks on paste.
     _pr.LOCAL_SURFACE = BIND_HOST in ('127.0.0.1', 'localhost', '::1')
-    PROMPT_DIR = REPO / ".pcc"
+    PROMPT_DIR = REPO / _pr.WORK_DIR
     cfgp = REPO / "docs" / "progress.toml"
     # An unconfigured repo must still START, because /setup is the thing that
     # configures it — a wizard you can only reach once you no longer need it
@@ -854,6 +891,23 @@ def _env_prelude() -> str:
         for f in files)
 
 
+# Variables that mark a process as living INSIDE a Claude Code session. A
+# terminal opened by this server inherits the server's environment when the
+# server itself was started from such a session (a Bash tool, an agent), and
+# the launched claude then ran as a child of that session: its turns went to
+# the parent's transcript, not to the id on record. Cleared in every launch
+# script, so a launched session is a top-level session whoever started us.
+_SESSION_LINK_VARS = ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+                      "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
+                      "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT",
+                      "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
+
+
+def _unlink_prelude() -> str:
+    return ("foreach($n in " + ",".join("'" + v + "'" for v in _SESSION_LINK_VARS) +
+            "){Remove-Item -Path \"env:$n\" -ErrorAction SilentlyContinue}\n")
+
+
 def _ps_lit(s) -> str:
     r"""A PowerShell single-quoted literal. Apostrophes are escaped by doubling.
 
@@ -896,95 +950,574 @@ def _copy_clipboard(path: Path) -> bool:
     return False
 
 
-def open_session(phase_id: str, prompt: str, tool: str = "claude",
-                 blank: bool = False) -> dict:
-    """Open a development session in the chosen tool, seeded with the phase prompt.
+# ------------------------------------------------------------- sessions ---
+# One conversation per phase that the dashboard can ADDRESS, recorded outside
+# git under WORK_DIR (a coding tool's sessions are per directory anyway, so the
+# checkout is the right scope). What is recorded is a launch fact - which id,
+# which item was last SENT and when - never progress: the checkboxes remain the
+# only store of that, and "last sent" says nothing about done.
+_SESS_LOCK = threading.Lock()
+PIN_BRIEF_DEFAULT = True     # profile.toml `pin_protocol = false` switches it off
 
-    Both things always happen — the session opens AND the prompt is available to
-    paste — and the result says which route delivered it. The old version put the
-    prompt on the clipboard in clipboard mode only, so on a terminal launcher the
-    "Copy prompt" you thought you had was not there.
+
+def _sessions_path() -> Path:
+    return PROMPT_DIR / "sessions.json"
+
+
+def load_sessions() -> dict:
+    try:
+        d = json.loads(_sessions_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    # The record is a file under the repo, so a clone could ship one. An id
+    # that is not id-shaped is dropped at the boundary and never reaches a
+    # command line, a WQL filter or a launch script.
+    for ph in list((d.get("phases") or {}).values()):
+        for rec in list((ph or {}).values()):
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("id") and not _SID_OK.match(str(rec["id"])):
+                rec.pop("id", None)
+                rec["id_malformed"] = True
+            if rec.get("previous"):
+                rec["previous"] = [x for x in rec["previous"]
+                                   if isinstance(x, dict) and _SID_OK.match(str(x.get("id") or ""))]
+    return d
+
+
+def _save_sessions(d: dict) -> None:
+    PROMPT_DIR.mkdir(exist_ok=True)
+    tmp = _sessions_path().with_suffix(".tmp")
+    tmp.write_bytes(json.dumps(d, indent=1, sort_keys=True).encode("utf-8"))
+    tmp.replace(_sessions_path())
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def session_record(phase_id: str, base: str) -> dict | None:
+    return ((load_sessions().get("phases") or {}).get(str(phase_id)) or {}).get(base)
+
+
+def record_session(phase_id: str, base: str, sid: str | None = None, item: str = "",
+                   kind: str = "item", new: bool = False, count: bool = True,
+                   via: str = "", route: str | None = None, pending: str = "",
+                   on_cmdline: bool | None = None) -> dict:
+    """Update the record for (phase, tool) after a launch or a paste.
+
+    `new` retires the current id into previous[] first: the old conversation
+    still exists and is not deleted, it is just no longer where Send goes.
+    `count` is False when nothing was launched (a paste, a --continue
+    fallback); `via` marks a delivery the record cannot vouch for ("paste":
+    copied, not yet pasted; "continue": the tool's own latest conversation,
+    destination unknown); `route` is how the tab was opened ("wt.exe" names
+    a tab, a plain shell does not); `on_cmdline` says whether a live process
+    can be recognised by the id at all (opencode chooses its own ids and its
+    cold launch carries none).
+    """
+    with _SESS_LOCK:
+        d = load_sessions()
+        ph = d.setdefault("phases", {}).setdefault(str(phase_id), {})
+        rec = ph.get(base) or {}
+        now = _now_iso()
+        if new and rec.get("id") and rec.get("id") != sid:
+            rec.setdefault("previous", []).insert(
+                0, {"id": rec["id"], "started": rec.get("started"), "retired": now})
+            rec["previous"] = rec["previous"][:10]
+        if new:
+            # A fresh session has received nothing yet and is nobody's attachment.
+            for k in ("id", "started", "attached", "route", "pending", "id_on_cmdline",
+                      "last_sent", "last_sync", "id_malformed"):
+                rec.pop(k, None)
+            rec["launches"] = 0
+        if sid and rec.get("id") != sid:
+            rec["id"], rec["started"] = sid, now
+            rec.pop("attached", None)
+        if route:
+            rec["route"] = route
+        if pending:
+            rec["pending"] = pending
+        if on_cmdline is not None:
+            rec["id_on_cmdline"] = on_cmdline
+        if count:
+            rec["launches"] = int(rec.get("launches") or 0) + 1
+        stamp = {"item": item or "", "kind": kind, "at": now}
+        if via:
+            stamp["via"] = via
+        if kind == "phase":
+            rec["last_sync"] = stamp       # a re-sync is not an item send
+        else:
+            rec["last_sent"] = stamp
+        ph[base] = rec
+        _save_sessions(d)
+        return rec
+
+
+def forget_session(phase_id: str, base: str) -> dict:
+    with _SESS_LOCK:
+        d = load_sessions()
+        rec = ((d.get("phases") or {}).get(str(phase_id)) or {}).get(base)
+        if not rec:
+            return {"ok": False, "error": f"no {base} session recorded for Phase {phase_id}"}
+        if rec.get("id"):
+            rec.setdefault("previous", []).insert(
+                0, {"id": rec["id"], "started": rec.get("started"), "retired": _now_iso()})
+            rec["previous"] = rec["previous"][:10]
+        for k in ("id", "started", "last_sent", "last_sync", "attached", "route",
+                  "pending", "id_on_cmdline", "id_malformed"):
+            rec.pop(k, None)
+        rec["launches"] = 0
+        _save_sessions(d)
+        return {"ok": True}
+
+
+_SID_OK = re.compile(r"^(?:[0-9a-fA-F-]{36}|ses_[A-Za-z0-9]{6,})$")
+
+
+def attach_session(phase_id: str, base: str, sid: str) -> dict:
+    """Point Send at a conversation the developer started themselves."""
+    sid = (sid or "").strip()
+    if not _SID_OK.match(sid):
+        return {"ok": False, "error": "that does not look like a session id "
+                                      "(claude: a uuid; opencode: ses_...)"}
+    # Only a tool with a warm launcher that takes an id can be sent to by id.
+    resumable = {v.get("base") or k for k, v in LAUNCHERS.items()
+                 if v.get("warm") and "{sid}" in str(v.get("cmd", ""))}
+    if base not in resumable:
+        return {"ok": False, "error": f"no launcher on this machine can resume a {base!r} "
+                                      "session by id"}
+    with _SESS_LOCK:
+        d = load_sessions()
+        ph = d.setdefault("phases", {}).setdefault(str(phase_id), {})
+        rec = ph.get(base) or {}
+        if rec.get("id") and rec["id"] != sid:
+            rec.setdefault("previous", []).insert(
+                0, {"id": rec["id"], "started": rec.get("started"), "retired": _now_iso()})
+            rec["previous"] = rec["previous"][:10]
+            # The attached conversation never received what the old one did.
+            for k in ("last_sent", "last_sync", "pending", "id_on_cmdline", "id_malformed"):
+                rec.pop(k, None)
+        rec["id"], rec["started"], rec["launches"] = sid, _now_iso(), 0
+        rec["attached"], rec["route"] = True, "attached"
+        ph[base] = rec
+        _save_sessions(d)
+    # Say what was checked, not what was hoped: a uuid with no transcript here
+    # will fall back to --continue on the next Send.
+    return {"ok": True, "id": sid, "transcript": _transcript_state(base, sid)}
+
+
+def _procs_with(needles: list[str]) -> dict | None:
+    """Which of these ids appear on a LIVE process's command line.
+
+    One WMI query for all of them. The querying shell is excluded - its own
+    command line contains every needle. None means the check itself failed,
+    which the page shows as "unknown", never as "not running".
+    """
+    if not needles:
+        return {}
+    if os.name != "nt":
+        return None
+    # Ids are id-shaped or they are not looked for: nothing else may be
+    # interpolated into a filter that PowerShell will read. The filter is a
+    # single-quoted PowerShell literal (no $(...) expansion) and '_' is a WQL
+    # wildcard, so it is bracketed.
+    needles = [n for n in needles if re.fullmatch(r"[A-Za-z0-9_-]+", n)]
+    if not needles:
+        return None
+    conds = " OR ".join("CommandLine LIKE '%" + n.replace("_", "[_]") + "%'" for n in needles)
+    cmd = ("Get-CimInstance Win32_Process -Filter " + _ps_lit(conds) + " | "
+           "Where-Object { $_.Name -notmatch '^(powershell|pwsh)' } | "
+           "Select-Object Name,ProcessId,CommandLine | ConvertTo-Json -Compress")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                           capture_output=True, timeout=25, creationflags=NO_WINDOW)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        if r.returncode != 0:
+            return None
+        rows = json.loads(out) if out else []
+        rows = rows if isinstance(rows, list) else [rows]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    found: dict[str, list[str]] = {}
+    for row in rows:
+        cl = str((row or {}).get("CommandLine") or "")
+        for n in needles:
+            if n in cl:
+                found.setdefault(n, []).append(str(row.get("Name")))
+    return found
+
+
+def _claude_transcript(sid: str) -> Path:
+    """Where Claude Code keeps this directory's conversations - the layout as
+    observed here (~/.claude/projects/<cwd with every non-alnum as '-'>/<id>.jsonl)."""
+    slug = re.sub(r"[^A-Za-z0-9-]", "-", str(REPO.resolve()))
+    return Path.home() / ".claude" / "projects" / slug / (sid + ".jsonl")
+
+
+def _transcript_state(base: str, sid: str) -> bool | None:
+    if base != "claude" or not sid:
+        return None          # only Claude's layout is known; unknown, not "missing"
+    try:
+        return _claude_transcript(sid).exists()
+    except OSError:
+        return None
+
+
+def _mint_claude_id() -> str:
+    import uuid
+    for _ in range(5):
+        sid = str(uuid.uuid4())
+        if not _claude_transcript(sid).exists():
+            return sid
+    return str(uuid.uuid4())
+
+
+def _opencode_ids() -> set[str]:
+    """Session ids `opencode session list` shows from this directory."""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", "opencode session list"],
+                           capture_output=True, timeout=30, creationflags=NO_WINDOW,
+                           cwd=str(REPO))
+        return set(re.findall(r"\bses_[A-Za-z0-9]+", r.stdout.decode("utf-8", "replace")))
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+
+def _opencode_dir(sid: str) -> str:
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", "opencode export " + sid],
+                           capture_output=True, timeout=30, creationflags=NO_WINDOW,
+                           cwd=str(REPO))
+        return str((json.loads(r.stdout.decode("utf-8", "replace")).get("info") or {})
+                   .get("directory") or "")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return ""
+
+
+def _discover_opencode(phase_id: str, base: str, before: set[str], pending: str) -> None:
+    """opencode names its own sessions: watch the list for one that appeared
+    after our launch AND belongs to this directory, then record it. Bounded;
+    silence if nothing shows - the warm launcher then falls back honestly.
+
+    `pending` is this launch's token: a later cold launch, a forget or an
+    attach replaces or removes it, and a superseded watcher exits without
+    writing - so two launches within the window cannot record each other's
+    session. The id is marked as not carried by any process: opencode chose
+    it, so liveness cannot be read off a command line and is shown as unknown.
+    """
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        new = _opencode_ids() - before
+        for sid in sorted(new):
+            d = _opencode_dir(sid)
+            if d and Path(d).resolve() == REPO.resolve():
+                with _SESS_LOCK:
+                    cur = load_sessions()
+                    ph = cur.setdefault("phases", {}).setdefault(str(phase_id), {})
+                    rec = ph.get(base) or {}
+                    if rec.get("id") or rec.get("pending") != pending:
+                        return
+                    rec["id"], rec["started"] = sid, _now_iso()
+                    rec["id_on_cmdline"] = False
+                    rec.pop("pending", None)
+                    ph[base] = rec
+                    _save_sessions(cur)
+                return
+
+
+def _split_tag(tag: str) -> tuple[str, str]:
+    """'0' -> ('0','phase'); '0-item' -> ('0','item'); '0-ticket' -> ('0','ticket');
+    'replan-item-0' -> ('0','replan'); 'replan-plan-all' -> ('all','replan')."""
+    if tag.startswith("replan-"):
+        parts = tag.split("-", 2)
+        return (parts[2] if len(parts) > 2 else "all"), "replan"
+    for k in ("item", "ticket"):
+        if tag.endswith("-" + k):
+            return tag[:-len(k) - 1], k
+    return tag, "phase"
+
+
+def _pin_brief() -> bool:
+    prof = _pr.load_user_profile() or {}
+    v = prof.get("pin_protocol", PIN_BRIEF_DEFAULT)
+    return bool(v) if isinstance(v, bool) else PIN_BRIEF_DEFAULT
+
+
+def _write_briefs_quietly() -> None:
+    """The per-phase brief is what a launcher pins and what /next-item reads;
+    keep it current, and never let a brief-writing hiccup block a launch."""
+    try:
+        _pr.write_briefs(build(REPO), REPO)
+    except Exception as exc:          # noqa: BLE001 - reported, never fatal
+        print(f"  briefs: not written ({type(exc).__name__}: {exc})", file=sys.stderr)
+
+
+def _tab_title(phase_id: str, base: str) -> str:
+    """The tab a tracked launch is given. Built from sanitised parts: wt.exe
+    splits its argv on ';', so nothing repo-authored may reach it raw."""
+    tb = "".join(c for c in str(base) if c.isalnum() or c in "-_") or "x"
+    return f"Phase {_pr.safe_id(phase_id)} - {tb}"
+
+
+def _where(phase_id: str, base: str, rec: dict, sid: str) -> str:
+    """Where the session is, as far as the record knows: a tab this server
+    named, or 'the terminal where it runs' for one it never opened."""
+    if (rec or {}).get("route") == "wt.exe":
+        return f"the terminal tab '{_tab_title(phase_id, base)}'"
+    return f"the terminal where session {sid[:8]}… is running"
+
+
+def _age_s(iso: str) -> float | None:
+    try:
+        return time.time() - time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def sessions_view() -> dict:
+    """Every recorded phase session with what the page may honestly say about
+    it: id, when, what was last SENT, whether a process carrying the id is live
+    (or unknown), whether Claude's transcript is on disk, and what Send will do."""
+    d = load_sessions()
+    phases = d.get("phases") or {}
+    ids = [rec["id"] for ph in phases.values() for rec in ph.values()
+           if rec.get("id") and rec.get("id_on_cmdline", True)]
+    alive = _procs_with(ids) if ids else {}
+    warm_of = {v.get("base") or k: k for k, v in LAUNCHERS.items() if v.get("warm")}
+    out: dict = {}
+    for pid, tools in phases.items():
+        for base, rec in tools.items():
+            sid = rec.get("id") or ""
+            live = None
+            if sid and alive is not None and rec.get("id_on_cmdline", True):
+                live = bool(alive.get(sid))
+            tr = _transcript_state(base, sid) if sid else None
+            where = _where(pid, base, rec, sid)
+            age = _age_s(rec.get("started") or "") if sid else None
+            if not sid:
+                will = ("continue the most recent conversation here — PCC cannot tell "
+                        "which one" if base in warm_of else "start a new session")
+            elif base not in warm_of:
+                will = f"nothing — no launcher on this machine can resume a {base} session"
+            elif live:
+                will = f"paste into {where}"
+            elif tr is False and age is not None and age < 120:
+                will = (f"wait — session {sid[:8]}… started {int(age)}s ago and has no "
+                        "transcript yet; if its tab shows an error, forget it")
+            elif tr is False:
+                will = ("continue the most recent conversation here: no transcript on disk "
+                        f"for the recorded session {sid[:8]}… (it may never have started, "
+                        "or was deleted)")
+            elif live is None:
+                will = (f"resume {sid[:8]}… in a new terminal tab — PCC cannot see "
+                        f"whether {where} is still open; close it first, or paste there yourself")
+            else:
+                will = f"resume {sid[:8]}… in a new terminal tab"
+            out.setdefault(str(pid), {})[base] = {
+                **rec, "alive": live, "transcript": tr, "send_will": will,
+                "warm_launcher": warm_of.get(base), "where": where,
+                "tab": _tab_title(pid, base) if rec.get("route") == "wt.exe" else None}
+    return {"ok": True, "phases": out}
+
+
+def open_session(phase_tag: str, prompt: str, tool: str = "claude",
+                 blank: bool = False, item: str = "", prompt_warm: str = "") -> dict:
+    """Open a development session in the chosen tool, seeded with a prompt.
+
+    Which prompt is decided HERE, where the launcher is known: a cold launcher
+    gets `prompt` (the full brief), a warm one gets `prompt_warm` (the delta)
+    and is pointed at this phase's recorded session - pasted into its live tab,
+    resumed by id in a new tab, or, with nothing on record, the tool's own
+    "continue the latest" with a note that says exactly that.
+
+    Both things always happen - the session opens AND the prompt is available
+    to paste - and the result says which route delivered it.
     """
     spec = LAUNCHERS.get(tool)
     if spec is None:
         return {"ok": False, "error": "launcher " + repr(tool) + " not available on this machine"}
 
-    safe = "".join(c for c in phase_id if c.isalnum()) or "x"
+    phase_id, kind = _split_tag(phase_tag)
+    base = str(spec.get("base") or tool)
+    warm = bool(spec.get("warm"))
+    tracked = kind in ("item", "phase") and not blank and spec["mode"] == "terminal"
+    rec = session_record(phase_id, base) if tracked else None
+    notes: list[str] = []
+    sid = str((rec or {}).get("id") or "")
+    if sid and not _SID_OK.match(sid):          # load_sessions drops these; belt and braces
+        notes.append(f"the recorded {base} session id for Phase {phase_id} is malformed and "
+                     "was ignored — forget it or attach a valid one")
+        sid = ""
+    text = prompt_warm if (warm and prompt_warm) else prompt
+
+    safe = _pr.safe_id(phase_id)
     PROMPT_DIR.mkdir(exist_ok=True)
-    pf = PROMPT_DIR / ("prompt-" + safe + ".txt")
-    pf.write_text(prompt, encoding="utf-8")
+    pf = PROMPT_DIR / f"prompt-{safe}-{kind}.txt"
+    pf.write_bytes(text.encode("utf-8"))
     copied = False if blank else _copy_clipboard(pf)
 
-    if spec["mode"] == "terminal":
-        import shutil
-        # The command goes in a .ps1 run with -File, never on the command line.
-        # wt.exe treats `;` as a command separator and PowerShell -Command needs
-        # a second level of quoting; a generated prompt or an env prelude hits
-        # both. A script file has neither problem — the same fix this repo's
-        # PowerShell helpers already use.
-        body = (
-            "# Generated by the control center. Safe to delete.\n"
-            "$ErrorActionPreference = 'Continue'\n"
-            + _env_prelude()
-            + (spec.get("cmd_blank") if blank and spec.get("cmd_blank")
-               else spec["cmd"].format(pf=_ps_lit(pf)))
-            + "\n")
-        ps1 = PROMPT_DIR / ("launch-" + safe + ".ps1")
-        # utf-8-SIG: Windows PowerShell 5.1 reads a .ps1 as ANSI unless it
-        # finds a BOM, which would mangle any non-ASCII path inside it.
-        ps1.write_text(body, encoding="utf-8-sig")
-        # Do not hard-code pwsh: Windows 11 ships Windows Terminal but PowerShell 7
-        # is a separate install, so `pwsh` is often absent while `powershell` works.
-        shell = "pwsh" if shutil.which("pwsh") else "powershell"
-        tried = []
-        for argv in (
-            ["wt.exe", "-w", "0", "nt", "-d", str(REPO), shell,
-             "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
-            [shell, "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
-        ):
-            try:
-                proc = subprocess.Popen(argv, cwd=str(REPO), creationflags=NEW_CONSOLE)
-            except (OSError, subprocess.SubprocessError) as exc:
-                # Catch every spawn failure, not just FileNotFoundError. A
-                # PermissionError or WinError 193 used to escape the handler,
-                # drop the connection, and leave the button stuck on "Opening…".
-                tried.append(f"{argv[0]}: {type(exc).__name__}")
-                continue
-            # Popen only proves a process image was created. wt.exe is a hand-off
-            # stub: an old build, a Store alias for an uninstalled terminal, or a
-            # missing inner shell all exit immediately, and reporting "session
-            # started" from process creation alone is the same unearned claim the
-            # clipboard copy used to make. Give it a moment and check.
-            time.sleep(0.6)
-            rc = proc.poll()
-            if rc in (None, 0):
-                return {"ok": True, "via": argv[0], "tool": tool, "copied": copied,
-                        "prompt_file": str(pf), "mode": "terminal",
-                        "blank": blank,
-                        "note": ("opened with no prompt" if blank else
-                                 "prompt sent into the session" +
-                                 (" · also on your clipboard" if copied else ""))}
-            tried.append(f"{argv[0]}: exited {rc}")
-        return {"ok": False, "error":
-                "could not start a terminal session (" + "; ".join(tried) + "). The prompt is "
-                + ("on your clipboard and " if copied else "") + "in " + str(pf) +
-                " — open the tool yourself."}
+    if spec["mode"] != "terminal":
+        # clipboard mode: the tool takes no prompt argument, so paste is the delivery.
+        try:
+            subprocess.Popen(spec["open"], cwd=str(REPO), creationflags=NO_WINDOW)
+            # Launching activates the app, but a background process may not take
+            # the foreground - so an already-running app just blinked in the
+            # taskbar while this said "opened". Pull it forward, and say which.
+            focused = _focus_app_window(spec["focus"]) if spec.get("focus") else False
+            where = ("— paste it into the session" if focused
+                     else "— the app is in your taskbar; paste it there")
+            return {"ok": True, "via": spec["open"][0], "tool": tool, "copied": copied,
+                    "mode": "clipboard", "focused": focused, "shape": "cold",
+                    "note": ("prompt on your clipboard " + where if copied
+                             else "opened, but the clipboard copy failed — use `view prompt`")}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
 
-    # clipboard mode: the tool takes no prompt argument, so paste is the delivery.
+    import shutil
+    cmd = spec.get("cmd_blank") if blank and spec.get("cmd_blank") else spec["cmd"]
+    before_oc: set[str] | None = None
+    pending, via, count = "", "", True
+    if tracked:
+        _write_briefs_quietly()
+        if warm:
+            if sid:
+                where = _where(phase_id, base, rec or {}, sid)
+                # An id opencode chose is on no command line: liveness unknown.
+                alive = _procs_with([sid]) if (rec or {}).get("id_on_cmdline", True) else None
+                if alive is None:
+                    notes.append(f"could not check whether {where} is still open — if it "
+                                 "is, paste the copied prompt there instead of using the new tab")
+                elif alive.get(sid):
+                    # The conversation is on screen: a second process attached to
+                    # the same transcript is not what anyone wants. Paste instead.
+                    # Recorded as a paste, not a launch: nothing was launched and
+                    # the paste itself is the developer's.
+                    focused = _focus_app_window("WindowsTerminal", timeout=2.0)
+                    record_session(phase_id, base, item=item, kind=kind, count=False, via="paste")
+                    return {"ok": True, "mode": "paste", "tool": tool, "copied": copied,
+                            "focused": focused, "session": sid, "shape": "warm",
+                            "phase": phase_id, "kind": kind, "where": where, "note": ""}
+                if _transcript_state(base, sid) is False:
+                    if spec.get("cmd_fallback"):
+                        cmd, via, count = spec["cmd_fallback"], "continue", False
+                        notes.append(f"no transcript on disk for the recorded session "
+                                     f"{sid[:8]}… (it may never have started, or was deleted) "
+                                     "— continuing the most recent conversation here instead")
+                        sid = ""
+                    else:
+                        return {"ok": False, "error": f"no transcript on disk for the recorded "
+                                f"{base} session {sid[:8]}…; forget it and start a new one"}
+            else:
+                if spec.get("cmd_fallback"):
+                    cmd, via, count = spec["cmd_fallback"], "continue", False
+                    notes.append(f"no session recorded for Phase {phase_id} — continuing "
+                                 "the most recent conversation here, which may not be it")
+                elif "{sid}" in cmd:
+                    return {"ok": False, "error": f"no {base} session recorded for Phase "
+                            f"{phase_id} — start one first, or attach an id"}
+        else:
+            if base == "claude" and "{sid}" in cmd:
+                sid = _mint_claude_id()
+            elif base == "opencode":
+                import uuid
+                before_oc, pending, sid = _opencode_ids(), uuid.uuid4().hex, ""
+            elif "{sid}" in cmd:
+                return {"ok": False, "error": f"launcher {tool!r} needs a session id but "
+                        "starts a new session; give it a warm sibling or drop {sid}"}
+            else:
+                sid = ""        # the tool picks its own id; the record must not claim one
+    else:
+        # Untracked launches (ticket drafts, re-plans, blank sessions) get a
+        # usable command and no record: a warm launcher continues the latest
+        # conversation, a cold claude template gets a throwaway id, and only a
+        # launcher that cannot run without a phase id is refused.
+        if warm and spec.get("cmd_fallback") and not blank:
+            cmd = spec["cmd_fallback"]
+        if base == "claude" and "{sid}" in cmd:
+            sid = _mint_claude_id()
+        elif "{sid}" in cmd:
+            return {"ok": False, "error": f"launcher {tool!r} needs a phase session and this "
+                    "launch is not a phase or item"}
+        else:
+            sid = ""
+    cmd_template = cmd
+
+    # Layer 4: pin the generated phase brief as appended system prompt so the
+    # protocol survives compaction. Claude Code only (the flag is its), and
+    # only when the brief exists - never a flag pointing at nothing.
+    sys_arg = ""
+    if tracked and base == "claude" and _pin_brief():
+        brief = PROMPT_DIR / _pr.brief_name(phase_id)
+        if brief.exists():
+            sys_arg = "--append-system-prompt-file " + _ps_lit(brief) + " "
     try:
-        subprocess.Popen(spec["open"], cwd=str(REPO), creationflags=NO_WINDOW)
-        # Launching activates the app, but a background process may not take the
-        # foreground - so an already-running app just blinked in the taskbar
-        # while this said "opened". Pull it forward, and say which happened.
-        focused = _focus_app_window(spec["focus"]) if spec.get("focus") else False
-        where = ("— paste it into the session" if focused
-                 else "— the app is in your taskbar; paste it there")
-        return {"ok": True, "via": spec["open"][0], "tool": tool, "copied": copied,
-                "mode": "clipboard", "focused": focused,
-                "note": ("prompt on your clipboard " + where if copied
-                         else "opened, but the clipboard copy failed — use `view prompt`")}
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
+        cmd = cmd.format(pf=_ps_lit(pf), sid=sid, sys=sys_arg)
+    except (KeyError, IndexError, ValueError) as exc:
+        return {"ok": False, "error": f"launcher {tool!r} has a bad template: {exc}"}
+
+    # The command goes in a .ps1 run with -File, never on the command line.
+    # wt.exe treats `;` as a command separator and PowerShell -Command needs a
+    # second level of quoting; a generated prompt or an env prelude hits both.
+    # A script file has neither problem.
+    body = ("# Generated by the control center. Safe to delete.\n"
+            "$ErrorActionPreference = 'Continue'\n" + _unlink_prelude() + _env_prelude()
+            + cmd + "\n")
+    ps1 = PROMPT_DIR / f"launch-{safe}-{kind}.ps1"
+    # utf-8-SIG: Windows PowerShell 5.1 reads a .ps1 as ANSI unless it finds a
+    # BOM, which would mangle any non-ASCII path inside it.
+    ps1.write_text(body, encoding="utf-8-sig")
+    # Do not hard-code pwsh: Windows 11 ships Windows Terminal but PowerShell 7
+    # is a separate install, so `pwsh` is often absent while `powershell` works.
+    shell = "pwsh" if shutil.which("pwsh") else "powershell"
+    # A tracked launch names its tab, so "paste it into the Phase 0 tab" points
+    # at something you can see; the app's own title would overwrite it.
+    tab = ["--title", _tab_title(phase_id, base), "--suppressApplicationTitle"] if tracked else []
+    tried = []
+    for argv in (
+        ["wt.exe", "-w", "0", "nt", *tab, "-d", str(REPO), shell,
+         "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+        [shell, "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+    ):
+        try:
+            proc = subprocess.Popen(argv, cwd=str(REPO), creationflags=NEW_CONSOLE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            # Catch every spawn failure, not just FileNotFoundError. A
+            # PermissionError or WinError 193 used to escape the handler,
+            # drop the connection, and leave the button stuck on "Opening…".
+            tried.append(f"{argv[0]}: {type(exc).__name__}")
+            continue
+        # Popen only proves a process image was created. wt.exe is a hand-off
+        # stub: an old build, a Store alias for an uninstalled terminal, or a
+        # missing inner shell all exit immediately, and reporting "session
+        # started" from process creation alone is the same unearned claim the
+        # clipboard copy used to make. Give it a moment and check.
+        time.sleep(0.6)
+        rc = proc.poll()
+        if rc in (None, 0):
+            if tracked:
+                record_session(phase_id, base, sid=sid or None, item=item, kind=kind,
+                               new=not warm, count=count, via=via, route=argv[0],
+                               pending=pending,
+                               on_cmdline=(True if sid and "{sid}" in cmd_template else None))
+                if before_oc is not None:
+                    threading.Thread(target=_discover_opencode,
+                                     args=(phase_id, base, before_oc, pending),
+                                     daemon=True).start()
+            return {"ok": True, "via": argv[0], "tool": tool, "copied": copied,
+                    "prompt_file": str(pf), "mode": "terminal", "blank": blank,
+                    "shape": "warm" if warm else "cold", "session": sid or None,
+                    "phase": phase_id, "kind": kind, "pinned": bool(sys_arg),
+                    "tab": _tab_title(phase_id, base) if tracked and argv[0] == "wt.exe" else None,
+                    "note": "; ".join(notes)}
+        tried.append(f"{argv[0]}: exited {rc}")
+    return {"ok": False, "error":
+            "could not start a terminal session (" + "; ".join(tried) + "). The prompt is "
+            + ("on your clipboard and " if copied else "") + "in " + str(pf) +
+            " — open the tool yourself."}
 
 
 def phase_activity(phase_id: str, model: dict) -> dict:
@@ -1218,8 +1751,7 @@ def ticket_prompt(ph: dict, plan: str, doc: str, open_items: list,
 
 
 def _draft_path(phase_id: str) -> Path:
-    safe = "".join(c for c in str(phase_id) if c.isalnum()) or "x"
-    return PROMPT_DIR / f"ticket-{safe}.json"
+    return PROMPT_DIR / f"ticket-{_pr.safe_id(phase_id)}.json"
 
 
 def draft_ticket(phase_id: str, tool: str, model: dict) -> dict:
@@ -1579,6 +2111,11 @@ CSS = """
 .pcc-btn[disabled]{opacity:.5;cursor:progress}
 .pcc-btn.run{border-color:var(--accent);background:var(--accent);color:#fff}
 .pcc-btn.run:hover{color:#fff;filter:brightness(1.08)}
+.psess{margin:6px 0 4px;font-family:var(--mono);font-size:11px;color:var(--ink-3);
+ display:flex;flex-direction:column;gap:4px;line-height:1.5}
+.psess .warn{color:var(--warn)}
+.psess button{margin:2px 6px 0 0;font-size:11.5px;padding:4px 9px}
+.dstatus.warn{color:var(--warn)}
 #pcc-out{position:fixed;right:14px;bottom:58px;z-index:51;width:min(680px,calc(100vw - 28px));
  max-height:52vh;display:none;flex-direction:column;background:var(--panel);
  border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
@@ -1696,6 +2233,41 @@ JS = r"""
   // from launchers DETECTED server-side; the page only ever sends a key.
   var LN = window.__ANU_LAUNCHERS__ || {};
   var lnKeys = Object.keys(LN);
+  // Phase sessions on record server-side: which conversation Send goes to and
+  // what it will do. Loaded once, refreshed after every launch; anything that
+  // draws from it registers a watcher.
+  var SESS = {}, sessWatchers = [];
+  function loadSessions(cb){
+    fetch('/api/sessions').then(function(r){ return r.json(); }).then(function(d){
+      if(d && d.ok){ SESS = d.phases || {}; sessWatchers.forEach(function(f){ try{ f(); }catch(e){} }); }
+      if(cb) cb();
+    }).catch(function(){ if(cb) cb(); });
+  }
+  function baseOf(tool){ return (LN[tool] && LN[tool].base) ? LN[tool].base : tool; }
+  function sessRec(phaseId, tool){ return (SESS[String(phaseId)] || {})[baseOf(tool)] || null; }
+  function warmKeyFor(base){
+    for(var i=0;i<lnKeys.length;i++){ if(LN[lnKeys[i]].warm && baseOf(lnKeys[i]) === base) return lnKeys[i]; }
+    return null;
+  }
+  // Preselect for a phase: your usual tool, switched to its "continue" form
+  // when this phase already has a session on record - and back to the cold
+  // form when it does not, so "continue" is never the silent default for a
+  // phase that has nothing to continue.
+  function pickLauncher(sel, phaseId){
+    var k = preferredTool(); if(!k || !LN[k]) return;
+    var base = baseOf(k), rec = (SESS[String(phaseId)] || {})[base], wk = warmKeyFor(base);
+    // A record whose transcript is known to be gone is no session to send to.
+    if(rec && rec.id && rec.transcript !== false){ if(wk && !LN[k].warm) k = wk; }
+    else if(LN[k].warm && LN[base]) k = base;
+    sel.value = k;
+  }
+  function ago(iso){
+    if(!iso) return '';
+    var ms = Date.now() - new Date(iso).getTime(); if(isNaN(ms)) return iso;
+    var m = Math.round(ms/60000); if(m < 1) return 'just now'; if(m < 60) return m + ' min ago';
+    var h = Math.round(m/60); if(h < 48) return h + ' h ago'; return Math.round(h/24) + ' d ago';
+  }
+  loadSessions();
 
   // Which tool to preselect: your last choice on this page, else the tool from
   // your setup profile. The wizard asked for a preferred tool and the launcher
@@ -1833,14 +2405,19 @@ JS = r"""
     return Promise.reject();
   }
   // One launch routine, used by the start cards and by the phase drawer.
-  function launch(btn, phaseId, prompt, tool, say){
+  function launch(btn, phaseId, prompt, tool, say, extra){
     btn.disabled = true;
     var was = btn.textContent;
     btn.textContent = 'Opening…';
     try { localStorage.pccLauncher = tool; } catch(e){}
+    var body = {phase: phaseId, prompt: prompt, tool: tool};
+    if(extra && extra.item) body.item = extra.item;
+    if(extra && extra.prompt_warm) body.prompt_warm = extra.prompt_warm;
+    // Copy what the server will actually send: the warm shape on a continue launcher.
+    var toCopy = (LN[tool] && LN[tool].warm && extra && extra.prompt_warm) ? extra.prompt_warm : prompt;
     var copied = false;
-    copyLocal(prompt).then(function(){ copied = true; }, function(){}).then(function(){
-      return api('/api/session', {phase: phaseId, prompt: prompt, tool: tool});
+    copyLocal(toCopy).then(function(){ copied = true; }, function(){}).then(function(){
+      return api('/api/session', body);
     }).then(function(d){
       btn.disabled = false; btn.textContent = was;
       if(!d.ok){ if(say) say(d.error, 'err'); else alert(d.error); return; }
@@ -1849,17 +2426,30 @@ JS = r"""
       // worse than saying nothing.
       var name = LN[d.tool] ? LN[d.tool].label : (d.tool || d.via);
       var ok = copied || d.copied, msg, cls = 'ok';
-      if(d.mode === 'clipboard'){
+      if(d.mode === 'paste'){
+        // Composed here from the COMBINED copy result: the page's own copy may
+        // have succeeded where the server's failed, or the other way round.
+        var where = d.where || 'the terminal running the session';
+        msg = ok ? ('prompt on your clipboard — paste it into ' + where +
+                    (d.focused ? '' : ' (the terminal is in your taskbar)'))
+                 : ('the session is open in ' + where + ', but no clipboard copy succeeded — ' +
+                    'open “view prompt” below and copy it by hand');
+        if(!ok) cls = 'err';
+      } else if(d.mode === 'clipboard'){
         msg = ok ? (name + ' opened — the prompt is on your clipboard, press Ctrl+V in it')
                  : (name + ' opened, but the clipboard copy FAILED — open “view prompt” ' +
                     'below and copy it by hand');
         if(!ok) cls = 'err';
       } else {
-        msg = 'Session started in ' + name + ' with the prompt already in it' +
-              (ok ? ' (also copied to your clipboard)' : '');
+        msg = (d.shape === 'warm' ? 'Follow-up sent to ' : 'Session started in ') + name +
+              (d.session ? ' · session ' + String(d.session).slice(0, 8) + '…' : '') +
+              (d.pinned ? ' · brief pinned' : '') +
+              (d.note ? ' — ' + d.note : '') + (ok ? ' · also on your clipboard' : '');
+        if(d.note) cls = 'warn';
       }
       if(say) say(msg, cls); else { btn.textContent = ok ? 'Opened ✓' : 'Opened (no copy)';
         btn.title = msg; setTimeout(function(){ btn.textContent = was; }, 4000); }
+      loadSessions();
     });
   }
   window.__pccLaunch__ = launch;
@@ -1925,6 +2515,10 @@ JS = r"""
   // Per-item start. Each checklist item is a unit of work in its own right, so
   // it gets its own session prompt — scoped to that one line, with an explicit
   // instruction not to widen silently.
+  function itemPromptWarm(p, label){
+    if(!p.item_tmpl_warm) return '';
+    return p.item_tmpl_warm.split(p.slot).join(label);
+  }
   function itemPrompt(p, label){
     if(!p.item_tmpl) return p.prompt;
     return p.item_tmpl.split(p.slot).join(label);
@@ -1968,7 +2562,7 @@ JS = r"""
     // out invites an agent to redo work that is already done, and the session
     // would open with instructions that contradict the checkbox next to them.
     var isDone = li.dataset.s === 'done';
-    var prompt = itemPrompt(p, label);
+    var prompt = itemPrompt(p, label), warmPrompt = itemPromptWarm(p, label);
     var msg = document.createElement('div'); msg.className = 'dstatus';
     function say(t, c){ msg.textContent = t || ''; msg.className = 'dstatus ' + (c||''); }
 
@@ -1976,24 +2570,69 @@ JS = r"""
 
     if(lnKeys.length){
       var sel = toolSelect();
+      if(!isDone) pickLauncher(sel, p.id);
       var go = document.createElement('button');
       go.className = 'pcc-btn run';
-      go.textContent = isDone ? 'Open blank session here' : 'Open session on this item';
-      go.title = isDone
-        ? 'This item is done — opens the tool in the repo with no prompt at all'
-        : 'Opens a session scoped to this one item';
+      // The button says what the launch will DO, which depends on the launcher
+      // and on whether this phase has a session on record - not a fixed verb.
+      function relabel(){
+        if(isDone){
+          go.textContent = 'Open blank session here';
+          go.title = 'This item is done — opens the tool in the repo with no prompt at all';
+          return;
+        }
+        var L = LN[sel.value] || {}, rec = sessRec(p.id, sel.value);
+        if(L.warm && rec && rec.id && rec.transcript !== false){
+          go.textContent = 'Send to phase session';
+          // The server already worked out what Send will do; the button says the same.
+          go.title = 'Sends only this item to the recorded ' + baseOf(sel.value) + ' session ' +
+                     String(rec.id).slice(0, 8) + '… — Send will ' +
+                     (rec.send_will || 'paste into its tab if that is open, resume it in a new tab if not');
+        } else if(L.warm){
+          go.textContent = 'Send to last session';
+          go.title = (rec && rec.id)
+            ? 'No transcript on disk for the recorded session: this continues the most recent conversation in the repo, which may not be it'
+            : 'No session is recorded for this phase: this continues the most recent conversation in the repo, which may not be it';
+        } else {
+          go.textContent = 'Open session on this item';
+          go.title = 'Opens a new session with the full brief for this one item; it becomes the phase session';
+        }
+        // The one thing the page CAN verify about the session: whether the
+        // item it was last sent is still open in the plan. Sending the next
+        // one onto an unconfirmed brief is the mistake this line prevents.
+        // A send that went via --continue reached an unknown conversation, so it
+        // says nothing about THIS session's unconfirmed brief.
+        var prev = rec && rec.last_sent && rec.last_sent.via !== 'continue' && rec.last_sent.item;
+        var warnOn = false;
+        if(L.warm && rec && rec.id && prev && prev !== label && li.parentNode){
+          var lis = li.parentNode.querySelectorAll('li.item');
+          for(var i=0;i<lis.length;i++){
+            if(lis[i].dataset.item === prev && lis[i].dataset.s !== 'done'){ warnOn = true; break; }
+          }
+        }
+        // 'stale' marks the one message relabel owns; a launch result (which
+        // may also be amber) is never cleared by the refresh that follows it.
+        if(warnOn) say('the item last sent to this session — “' + prev + '” — is still open in the plan', 'warn stale');
+        else if(msg.className.indexOf('stale') >= 0) say('');
+      }
+      sel.addEventListener('change', function(){ sel.dataset.touched = '1'; relabel(); });
+      // Records load asynchronously: re-pick when they arrive, unless the
+      // developer has already chosen a launcher by hand.
+      sessWatchers.push(function(){ if(!isDone && !sel.dataset.touched) pickLauncher(sel, p.id); relabel(); });
+      relabel();
       go.addEventListener('click', function(ev){
         ev.stopPropagation();
         if(isDone) launchBlank(go, p.id, sel.value, say);
-        else launch(go, p.id + '-item', prompt, sel.value, say);
+        else launch(go, p.id + '-item', prompt, sel.value, say, {item: label, prompt_warm: warmPrompt});
       });
       row.appendChild(go); row.appendChild(sel);
     }
 
     var cp = document.createElement('button');
     cp.className = 'pcc-btn';
-    cp.textContent = isDone ? 'Copy re-check prompt' : 'Copy prompt';
-    cp.title = isDone ? 'A prompt that VERIFIES this item, rather than rebuilding it' : '';
+    cp.textContent = isDone ? 'Copy re-check prompt' : 'Copy prompt (new chat)';
+    cp.title = isDone ? 'A prompt that VERIFIES this item, rather than rebuilding it'
+                      : 'The full brief for this item — for a chat that has nothing yet';
     cp.addEventListener('click', function(ev){
       ev.stopPropagation();
       var txt = isDone ? recheckPrompt(p, label) : prompt;
@@ -2001,6 +2640,17 @@ JS = r"""
                           function(){ say('clipboard refused — open the prompt below', 'err'); });
     });
     row.appendChild(cp);
+    if(!isDone && warmPrompt){
+      var cw = document.createElement('button');
+      cw.className = 'pcc-btn'; cw.textContent = 'Copy prompt (same chat)';
+      cw.title = 'The short follow-up — for a chat that already holds this phase’s brief';
+      cw.addEventListener('click', function(ev){
+        ev.stopPropagation();
+        copyLocal(warmPrompt).then(function(){ say('follow-up copied', 'ok'); },
+                                   function(){ say('clipboard refused', 'err'); });
+      });
+      row.appendChild(cw);
+    }
 
     // The same honest fallback the read-only surface uses: a command you paste.
     var CMD = window.__PCC_TOOLCMD__ || {};
@@ -2015,7 +2665,8 @@ JS = r"""
         var shell = window.__PCC_SHELL__ ||
                     (navigator.platform.indexOf('Win') === 0 ? 'powershell' : 'bash');
         var tmpl = CMD[t][shell] || CMD[t].bash;
-        var cmd = tmpl.split('{repo}').join(window.__PCC_REPO__ || '.').split('{p}').join(prompt);
+        var txt = (/\(continue\)$/.test(t) && warmPrompt) ? warmPrompt : prompt;
+        var cmd = tmpl.split('{repo}').join(window.__PCC_REPO__ || '.').split('{p}').join(txt);
         copyLocal(cmd).then(function(){ say(t + ' command copied', 'ok'); },
                             function(){ say('clipboard refused', 'err'); });
       });
@@ -2047,12 +2698,10 @@ JS = r"""
 
     row.appendChild(replanToggle('item', String(p.id), label, say, bar));
 
-    var det = document.createElement('details');
-    var sum = document.createElement('summary'); sum.textContent = 'item prompt';
-    var pre = document.createElement('pre'); pre.textContent = prompt;
-    det.appendChild(sum); det.appendChild(pre);
-
-    bar.appendChild(row); bar.appendChild(msg); bar.appendChild(det);
+    // The prompt fold is part of the shared template now (filled from the
+    // phase's template at load); the controls go above it.
+    bar.insertBefore(row, bar.firstChild);
+    bar.insertBefore(msg, row.nextSibling);
   }
 
   // ONE entry point. A phase is one object with one detail view, so there is
@@ -2068,11 +2717,29 @@ JS = r"""
 
     if(lnKeys.length){
       var sel = toolSelect();
+      pickLauncher(sel, p.id);
       var open = document.createElement('button');
-      open.className = 'pcc-btn run'; open.textContent = 'Open session';
-      open.title = p.startable ? 'Open this phase in a coding session'
-                               : 'This phase is blocked — the prompt says so';
-      open.addEventListener('click', function(){ launch(open, p.id, p.prompt, sel.value, say); });
+      open.className = 'pcc-btn run';
+      function relabel(){
+        var L = LN[sel.value] || {}, rec = sessRec(p.id, sel.value);
+        if(L.warm && rec && rec.id){
+          open.textContent = 'Re-sync phase session';
+          open.title = 'Asks the recorded session to re-read the checklist and wait for the next item';
+        } else if(L.warm){
+          open.textContent = 'Continue last session';
+          open.title = 'No session recorded for this phase — continues the most recent conversation in the repo, which may not be it';
+        } else {
+          open.textContent = 'Start phase session';
+          open.title = p.startable ? 'Opens a session with the phase brief; it reads in, then waits for the items you send'
+                                   : 'This phase is blocked — the brief says so';
+        }
+      }
+      sel.addEventListener('change', function(){ sel.dataset.touched = '1'; relabel(); });
+      sessWatchers.push(function(){ if(!sel.dataset.touched) pickLauncher(sel, p.id); relabel(); });
+      relabel();
+      open.addEventListener('click', function(){
+        launch(open, p.id, p.prompt, sel.value, say, {prompt_warm: p.prompt_warm});
+      });
       act.appendChild(open); act.appendChild(sel);
     }
 
@@ -2144,7 +2811,7 @@ JS = r"""
       var cur = currentKey();
       if(cur){
         var un = document.createElement('button');
-        un.className = 'anu-btn'; un.textContent = 'Unlink ' + cur;
+        un.className = 'pcc-btn'; un.textContent = 'Unlink ' + cur;
         un.title = 'Remove this ticket from the phase in docs/progress.toml. The '
                  + 'issue itself is not touched - only the link.';
         un.addEventListener('click', function(){
@@ -2322,12 +2989,87 @@ JS = r"""
   }
   function el(tag, text){ var n = document.createElement(tag); n.textContent = text; return n; }
 
+  // What the page may honestly say about a phase's session: the record, a
+  // process check, a transcript check, and what Send will do next. "last
+  // sent" is a launch fact - it does not mean confirmed, let alone done.
+  function sessionStrip(p, det, say){
+    var host = det.querySelector('.psess');
+    if(!host){
+      var act = det.querySelector('.dact'); if(!act) return;
+      host = document.createElement('div'); host.className = 'psess';
+      act.parentNode.insertBefore(host, act.nextSibling);
+    }
+    function attachBtn(base){
+      var a = document.createElement('button'); a.className = 'pcc-btn'; a.textContent = 'Attach session id';
+      a.title = 'Point Send at a conversation you started yourself (claude: the uuid from /status; opencode: ses_…)';
+      a.addEventListener('click', function(){
+        var id = window.prompt('Session id to send Phase ' + p.id + ' items to (' + base + '):', '');
+        if(!id) return;
+        api('/api/session/attach', {phase: p.id, base: base, id: id.trim()}).then(function(d){
+          if(!d.ok){ say(d.error || 'could not attach', 'err'); return; }
+          var id8 = id.trim().slice(0, 8) + '…';
+          if(d.transcript === false) say('attached — no transcript found here for ' + id8 + '; Send will fall back to the most recent conversation', 'warn');
+          else say('attached — Send now goes to ' + id8, 'ok');
+          loadSessions();
+        });
+      });
+      return a;
+    }
+    function draw(){
+      host.innerHTML = '';
+      var ph = SESS[String(p.id)] || {}, bases = Object.keys(ph).filter(function(b){ return ph[b] && (ph[b].id || ph[b].last_sent); });
+      if(!bases.length){
+        var none = el('div', 'no phase session on record — Open/Start records one');
+        var pref = preferredTool();
+        if(pref) none.appendChild(attachBtn(baseOf(pref)));
+        host.appendChild(none);
+        return;
+      }
+      bases.forEach(function(base){
+        var r = ph[base];
+        var idtxt = r.id ? String(r.id).slice(0, 8) + '…' : 'no id recorded';
+        var ls = r.last_sent || null;
+        var lead = !ls ? '' : (ls.via === 'paste' ? ' · last copied for paste: “'
+                       : (ls.via === 'continue' ? ' · last sent via --continue (destination unknown): “'
+                       : ' · last sent: “'));
+        var last = (ls && ls.item) ? lead + ls.item + '” ' + ago(ls.at)
+                                   : (ls ? ' · last sent ' + ago(ls.at) : '');
+        if(r.last_sync) last += ' · re-synced ' + ago(r.last_sync.at);
+        var n = r.launches || 0;
+        host.appendChild(el('div', 'session · ' + base + ' ' + idtxt +
+          (r.started ? ' · started ' + ago(r.started) : '') + ' · ' + n + ' launch' + (n === 1 ? '' : 'es') + last +
+          (r.previous && r.previous.length ? ' · ' + r.previous.length + ' earlier' : '')));
+        var live = r.alive === true ? 'live' : (r.alive === false ? 'not running' : 'unknown');
+        var tr = r.transcript === true ? 'found' : (r.transcript === false ? 'not found' : '—');
+        host.appendChild(el('div', 'terminal: ' + live + ' · transcript: ' + tr + ' · Send will: ' + (r.send_will || '')));
+        if(r.last_sent && r.last_sent.at && Date.now() - new Date(r.last_sent.at).getTime() > 86400000){
+          var w = el('div', 'long gap since the last send — the session may hold stale beliefs; the follow-up already tells it to re-read the checklist');
+          w.className = 'warn'; host.appendChild(w);
+        }
+        var btns = document.createElement('div');
+        var f = document.createElement('button'); f.className = 'pcc-btn'; f.textContent = 'Forget session';
+        f.title = 'Stop sending to this conversation. It is kept in the record’s history and its transcript is untouched; the next Open starts a new one.';
+        f.addEventListener('click', function(){
+          api('/api/session/forget', {phase: p.id, base: base}).then(function(d){
+            if(!d.ok){ say(d.error || 'could not forget', 'err'); return; }
+            say('session forgotten — the next Open starts a new one', 'ok'); loadSessions();
+          });
+        });
+        btns.appendChild(f); btns.appendChild(attachBtn(base));
+        host.appendChild(btns);
+      });
+    }
+    sessWatchers.push(draw);
+    draw();
+  }
+
   window.__pccPhaseOpened__ = function(p, det){
     var act = det.querySelector('.dact');
     var msg = det.querySelector('.pbody > .dstatus');
     if(!act || !msg) return;
     function say(t, c){ msg.textContent = t || ''; msg.className = 'dstatus ' + (c||''); }
     actionRow(p, act, say, det);
+    sessionStrip(p, det, say);
     wireTicks(det);
 
     // Work tree: what git says actually happened under this phase's modules.
@@ -2486,7 +3228,8 @@ def action_layer(token: str, model: dict) -> str:
         "window.__ANU_PROVIDERS__=" + _pr.js(
             [c.get("name", "") for c in (CFG.get("context") or []) if c.get("name")]) + ";"
           "window.__ANU_LAUNCHERS__=" + _pr.js(
-            {k: {"label": v["label"], "mode": v.get("mode", "")}
+            {k: {"label": v["label"], "mode": v.get("mode", ""),
+                 "base": v.get("base", k), "warm": bool(v.get("warm"))}
              for k, v in LAUNCHERS.items()}) + ";</script>"
         "<script>" + JS + "</script>")
 
@@ -3779,6 +4522,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 model = build(REPO)
+                _pr.write_briefs(model, REPO)   # so /next-item and a pinned launch never read a stale brief
                 # render() returns an artifact-safe FRAGMENT (no doctype, html,
                 # head or body — the artifact wrapper supplies those). Served
                 # directly it therefore had no <html lang>, which screen readers
@@ -3846,6 +4590,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/context":
             self._json({"providers": probe_status()})
+            return
+
+        if path == "/api/sessions":
+            self._json(sessions_view())
             return
 
         if path == "/api/model":
@@ -4000,9 +4748,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/session":
-            self._json(open_session(str(body.get("phase", "x")), body.get("prompt", ""),
+            self._json(open_session(str(body.get("phase", "x")), str(body.get("prompt", "")),
                                     str(body.get("tool", "claude")),
-                                    blank=bool(body.get("blank"))))
+                                    blank=bool(body.get("blank")),
+                                    item=str(body.get("item", "")),
+                                    prompt_warm=str(body.get("prompt_warm", ""))))
+            return
+
+        if path == "/api/session/forget":
+            self._json(forget_session(str(body.get("phase", "")), str(body.get("base", ""))))
+            return
+
+        if path == "/api/session/attach":
+            self._json(attach_session(str(body.get("phase", "")), str(body.get("base", "")),
+                                      str(body.get("id", ""))))
             return
 
         self._json({"error": "not found"}, 404)

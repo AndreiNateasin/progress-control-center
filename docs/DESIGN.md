@@ -91,6 +91,13 @@ open = ["cursor", "{repo}"]
 # mode terminal needs {pf} in cmd (the prompt file, already quoted); mode
 # clipboard needs open = [...]
 
+[[launcher]]                       # a "continue" variant of a terminal tool
+id = "mytool-continue"; label = "mytool - continue"; detect = "mytool"; mode = "terminal"
+base = "mytool"                    # groups it with that tool's cold launcher
+warm = true                        # receives the WARM prompt: the item, not the phase again
+cmd = "mytool --resume {sid} {pf}" # {sid} = the recorded phase session id
+cmd_fallback = "mytool --continue {pf}"   # when no id is on record — the result says so
+
 [[developer]]                      # the team ROSTER, committed
 name = "alice"; tool = "claude"; shell = "bash"
 
@@ -127,6 +134,7 @@ directory, outside every repo:
 name  = "alice"
 tool  = "opencode"
 shell = "bash"
+pin_protocol = true                # Claude Code launches pin the phase brief as system prompt
 [repos]
 "/srv/project" = "/home/alice/src/project"
 ```
@@ -202,6 +210,135 @@ outward-facing and cannot be withdrawn, while the config is a local file whose d
 you can read after the fact. So Save writes on the first click and then shows the
 diff that landed — not the one a preview predicted, which is the stronger claim of
 the two. Preview is still there for reading first.
+
+## Cold and warm prompts, and the phase session
+
+Every session prompt has two shapes. The **cold** shape is for a session that has
+nothing yet: the phase context pointers (doc, exit test, modules, open items, the
+context providers' usage rules), a four-rule protocol block — brief first, then
+wait; only this item; claim only what was verified; tick only in the named checklist
+file — and the declaration *"This is the Phase N session: later items arrive as
+short 'Next item' messages"*. The **warm** shape, about 560 characters, is for the
+session that already holds all that: it names the next item, restates the protocol
+in one paragraph, tells the session to re-read the checklist, and says that if this
+conversation has not already read the phase doc it is not the phase session — say
+so, read it, then post the brief.
+
+Two shapes because the old item prompt was ~1,500 characters of which ~130 were the
+item. On the reference project a 19-item phase sent 29,902 characters, 27,400 of
+them the same phase context repeated at a session that already had it. Now it is
+one cold prompt, then ~560 per item.
+
+**The launcher decides the shape**, not the prompt. Launchers carry `base` (the tool:
+claude, opencode, codex, or a `[[launcher]]` id) and `warm` (true on the "continue"
+variants), and a warm launcher receives the warm prompt. The prompt has no way to
+know whether it lands in a fresh process or an existing conversation; the launcher
+is the one thing that does. The same rule reaches the static surface: each open item
+gets an "item prompt" fold there, filled client-side from the per-phase template so
+the file does not double, and the developer bar's *Copy <tool> command* carries the
+warm shape for a "(continue)" tool.
+
+**A phase session, addressed by id.** "Continue" used to mean whichever conversation
+was most recent in the directory, so a ticket draft or a re-plan in between hijacked
+it. Now a cold Claude Code launch mints a uuid (`claude --session-id <uuid>`) and the
+warm one resumes exactly that (`claude --resume <uuid> "<warm prompt>"`) — both
+verified interactively. opencode is `opencode -s <id> --prompt …`, its id discovered
+from `opencode session list` right after the cold launch (bounded, and checked
+against the directory); its fallback is `-c`. Codex resumes "last" only, so its warm
+launcher has no id to address. With no id on record the warm launcher falls back to
+`--continue` and the result says so.
+
+The record is `.pcc/sessions.json`, in the gitignored generated folder:
+
+```json
+{"phases": {"0": {"claude": {
+  "id": "3f2c…", "started": "2026-09-16T10:12:04", "launches": 4,
+  "route": "wt.exe", "id_on_cmdline": true,
+  "last_sent": {"item": "Burn-up on the Timeline tab", "kind": "item", "at": "2026-09-16T11:40:51"},
+  "last_sync": {"item": "", "kind": "phase", "at": "2026-09-16T11:20:00"},
+  "previous": [{"id": "9a10…", "started": "2026-09-15T09:02:11", "retired": "2026-09-16T10:12:04"}]
+}}}}
+```
+
+`route` is how the tab was opened (`wt.exe` names a tab; `attached` means you
+recorded the id yourself and no tab is known); `id_on_cmdline` is false for an id
+opencode chose, since no process carries it and liveness is then shown as unknown;
+`last_sent.via` is `paste` when the text was only copied for you to paste, or
+`continue` when the send fell back to the tool's own latest conversation and the
+destination is unknown — neither counts as a launch, and a `continue` send never
+raises the amber warning. A phase-level re-sync writes `last_sync`, never
+`last_sent`. Ids are validated when the file is read: anything not id-shaped is
+dropped before it can reach a command line or a process filter.
+
+It is a **launch fact, never progress**: which conversation was last spoken to, and
+what was said to it. Nothing reads a phase's state from it, and forgetting a session
+changes no checkbox. The checkboxes remain the only store, which is why the
+dashboard's one warning about a session — an amber line when the item last sent is
+still open in the plan — is also the only thing it can verify. *Forget session*
+retires the id into `previous` and touches no transcript; *Attach session id*
+records one you already have.
+
+**Liveness, then paste.** Before a warm launch the server asks once (Win32_Process
+command lines, one query) whether a process carrying the recorded id is live. If it
+is, the conversation is on screen and a second process on the same transcript is not
+what anyone wants: Send copies the warm text to the clipboard and focuses Windows
+Terminal. The tab was titled `Phase N - <tool>` at launch so the message "paste it
+into the terminal tab 'Phase 0 - claude'" points at something visible. If it is not
+live and the transcript exists, the id is resumed in a new tab. If the transcript is
+missing, the result says exactly that (it may never have started, or was deleted)
+and falls back to the tool's continue; a record only seconds old with no transcript
+yet reads as *wait*, and a liveness check that could not run says so instead of
+reporting *not running*. The strip on the
+phase states this before you click — *Send will: paste into the live tab / resume
+<id> in a new tab / continue the most recent conversation here — PCC cannot tell
+which one* — because a guess presented as a plan is the fourth rule broken again.
+
+The generated launch script also clears the `CLAUDE_CODE_*` session-linking
+variables, so a session launched from a dashboard that was itself started inside a
+Claude Code session is still a top-level session.
+
+**The brief file carries no checklist.** `.pcc/phase-<id>.md` — protocol, phase
+context, provider rules — is rewritten on every render and before every tracked
+launch. Claude Code launches pin it as appended system prompt
+(`--append-system-prompt-file`) unless the profile sets `pin_protocol = false`.
+Verified interactively: the pinned brief is honoured on the launch that passes the
+flag and gone on a resume that does not, so the warm launcher passes it again. The
+checklist is deliberately not in it: the checklist has one home, and a copy in a
+pinned system prompt would be a second store, stale the moment a box is ticked.
+
+**The pull path.** A session should not need the dashboard to get its next item:
+
+```bash
+python progress-report.py --next 0             # warm prompt for Phase 0's next open item
+python progress-report.py --next 0 burn-up     # …or the open item matching the words
+python progress-report.py --brief 0            # the brief file's content
+python progress-report.py --write-briefs       # write every .pcc/phase-<id>.md
+python progress-report.py --install-skills     # /next-item for Claude Code and opencode
+```
+
+`--next` reads the LIVE checklist and always exits 0, so a tool can inject it.
+`--install-skills` writes `.claude/skills/next-item/SKILL.md` (user-invoked only)
+and `.opencode/commands/next-item.md`, both of which inject the generator's output
+with the tools' !`command` syntax: `/next-item 0` inside the terminal pulls the next
+item with zero dashboard clicks. It refuses to overwrite a skill file it did not
+generate. This repo has both installed for its own roadmap.
+
+**`[[launcher]]` keys.** A configured terminal launcher may add `warm = true`,
+`base = "<id>"`, `cmd_fallback = "…"`, and `{sid}` in `cmd`, filled with the phase
+session id. A warm launcher with `{sid}` and no `cmd_fallback` is refused when no
+id is recorded; a cold launcher with `{sid}` is refused outright, since it starts a
+new session and has nothing to fill it with. All of these are part of the trust
+digest when present, because they change what runs.
+
+**Not solved**, and said so:
+
+- enforcement — the protocol is context; the only gate is the human reply
+- a claim marker for two sessions on one phase
+- cross-machine continuity: the record is local to each developer's checkout, which
+  is fine until the roadmap's MCP server (Phase 7) makes `get_phase` / `next_item` /
+  `tick` the shared surface
+- Codex session addressing
+- the startup cost of any new launch
 
 ## Trust
 
