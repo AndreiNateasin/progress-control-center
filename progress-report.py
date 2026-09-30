@@ -1868,9 +1868,29 @@ def protocol_block(tick_file: str, mode: str = "checkboxes") -> str:
            "exact line, nothing else, no other file."))
 
 
+def phase_source(p: dict, plan_name: str, plan_text: str, sections: dict, repo: Path) -> str:
+    """Where a session reads this phase in: the declared phase doc when that
+    file exists, otherwise the phase's own heading and line range in the plan.
+    Never a guessed path - a prompt naming a file that is not there sends every
+    session off to look for it first."""
+    doc = p.get("doc")
+    if isinstance(doc, str) and doc and (repo / doc).is_file():
+        return doc
+    sec = sections.get(str(p.get("id")))
+    if sec:
+        at = plan_text.find(sec)
+        first = plan_text.count("\n", 0, at) + 1
+        last = first + sec.rstrip("\n").count("\n")
+        return f"the `{sec.splitlines()[0].strip()}` section of {plan_name} (lines {first}-{last})"
+    return f"{plan_name} (it has no Phase {p.get('id')} heading)"
+
+
+def _source(p: dict, plan_name: str) -> str:
+    return p.get("source") or f"the Phase {p['id']} section of {plan_name}"
+
+
 def _phase_context(p: dict, plan_name: str) -> str:
-    doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
-    bits = [f"Context: {doc} (if absent, the Phase {p['id']} section of {plan_name})."]
+    bits = [f"Context: {_source(p, plan_name)}."]
     if p.get("modules"):
         bits.append("Modules: " + ", ".join(p["modules"]) + ".")
     if p.get("jira"):
@@ -1886,12 +1906,11 @@ def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
     message that relies on both. Built for EVERY phase, not just the startable
     ones: a blocked phase is exactly when you want to read yourself in.
     """
-    doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
+    doc = _source(p, plan_name)
     tick = tick_file_of(p, plan_name)
     items = p.get("items") or []
     open_items = [i for i in items if i["state"] != "done"]
-    lines = [f"- Phase doc: {doc} - read it now (if absent, the Phase {p['id']} "
-             f"section of {plan_name}).",
+    lines = [f"- Read now: {doc}.",
              f"- Exit test: {p.get('exit_test') or 'see plan'}",
              "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
     if p.get("jira"):
@@ -1992,10 +2011,9 @@ def phase_brief(p: dict, plan_name: str, providers: list) -> str:
     can pin this file as appended system prompt so the rules survive
     compaction, and /next-item reads the live checklist, never this.
     """
-    doc = p.get("doc") or f"docs/PHASE-{p['id']}.md"
     tick = tick_file_of(p, plan_name)
     facts = [f"- Plan: {plan_name}",
-             f"- Phase doc: {doc} (if absent, the Phase {p['id']} section of {plan_name})",
+             f"- Phase context: {_source(p, plan_name)}",
              f"- Exit test: {p.get('exit_test') or 'see plan'}",
              "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
     if p.get("jira"):
@@ -2450,6 +2468,7 @@ def build(repo: Path) -> dict:
         # the launcher is known - here both are just built.
         plan_name, providers = proj.get("plan", "the plan"), cfg.get("context", [])
         p["items_mode"] = mode
+        p["source"] = phase_source(p, plan_name, plan_text, sections, repo)
         p["tick_file"] = tick_file_of(p, plan_name)
         p["prompt"] = phase_prompt(p, plan_name, providers)
         p["prompt_warm"] = phase_prompt_warm(p, plan_name)

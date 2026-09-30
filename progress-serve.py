@@ -1759,7 +1759,7 @@ def ticket_prompt(ph: dict, plan: str, doc: str, open_items: list,
         f"Draft a JIRA ticket for Phase {ph['id']} ({ph['name']}) of {plan}.\n\n"
 
         "Read for context first — then throw the reading away and write a short work "
-        f"order. Sources: {doc} if it exists, otherwise that phase's section of {plan}, "
+        f"order. Sources: {doc}, "
         f"and the code under {', '.join(ph.get('modules') or ['the repo'])}. The point of "
         "reading is that the scope and the acceptance criteria are TRUE, not that the "
         "ticket recounts what you read.\n\n"
@@ -1861,7 +1861,7 @@ def draft_ticket(phase_id: str, tool: str, model: dict) -> dict:
     open_items = [i["label"] for i in ph.get("items", []) if i["state"] != "done"]
     jira_cfg = (CFG.get("integrations", {}) or {}).get("jira", {}) or {}
     project = jira_cfg.get("project_key") or jira_cfg.get("project") or ""
-    doc = ph.get("doc") or f"docs/PHASE-{ph['id']}.md"
+    doc = ph.get("source") or f"the Phase {ph['id']} section of the plan"
 
     cap = int(jira_cfg.get("draft_max_chars", 1600) or 1600)
     prompt = ticket_prompt(ph, model['project'].get('plan', 'the plan'), doc,
