@@ -873,6 +873,8 @@ def init_repo(path: Path) -> None:
     # configures it — a wizard you can only reach once you no longer need it
     # would be useless on exactly the machine that needs it.
     CFG = tomllib.loads(cfgp.read_text(encoding="utf-8")) if cfgp.exists() else {}
+    global _CFG_STAMP
+    _CFG_STAMP = _cfg_stamp()
     ACTIONS.clear()
     ACTIONS.update(build_actions(CFG))
     LAUNCHERS.clear()
@@ -882,6 +884,36 @@ def init_repo(path: Path) -> None:
     # Sync at startup so a session launched seconds later already has its MCP
     # servers. Reported, never silent: this writes a committed file.
     return CFG
+
+
+_CFG_STAMP: tuple | None = None
+
+
+def _cfg_stamp() -> tuple | None:
+    try:
+        st = (REPO / "docs" / "progress.toml").stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def refresh_cfg() -> bool:
+    """Reload the config DATA if docs/progress.toml changed on disk since it
+    was last read. In place, so every holder of CFG sees it. A file caught
+    half-written (unparsable) keeps the previous config and is retried on the
+    next request. Returns whether a reload happened."""
+    global _CFG_STAMP
+    stamp = _cfg_stamp()
+    if stamp is None or stamp == _CFG_STAMP:
+        return False
+    try:
+        new = tomllib.loads((REPO / "docs" / "progress.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    CFG.clear()
+    CFG.update(new)
+    _CFG_STAMP = stamp
+    return True
 
 
 def post_trust_setup() -> None:
@@ -4777,6 +4809,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._loopback_host():
             self._json({"error": "loopback only"}, 421)
             return
+        refresh_cfg()           # an edit from a session or a git pull, not ours
         path = urlparse(self.path).path
 
         if path == "/api/fresh":
@@ -4883,6 +4916,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._loopback_host():
             self._json({"error": "loopback only"}, 421)
             return
+        refresh_cfg()
         if not self._authed():
             self._json({"error": "bad or missing token"}, 403)
             return

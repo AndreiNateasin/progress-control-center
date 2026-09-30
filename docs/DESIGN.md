@@ -38,6 +38,13 @@ Phase 0 therefore never shows an old plan's Phase 0 draft or resumes its
 conversation. A file from before this existed is read only while the project
 has a single plan, when it can only be that plan's.
 
+The server re-reads `docs/progress.toml` whenever it changed on disk, before
+handling a request - so an edit by a session or a `git pull` moves which files the
+page watches, which plan is active and which phases re-plan sees. Only the config
+data is reloaded: the run-command allowlist and the launchers stay as they were
+approved at startup, because an edited repo file must never be how a new command
+gets in.
+
 Write-back matches the verbatim source line, not a line number: if the file changed
 since the page rendered, the match fails and you are told to refresh, rather than
 the wrong box being ticked.
