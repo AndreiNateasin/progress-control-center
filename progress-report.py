@@ -347,7 +347,7 @@ def _aligned_kv(body: str, key: str, value) -> str:
     return key.ljust(max(width, len(key) + 1)) + "= " + _toml_val(value)
 
 
-
+def _append_in_body(body: str, key: str, value) -> str:
     """Add `key = value` to a table body without disturbing anything else.
 
     Two details that matter on a file people hand-edit: the blank line that
@@ -710,10 +710,15 @@ def plan_candidates(repo: Path) -> list[dict]:
                         # findall over a whole file silently returns nothing -
                         # which would show every candidate as "0 checkboxes".
                         n = sum(1 for line in text.splitlines() if CHECK.match(line))
-                        ph = len(re.findall(r"^###\s+Phase\s+[0-9A-Za-z]+\s*[—\-–]",
-                                            text, re.M))
+                        ph = len(PHASE_HEAD.findall(text))
+                        # With no checkboxes, what WOULD be tracked: the list
+                        # entries under its phase headings (items = "lists").
+                        li = (sum(len(parse_list_items(s))
+                                  for s in plan_phase_sections(text).values())
+                              if ph and not n else 0)
                         out.append({"file": e.relative_to(root).as_posix(),
-                                    "checkboxes": n, "phases": ph, "depth": depth})
+                                    "checkboxes": n, "phases": ph, "items": li,
+                                    "depth": depth})
                 except OSError:
                     continue                  # broken junction, or a race
         queue, depth = nxt, depth + 1
@@ -833,6 +838,7 @@ def detect_environment(repo: Path) -> dict:
 # still gated by the trust prompt on the next start.
 PROJECT_FIELDS = {
     "name": ("[project]", str), "plan": ("[project]", str),
+    "items": ("[project]", str),
     "owner": ("[project]", str), "start_date": ("[project]", str),
     "allow_artifact_publish": ("[project]", bool),
     "jira_browse": ("[integrations.jira]", str),
@@ -867,6 +873,9 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
     if not cfgp.exists():
         return {"ok": False, "error": f"no config at {cfgp} — run Init first"}
     before = cfgp.read_text(encoding="utf-8")
+    # The file's own line ending, kept on write: text mode on Windows would turn
+    # an LF config into CRLF and put every line of a committed file in the diff.
+    eol = "\r\n" if b"\r\n" in cfgp.read_bytes() else "\n"
     text, notes = before, []
 
     for key, val in (fields or {}).items():
@@ -882,6 +891,8 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
                 return {"ok": False, "error": f"{_KEYNAME.get(key, key)} must be a whole number"}
         else:
             val = str(val)
+        if key == "items" and val not in ITEM_MODES:
+            return {"ok": False, "error": f"items must be one of {', '.join(ITEM_MODES)}"}
         if typ is str and not val.strip():
             continue                                   # empty means "leave alone"
         # Already correct? Leave the author's line exactly as written. Rewriting
@@ -920,10 +931,19 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
         plan_path = Path(repo) / plan_rel if plan_rel else None
         if plan_path and plan_path.is_file():
             import datetime
+            plan_txt = plan_path.read_text(encoding="utf-8", errors="replace")
             text, sync_notes = sync_phases_with_plan(
-                text, plan_path.read_text(encoding="utf-8", errors="replace"),
-                plan_rel, prev_plan, datetime.date.today().isoformat())
+                text, plan_txt, plan_rel, prev_plan, datetime.date.today().isoformat())
             notes.extend(sync_notes)
+            # A plan with no checkboxes is tracked by its list entries. Record
+            # that once, visibly, so the first tick cannot flip the mode.
+            cfg_now = tomllib.loads(text)
+            if not (cfg_now.get("project") or {}).get("items"):
+                m_now = resolve_items_mode(Path(repo), cfg_now, plan_phase_sections(plan_txt))
+                if m_now == "lists":
+                    text = set_toml_key(text, "[project]", "items", "lists")
+                    notes.append('[project] items = "lists" - the plan has no checkboxes; '
+                                 "its list entries under each phase heading are the items")
     except (tomllib.TOMLDecodeError, OSError) as exc:
         notes.append(f"phase sync skipped: {exc}")
 
@@ -941,7 +961,7 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
         tomllib.loads(text)                    # never write a file we just broke
     except tomllib.TOMLDecodeError as exc:
         return {"ok": False, "error": f"the edit would produce invalid TOML ({exc}) — nothing written"}
-    cfgp.write_text(text, encoding="utf-8")
+    cfgp.write_bytes(text.replace("\r\n", "\n").replace("\n", eol).encode("utf-8"))
     return {"ok": True, "changed": True, "notes": notes, "diff": diff, "written": True,
             "path": str(cfgp)}
 
@@ -980,6 +1000,7 @@ def check_config(repo: Path) -> int:
         sections = plan_phase_sections(plan_p.read_text(encoding="utf-8", errors="replace"))
 
     phases = cfg.get("phase", [])
+    mode = resolve_items_mode(repo, cfg, sections)
     if not phases:
         problems.append("no [[phase]] tables — the report would render empty")
     ids = [str(p.get("id", "")) for p in phases]
@@ -1005,17 +1026,17 @@ def check_config(repo: Path) -> int:
         doc = p.get("doc")
         n_items = 0
         if doc and (repo / doc).exists():
-            n_items = len(parse_checklist((repo / doc).read_text(encoding="utf-8", errors="replace")))
+            n_items = len(parse_items((repo / doc).read_text(encoding="utf-8", errors="replace"), None, mode))
         elif doc:
             problems.append(f"phase {pid}: doc {doc!r} does not exist")
         if not n_items and pid in sections:
-            n_items = len(parse_checklist(sections[pid]))
+            n_items = len(parse_items(sections[pid], None, mode))
         if not n_items:
             # The silent killer: renders 0% forever and looks like idleness rather
             # than misconfiguration. A `continuous` phase is the legitimate case —
             # a standing habit has no finish line — so that is informational.
             msg = (f"phase {pid}: no checklist items found "
-                   f"(no `### Phase {pid} — ...` section in {plan_rel}"
+                   f"(no `## Phase {pid} — ...` heading in {plan_rel}"
                    + (f", and {doc!r} has no checkboxes" if doc else ", and no doc") + ")")
             if p.get("continuous"):
                 warnings.append(msg + " — expected for a continuous phase")
@@ -1164,15 +1185,19 @@ def scaffold_init(target: Path, name: str | None, *, owner: str | None = None,
 
     # Plan discovery: the root .md with the most checkboxes wins; phase headings
     # (### Phase N — name) become [[phase]] stubs so the report renders day one.
-    plan_file, plan_phases, best = None, {}, 0
+    plan_file, plan_phases, best, plan_items_mode = None, {}, (0, 0), "checkboxes"
     for md in sorted(target.glob("*.md")):
         try:
             text = md.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         n = sum(1 for line in text.splitlines() if CHECK.match(line))
-        if n > best:
-            best, plan_file, plan_phases = n, md.name, plan_phase_sections(text)
+        ph = len(PHASE_HEAD.findall(text))
+        # Checkboxes first, phase headings as the tie-break - and a plan with
+        # phase headings but no boxes is still a plan (items = "lists").
+        if (n or ph) and (n, ph) > best:
+            best, plan_file, plan_phases = (n, ph), md.name, plan_phase_sections(text)
+            plan_items_mode = detect_items_mode(list(plan_phases.values()))
     if not plan_file:
         plan_file = "PLAN.md"
         (target / plan_file).exists() or (target / plan_file).write_text(
@@ -1193,25 +1218,28 @@ def scaffold_init(target: Path, name: str | None, *, owner: str | None = None,
     phase_blocks = []
     prev = None
     for pid, section in plan_phases.items():
-        m = re.match(r"^###\s+Phase\s+\S+\s*[—\-–]\s*(.*)$", section.splitlines()[0])
-        pname = (m.group(1).strip() if m else f"Phase {pid}") or f"Phase {pid}"
+        m = PHASE_HEAD.match(section.splitlines()[0])
+        pname = phase_head_name(m) if m else f"Phase {pid}"
         dep = f'["{prev}"]' if prev is not None else "[]"
         phase_blocks.append(
-            f'[[phase]]\nid         = "{pid}"\nname       = "{pname}"\n'
+            f'[[phase]]\nid         = "{pid}"\nname       = {_toml_str(pname)}\n'
             f'days       = 1                  # TODO: working days of focused effort\n'
             f'depends_on = {dep}             # TODO: real technical dependency, not plan order\n'
             f'exit_test  = "TODO"\n')
         prev = pid
 
+    items_line = ('items      = "lists"            # no checkboxes: the list entries '
+                  'under each phase heading are the items' + chr(10) if plan_items_mode == "lists" else "")
     toml_text = f"""# {proj_name} — control-center configuration.
-# Progress is DERIVED from the checkboxes in {plan_file}; this file holds only
+# Progress is DERIVED from the plan named in [project].plan - its checkboxes, or with
+# items = "lists" its list entries under each phase heading. This file holds only
 # what markdown cannot express. Generated by progress-report.py --init on {date.today().isoformat()}.
 # Full schema: docs/CONTROL-CENTER.md in the control-center source repo.
 
 [project]
 name       = "{proj_name}"
 plan       = "{plan_file}"
-start_date = "{date.today().isoformat()}"
+{items_line}start_date = "{date.today().isoformat()}"
 {f'owner      = "{owner}"' if owner else '# owner    = "your-name"'}
 
 # Cleared to share this report outside this machine? OFF for new projects.
@@ -1335,6 +1363,32 @@ def brief_name(pid) -> str:
 
 CHECK = re.compile(r"^\s*[-*]\s*\[([ xX~/-])\]\s*(.+?)\s*$")
 
+# A top-level list entry, numbered or bulleted, with an optional state mark
+# after the marker: `3. Foo`, `3. [x] Foo`, `- Foo`, `- [~] Foo`. Column 0
+# only - nested bullets are the entry's detail, not items of their own.
+LIST_ITEM = re.compile(r"^(\d+[.)]|[-*+])[ \t]+(?:\[([ xX~/-])\][ \t]+)?(\S.*?)\s*$")
+ITEM_MODES = ("checkboxes", "lists")
+# A table body row; group 2 is the optional mark in the first cell, group 3 the
+# rest - numbered like LIST_ITEM so the write-back treats both the same way.
+TABLE_ROW = re.compile(r"^(\|)[ \t]*(?:\[([ xX~/-])\][ \t]+)?(.*?)\|?\s*$")
+_TABLE_SEP = re.compile(r"^\|?[ \t]*:?-{3,}")
+
+# The phase heading, in the spellings plans actually use:
+#   ### Phase 0 — Foundations      ### Phase 0: Foundations
+#   ### Phase 5 (follow-up): Other background work
+# Group 2 is the id, group 3 an optional qualifier, group 4 the name.
+PHASE_HEAD = re.compile(
+    r"^(#{2,4})[ \t]+Phase[ \t]+([0-9A-Za-z]+)[ \t]*(\([^)\n]*\))?[ \t]*"
+    r"[:—–-][ \t]*(.*)$", re.M)
+
+
+def phase_head_name(m) -> str:
+    """The phase's display name from a PHASE_HEAD match, qualifier kept."""
+    name = re.sub(r"\s*\*\(.*?\)\*\s*$", "", (m.group(4) or "").strip()).strip()
+    if m.group(3):
+        name = f"{name} {m.group(3)}".strip()
+    return name or f"Phase {m.group(2)}"
+
 
 def _state(mark: str) -> str:
     return {"x": "done", "X": "done", "~": "active", "/": "active", "-": "active"}.get(mark, "todo")
@@ -1383,6 +1437,111 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
         out.append({"state": state, "label": label.strip(),
                     "file": file, "raw": raw, "redo": redo})
     return out
+
+
+def _clean_label(label: str) -> str:
+    label = re.sub(r"\*\*(.+?)\*\*", r"\1", label)
+    label = re.sub(r"`([^`]+)`", r"\1", label)
+    label = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", label)
+    return label.strip()
+
+
+_FENCE = re.compile(r"^\s*(```|~~~)")
+_HRULE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+
+
+def parse_list_items(text: str, file: str | None = None) -> list[dict]:
+    """items = "lists": every top-level list entry is an item.
+
+    For a plan written as numbered steps with no checkboxes. The state lives in
+    the entry's own line - no mark is open, `[x]` done, `[~]` in progress - so
+    progress is still derived from the plan and nowhere else. Wrapped
+    continuation lines join the label; nested bullets are detail and are left
+    out of it. Code fences are skipped.
+    """
+    out, lines, i, fence = [], text.splitlines(), 0, False
+    while i < len(lines):
+        ln = lines[i]
+        if _FENCE.match(ln):
+            fence = not fence
+            i += 1
+            continue
+        m = None if (fence or _HRULE.match(ln)) else LIST_ITEM.match(ln)
+        if not m:
+            i += 1
+            continue
+        raw, i = ln, i + 1
+        parts = [m.group(3)]
+        while i < len(lines):
+            nxt = lines[i]
+            if not nxt.strip() or LIST_ITEM.match(nxt) or _FENCE.match(nxt):
+                break
+            if not re.match(r"^\s{2,}(?![-*+>]\s|\d+[.)]\s)\S", nxt):
+                break
+            parts.append(nxt.strip())
+            i += 1
+        label = _clean_label(" ".join(parts))
+        state = _state(m.group(2)) if m.group(2) is not None else "todo"
+        redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
+        out.append({"state": state, "label": label, "file": file, "raw": raw,
+                    "redo": redo, "implied": m.group(2) is None})
+    # A phase written as a table ("today | becomes") has no list entries; its
+    # body rows are the units of work. Only as a fallback, so a table beside a
+    # list stays documentation.
+    return out or _parse_table_items(text, file)
+
+
+def _parse_table_items(text: str, file: str | None = None) -> list[dict]:
+    out, lines, fence = [], text.splitlines(), False
+    for n, ln in enumerate(lines):
+        if _FENCE.match(ln):
+            fence = not fence
+            continue
+        if fence or not ln.startswith("|") or _TABLE_SEP.match(ln):
+            continue
+        if n + 1 < len(lines) and _TABLE_SEP.match(lines[n + 1]):
+            continue                                  # the header row
+        m = TABLE_ROW.match(ln)
+        cells = [c.strip() for c in (m.group(3) if m else "").split("|")]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        label = _clean_label(" \u2192 ".join(cells[:2]))
+        state = _state(m.group(2)) if m.group(2) is not None else "todo"
+        redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
+        out.append({"state": state, "label": label, "file": file, "raw": ln,
+                    "redo": redo, "implied": m.group(2) is None})
+    return out
+
+
+def parse_items(text: str, file: str | None, mode: str) -> list[dict]:
+    return parse_list_items(text, file) if mode == "lists" else parse_checklist(text, file)
+
+
+def detect_items_mode(texts: list[str]) -> str:
+    """"lists" only for a plan with NO checkbox anywhere and list entries to
+    track; anything with a single checkbox keeps the checkbox contract."""
+    if any(CHECK.match(line) for t in texts for line in t.splitlines()):
+        return "checkboxes"
+    return "lists" if any(parse_list_items(t) for t in texts) else "checkboxes"
+
+
+def resolve_items_mode(repo: Path, cfg: dict, sections: dict) -> str:
+    """[project].items when set; otherwise detected from the phase sections and
+    the declared phase docs. Persisted on the first save or tick, so the mode
+    cannot flip once a box has been written."""
+    mode = str((cfg.get("project") or {}).get("items") or "").strip().lower()
+    if mode in ITEM_MODES:
+        return mode
+    texts = list(sections.values())
+    for p in cfg.get("phase", []) or []:
+        doc = p.get("doc")
+        if isinstance(doc, str) and doc and (repo / doc).is_file():
+            try:
+                texts.append((repo / doc).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return detect_items_mode(texts)
 
 
 def _phase_block_spans(lines: list[str]) -> list[tuple[int, int]]:
@@ -1442,10 +1601,8 @@ def sync_phases_with_plan(cfg_text: str, plan_text: str, plan_rel: str,
     """
     desired: dict[str, str] = {}
     for pid, sec in plan_phase_sections(plan_text).items():
-        m = re.match(r"^###\s+Phase\s+\S+\s*[\u2014\-\u2013]\s*(.*)$",
-                     sec.splitlines()[0])
-        name = (m.group(1).strip() if m else "") or f"Phase {pid}"
-        name = re.sub(r"\s*\*\(.*?\)\*\s*$", "", name).strip() or f"Phase {pid}"
+        m = PHASE_HEAD.match(sec.splitlines()[0])
+        name = phase_head_name(m) if m else f"Phase {pid}"
         desired[pid] = name
     if not desired:
         return cfg_text, []                    # a plan with no headings syncs nothing
@@ -1522,17 +1679,19 @@ def sync_phases_with_plan(cfg_text: str, plan_text: str, plan_rel: str,
 def plan_phase_sections(plan_text: str) -> dict[str, str]:
     """Split PLAN.md §6 into {phase_id: section_text}."""
     sections: dict[str, str] = {}
-    pat = re.compile(r"^###\s+Phase\s+([0-9A-Za-z]+)\s*[—\-–]\s*(.*)$", re.M)
-    # Bound each phase at the next heading of ANY level. Without this the LAST
-    # phase runs to EOF and absorbs the checkboxes of every later section
-    # (§7 security, §9 next actions, Addendum A) — which silently inflates its
-    # item count and drags its percentage down.
-    nxt = re.compile(r"^#{2,3}\s+", re.M)
-    marks = list(pat.finditer(plan_text))
-    for m in marks:
+    # h2, h3 or h4: which level a plan uses is a document-structure choice, not
+    # a contract. A plan whose title is `#` naturally puts phases at `##`, and
+    # demanding exactly `###` made such a plan parse as zero phases.
+    for m in PHASE_HEAD.finditer(plan_text):
+        # Bound at the next heading of the SAME OR HIGHER level. Without a bound
+        # the last phase runs to EOF and absorbs every later section's
+        # checkboxes; bounding at any level instead would truncate an h2 phase
+        # at its own first h3 subsection.
+        level = len(m.group(1))
+        nxt = re.compile(r"^#{1,%d}\s+" % level, re.M)
         after = nxt.search(plan_text, m.end())
         end = after.start() if after else len(plan_text)
-        sections[m.group(1)] = plan_text[m.start():end]
+        sections[m.group(2)] = plan_text[m.start():end]
     return sections
 
 
@@ -1589,7 +1748,7 @@ def tick_file_of(p: dict, plan_name: str) -> str:
     return str(p.get("doc") or plan_name)
 
 
-def protocol_block(tick_file: str) -> str:
+def protocol_block(tick_file: str, mode: str = "checkboxes") -> str:
     """The standing rules of a working session, stated ONCE per session.
 
     Every cold shape carries them - the item prompt, the phase opening brief,
@@ -1608,8 +1767,12 @@ def protocol_block(tick_file: str) -> str:
         "implement only what was confirmed.\n"
         "2. Only this item. Name neighbouring work in the brief instead of doing it.\n"
         "3. Claim only what you verified against those acceptance criteria.\n"
-        f"4. Tick only in {tick_file}: change that item's `- [ ]` to `- [x]` on its "
-        "exact line, nothing else, no other file.")
+        + (f"4. Tick only in {tick_file}: on that item's exact line write `[x] ` right "
+           "after its list marker (`3. Foo` becomes `3. [x] Foo`; a table row takes it at the start of its first cell), nothing else, no other "
+           "file - this plan tracks its list entries, not checkboxes."
+           if mode == "lists" else
+           f"4. Tick only in {tick_file}: change that item's `- [ ]` to `- [x]` on its "
+           "exact line, nothing else, no other file."))
 
 
 def _phase_context(p: dict, plan_name: str) -> str:
@@ -1666,7 +1829,7 @@ def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
     return (f"You are the working session for Phase {p['id']} ({p['name']}) of {plan_name}. "
             'Items will be sent to you one at a time as messages beginning "Next item"; '
             "this message opens the session.\n\nPHASE BRIEF\n" + "\n".join(lines) + "\n\n"
-            + protocol_block(tick) + "\n\n"
+            + protocol_block(tick, p.get("items_mode", "checkboxes")) + "\n\n"
             'Later "Next item" messages rely on this brief and this protocol; do not ask '
             "for them again. If the plan may have changed since you read it, re-read the "
             "item's section before briefing."
@@ -1702,7 +1865,7 @@ def phase_item_prompt_tmpl(p: dict, plan_name: str, providers: list) -> str:
     return (f"In Phase {p['id']} ({p['name']}) of {plan_name}, work on exactly one "
             f"checklist item:\n\n    {ITEM_SLOT}\n\n"
             + _phase_context(p, plan_name) + "\n\n"
-            + protocol_block(tick) + "\n\n"
+            + protocol_block(tick, p.get("items_mode", "checkboxes")) + "\n\n"
             f"This is the Phase {p['id']} session: later items arrive as short "
             '"Next item" messages naming only the item; apply the same protocol '
             "without asking for it again."
@@ -1720,7 +1883,9 @@ def phase_item_prompt_warm_tmpl(p: dict, plan_name: str) -> str:
             f"Re-read the checklist in {tick} first (another session may have ticked items). "
             "Then brief and stop: 2-5 proposed steps, 2-4 acceptance criteria, end with "
             '"confirm these steps, or redirect me?", and WAIT. Only this item; when done, '
-            f"tick its exact line in {tick} and nothing else.\n\n"
+            f"tick its exact line in {tick} and nothing else"
+            + (" (write `[x] ` right after its list marker, or at the start of a table row's first cell)" if p.get("items_mode") == "lists" else "")
+            + ".\n\n"
             f"If this conversation has not already read {tick}, you are not the Phase "
             f"{p['id']} session: say so, read it, then post the brief.")
 
@@ -1751,7 +1916,7 @@ def phase_brief(p: dict, plan_name: str, providers: list) -> str:
             f"Generated by the control center from {plan_name} and docs/progress.toml; "
             "rewritten on every launch, so do not edit it. The checklist and its state "
             f"live in {tick}: read them there, tick there, never here.\n\n"
-            + "\n".join(facts) + "\n\n" + protocol_block(tick)
+            + "\n".join(facts) + "\n\n" + protocol_block(tick, p.get("items_mode", "checkboxes"))
             + prompt_appendix(providers) + "\n")
 
 
@@ -1965,6 +2130,7 @@ def build(repo: Path) -> dict:
     proj = cfg["project"]
     plan_text = (repo / proj.get("plan", DEFAULT_PLAN)).read_text(encoding="utf-8", errors="replace")
     sections = plan_phase_sections(plan_text)
+    mode = resolve_items_mode(repo, cfg, sections)
 
     phases = []
     for p in cfg.get("phase", []):
@@ -1976,10 +2142,10 @@ def build(repo: Path) -> dict:
         items, src = [], None
         doc = p.get("doc")
         if doc and (repo / doc).exists():
-            items = parse_checklist((repo / doc).read_text(encoding="utf-8", errors="replace"), doc)
+            items = parse_items((repo / doc).read_text(encoding="utf-8", errors="replace"), doc, mode)
             src = doc
         if not items and pid in sections:
-            items = parse_checklist(sections[pid], proj.get("plan", DEFAULT_PLAN))
+            items = parse_items(sections[pid], proj.get("plan", DEFAULT_PLAN), mode)
             src = f"{proj.get('plan')} §6"
 
         done = sum(1 for i in items if i["state"] == "done")
@@ -2189,6 +2355,7 @@ def build(repo: Path) -> dict:
         # carries only the delta. Which one a launch sends is decided where
         # the launcher is known - here both are just built.
         plan_name, providers = proj.get("plan", "the plan"), cfg.get("context", [])
+        p["items_mode"] = mode
         p["tick_file"] = tick_file_of(p, plan_name)
         p["prompt"] = phase_prompt(p, plan_name, providers)
         p["prompt_warm"] = phase_prompt_warm(p, plan_name)
@@ -2213,6 +2380,7 @@ def build(repo: Path) -> dict:
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "today": today.isoformat(),
         "phases": phases,
+        "items_mode": mode,
         "levels": levels,
         "groups": groups,
         "ready": ready,

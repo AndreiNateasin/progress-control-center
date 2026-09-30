@@ -234,7 +234,9 @@ def tick(rel_file: str, raw: str, state: str) -> dict:
     if not target.exists():
         return {"ok": False, "error": rel_file + " does not exist"}
 
-    lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    # Bytes, not text mode: text mode on Windows rewrites every line ending,
+    # and one tick in an LF plan would put the whole file in the git diff.
+    lines = target.read_bytes().decode("utf-8").splitlines(keepends=True)
     hits = [n for n, ln in enumerate(lines) if ln.rstrip("\r\n") == raw]
     if len(hits) != 1:
         found = "no" if not hits else str(len(hits))
@@ -244,12 +246,45 @@ def tick(rel_file: str, raw: str, state: str) -> dict:
 
     n = hits[0]
     line = lines[n]
-    if not _pr.CHECK.match(line):
-        return {"ok": False, "error": "matched line is not a checkbox"}
-    ob = line.index("[")
-    cb = line.index("]", ob)
-    lines[n] = line[:ob + 1] + MARK[state] + line[cb:]
-    target.write_text("".join(lines), encoding="utf-8")
+    if _pr.CHECK.match(line):
+        ob = line.index("[")
+        cb = line.index("]", ob)
+        lines[n] = line[:ob + 1] + MARK[state] + line[cb:]
+    else:
+        body = line.rstrip("\r\n")
+        eol = line[len(body):]
+        m = _pr.LIST_ITEM.match(body) or (
+            _pr.TABLE_ROW.match(body) if body.startswith("|") else None)
+        # A plain list entry is an item only when the model says so (items =
+        # "lists", under a phase heading). Any other list line in the repo's
+        # markdown is not this endpoint's to edit.
+        model = build(REPO)
+        if not m or model.get("items_mode") != "lists" or not any(
+                it.get("file") == rel_file and it.get("raw") == raw
+                for ph in model["phases"] for it in ph.get("items", [])):
+            return {"ok": False, "error": "matched line is not a plan item"}
+        if body.startswith("|") and m.group(2) is None:
+            # the mark goes at the start of the first cell's text
+            s = m.start(3)
+            m = None
+        # Record the mode BEFORE the first box is written: once a line carries
+        # `[x]` the plan has a checkbox, and detection alone would switch the
+        # whole plan back to checkbox mode and hide every other entry.
+        if not (CFG.get("project") or {}).get("items"):
+            r = _pr.apply_project_edits(REPO, {"items": "lists"}, dry_run=False)
+            if not r.get("ok"):
+                return {"ok": False, "error": "could not record items = \"lists\" in "
+                        "docs/progress.toml: " + str(r.get("error"))}
+            CFG.setdefault("project", {})["items"] = "lists"
+        if m is None:
+            lines[n] = body[:s] + "[" + MARK[state] + "] " + body[s:] + eol
+        elif m.group(2) is not None:
+            s = m.start(2)
+            lines[n] = body[:s] + MARK[state] + body[s + 1:] + eol
+        else:
+            s = m.start(3)
+            lines[n] = body[:s] + "[" + MARK[state] + "] " + body[s:] + eol
+    target.write_bytes("".join(lines).encode("utf-8"))
 
     # Keep the artifact-bound HTML in step. The PostToolUse hook only fires on
     # Claude's edits, and this edit came from a browser. The plan file — the
@@ -444,6 +479,10 @@ def build_launchers(cfg: dict | None = None) -> dict:
                                "cmd_blank": "codex resume --last"}
     appid = _detect_claude_app()
     if appid:
+        # The publisher hash out of the AppID (Claude_pzs8sxrjxfjjc!Claude)
+        # appears in the installed package path, so it identifies the app's own
+        # windows across versions - and never matches the Claude Code CLI,
+        # which is the same executable name in a different place.
         L["claude-app"] = {"label": "Claude app (prompt → clipboard)",
                            "mode": "clipboard",
                            "focus": appid.split("!")[0].split("_")[-1],
@@ -1584,6 +1623,14 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
               if c.get("name") in provider_names]
     ctx = _pr.prompt_appendix(chosen) if chosen else ""
     check_cmd = f"python {_pr.__file__} --check --repo {REPO}"
+    # The rules below speak `- [ ]`. A plan tracked by its list entries must be
+    # told how that maps, or a session "fixes" it into a format it never used.
+    lists = build(REPO).get("items_mode") == "lists"
+    lists_rule = ("- This plan's items are the TOP-LEVEL list entries under each phase "
+                  "heading (numbered or bulleted); a mark after the list marker "
+                  "(`3. [x] ...`) is the state, no mark means open. Where these rules say "
+                  "`- [ ]` / `- [x]`, write `N. [ ]` / `N. [x]` in that list's own style; "
+                  "one task per top-level entry, sub-detail as nested bullets under it.\n")
 
     if scope == "item":
         head = (f"Re-assess ONE checklist item of Phase {phase_id} "
@@ -1637,8 +1684,9 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
         "- Any phase you ADD gets a matching `[[phase]]` block in "
         "docs/progress.toml (id, name, days, depends_on); any phase you RETIRE "
         "has its block commented out under a dated note, never deleted.\n"
-        "- One task per `- [ ]` line; sub-detail goes in indented plain lines "
-        "under the task, not in nested checkboxes.\n"
+        + (lists_rule if lists else
+           "- One task per `- [ ]` line; sub-detail goes in indented plain lines "
+           "under the task, not in nested checkboxes.\n") +
         "- Under each heading you changed, add one line: `> re-planned "
         "<YYYY-MM-DD>: <one-line reason>` so the plan carries its own history.\n"
         f"- When you are done, run `{check_cmd}` and fix anything it flags; the "
@@ -1646,6 +1694,7 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
         "- Do not create tickets, push, or touch anything outside the plan "
         "document and docs/progress.toml."
     )
+    return {"ok": True, "prompt": prompt}
     return {"ok": True, "prompt": prompt}
 
 
@@ -1947,7 +1996,6 @@ def create_jira_issue(phase_id: str, summary: str, description: str) -> dict:
         return {"ok": False, "error": f"phase {phase_id} already has ticket "
                 f"{ph_cfg['jira']} — use Unlink on this phase first if you "
                 "meant to raise a different one"}
-
     summary = str(summary or "").strip()
     description = str(description or "").strip()
     if not summary:
@@ -2085,7 +2133,7 @@ def unlink_ticket(phase_id: str) -> dict:
     return {"ok": True, "was": had, "path": str(cfgp)}
 
 
-
+# ---------------------------------------------------------------- action layer
 
 CSS = """
 #pcc-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;gap:8px;align-items:center;
@@ -2503,6 +2551,31 @@ JS = r"""
         setInterval(tick, 4000); tick();
   })();
 
+  // Phase headings in the plan with no [[phase]] block: ask the server to add
+  // them (the additive sync Save runs), then reload so they render. Once per
+  // gap per tab, so a failing write cannot loop; what was written is said.
+  (function(){
+    try {
+      var note = sessionStorage.getItem('pccPhaseSyncNote');
+      if(note){
+        sessionStorage.removeItem('pccPhaseSyncNote');
+        var n = document.createElement('p'); n.className = 'pnote';
+        n.textContent = 'docs/progress.toml updated: ' + note;
+        var host = document.querySelector('main') || document.body;
+        host.insertBefore(n, host.firstChild);
+      }
+    } catch(e){}
+    var g = window.__ANU_PHASE_GAP__ || {};
+    if(!((g.missing && g.missing.length) || g.mode)) return;
+    var sig = 'pccPhaseSync:' + (g.repo || '') + ':' + (g.missing || []).join(',') + (g.mode ? '+mode' : '');
+    try { if(sessionStorage.getItem(sig)) return; sessionStorage.setItem(sig, '1'); } catch(e){ return; }
+    api('/api/phases/sync', {}).then(function(d){
+      if(d && d.ok && d.written){
+        try { sessionStorage.setItem('pccPhaseSyncNote', (d.notes || []).join('; ')); } catch(e){}
+        location.reload();
+      } else if(d && !d.ok){ console.warn('phase sync: ' + d.error); }
+    });
+  })();
   window.__pccToolSelect__ = toolSelect;
 
   // The shared render draws a .launch row (prompt + Copy prompt + Details) on
@@ -2830,7 +2903,76 @@ JS = r"""
         slot.appendChild(un);
         return;
       }
-      act.appendChild(slot);
+      var inp = document.createElement('input');
+      inp.type = 'text'; inp.placeholder = 'PROJ-123'; inp.className = 'pcc-btn';
+      inp.style.width = '110px'; inp.style.cursor = 'text';
+      var lk = document.createElement('button');
+      lk.className = 'pcc-btn'; lk.textContent = 'Link ticket';
+      lk.title = 'Record an EXISTING ticket key on this phase (docs/progress.toml)';
+      function doLink(){
+        if(!inp.value.trim()){
+          say('type the key of a ticket that already exists (e.g. PROJ-123), or ' +
+              'use Draft ticket to create one', 'err');
+          inp.focus(); return;
+        }
+        lk.disabled = true;
+        api('/api/phase/jira', {phase: p.id, key: inp.value}).then(function(d){
+          lk.disabled = false;
+          if(!d.ok){ say(d.error, 'err'); return; }
+          if(window.__PCC_PHASES__ && window.__PCC_PHASES__[p.id])
+            window.__PCC_PHASES__[p.id].jira = d.key;
+          p.jira = d.key;
+          say('linked ' + d.key + ' \u2014 reload to see the pill everywhere', 'ok');
+          renderTicketSlot();
+        }).catch(function(){ lk.disabled = false; say('server unreachable', 'err'); });
+      }
+      lk.addEventListener('click', doLink);
+      inp.addEventListener('keydown', function(ev){ if(ev.key === 'Enter') doLink(); });
+      slot.appendChild(inp); slot.appendChild(lk);
+    }
+    renderTicketSlot();
+    // A linked phase still needs the control that UNLINKS it; only the
+    // drafting controls are pointless once a ticket exists.
+    if(p.jira){ act.appendChild(slot); return; }
+
+    // Drafting needs a launcher that can RUN and write a file. Offering it with
+    // a clipboard-only app selected produced a button that opened the app and
+    // then waited forever for a draft that could never be written.
+    var terms = terminalTools();
+    var draft = document.createElement('button');
+    draft.className = 'pcc-btn'; draft.textContent = 'Draft ticket';
+    if(!terms.length){
+      draft.disabled = true;
+      draft.title = 'Needs a terminal launcher (claude or opencode) — none found on this machine';
+    } else {
+      draft.title = 'Ask the selected terminal tool to write a ticket from this phase, ' +
+                    'then review it here before anything is created';
+      draft.addEventListener('click', function(){
+        // Resolve the tool AT CLICK TIME from the row's select, so changing it
+        // takes effect. Frozen at wiring time it ignored the picker entirely.
+        var sel = act.querySelector('select');
+        var want = sel && sel.value;
+        var dtool = (want && terms.indexOf(want) >= 0) ? want
+                  : (terms.indexOf(preferredTool()) >= 0 ? preferredTool() : terms[0]);
+        draft.disabled = true; say('asking ' + LN[dtool].label + ' to draft it…');
+        api('/api/phase/draft-ticket', {phase: p.id, tool: dtool})
+          .then(function(d){
+            draft.disabled = false;
+            if(!d.ok){ say(d.error, 'err'); return; }
+            say(d.note || 'session started — it will write the draft; press Load draft when done');
+            watchDraft(p, act, say, host);
+          });
+      });
+    }
+    act.appendChild(draft);
+
+    var load = document.createElement('button');
+    load.className = 'pcc-btn'; load.textContent = 'Load draft';
+    load.title = 'Read .pcc/ticket-' + p.id + '.json if a session has written it';
+    load.addEventListener('click', function(){ loadDraft(p, act, say, host, true); });
+    act.appendChild(load);
+
+    act.appendChild(slot);
 
     loadDraft(p, act, say, host, false, function(found){
       if(!found) resumeWatch(p, act, say, host);   // a reload mid-drafting resumes
@@ -3190,6 +3332,40 @@ JS = r"""
 """
 
 
+def phase_gap(model: dict) -> dict:
+    """Phase headings in the plan with no [[phase]] block, and whether the
+    detected items mode is still unrecorded. The page asks the server to close
+    the gap; it is the same additive sync Save runs."""
+    proj = CFG.get("project", {}) or {}
+    plan_rel = proj.get("plan", _pr.DEFAULT_PLAN)
+    heads: list[str] = []
+    if isinstance(plan_rel, str) and (REPO / plan_rel).is_file():
+        try:
+            heads = list(_pr.plan_phase_sections(
+                (REPO / plan_rel).read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            heads = []
+    declared = {str(p["id"]) for p in model.get("phases", [])}
+    return {"missing": [h for h in heads if h not in declared],
+            "mode": model.get("items_mode") == "lists" and not proj.get("items"),
+            "repo": str(REPO)}
+
+
+def sync_phases_now() -> dict:
+    """Add a [[phase]] block per undeclared heading and record a detected items
+    mode. Additive: same plan, so nothing is retired."""
+    global CFG
+    r = _pr.apply_project_edits(REPO, {}, dry_run=False)
+    if r.get("ok") and r.get("written"):
+        try:
+            CFG = tomllib.loads((REPO / "docs" / "progress.toml").read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            return {"ok": False, "error": f"written, but could not be re-read: {exc}"}
+        for n in r.get("notes", []):
+            print("  phase sync: " + n)
+    return r
+
+
 def action_layer(token: str, model: dict) -> str:
     """Everything the local build adds on top of the shared render()."""
     # label -> source line, so a click can find its way back into the markdown.
@@ -3216,17 +3392,18 @@ def action_layer(token: str, model: dict) -> str:
         '<div id="pcc-svc"></div>'
         '<div id="pcc-bar"><span class="lbl">local</span>' + buttons +
         '<button class="pcc-btn" id="pcc-replan-all" '
-        'title="Reassess the whole plan in a code session">Re-plan\u2026</button>'
+        'title="Reassess the whole plan in a code session">Re-plan…</button>'
         '<a class="pcc-btn" href="/setup" style="text-decoration:none;margin-left:auto"'
         ' title="configure this machine and this project">Setup</a>'
         '<span class="pcc-local">actions live</span></div>'
         "<script>window.__ANU_TOKEN__=" + _pr.js(token) + ";"
         "window.__ANU_FRESH0__=" + _pr.js(fresh_stamp()) + ";"
         "window.__ANU_ITEMS__=" + _pr.js(idx) + ";"
+        "window.__ANU_PHASE_GAP__=" + _pr.js(phase_gap(model)) + ";"
         "window.__ANU_PROFILE_TOOL__=" + _pr.js(
             (_pr.load_user_profile() or {}).get("tool", "")) + ";"
         "window.__ANU_PROVIDERS__=" + _pr.js(
-            [c.get("name", "") for c in (CFG.get("context") or []) if c.get("name")]) + ";"
+              [c.get("name", "") for c in (CFG.get("context") or []) if c.get("name")]) + ";"
           "window.__ANU_LAUNCHERS__=" + _pr.js(
             {k: {"label": v["label"], "mode": v.get("mode", ""),
                  "base": v.get("base", k), "warm": bool(v.get("warm"))}
@@ -3773,29 +3950,35 @@ SETUP_JS = r"""
       var head = n
         ? '<b>'+n+'</b> checkbox'+(n===1?'':'es')+
           (ph ? ' · <b>'+ph+'</b> phase heading'+(ph===1?'':'s') : '')+' in this file'
-        : '<b>No checkboxes in this file.</b> Progress is derived only from '+
-          '<code>- [ ]</code> / <code>- [x]</code> lines, so this plan would read '+
-          '<b>0% forever</b>. Choose a file that has them, or add them there.';
+        : ((hit.items && ph)
+          ? '<b>No checkboxes</b> · <b>'+ph+'</b> phase heading'+(ph===1?'':'s')+
+            ' with <b>'+hit.items+'</b> list item'+(hit.items===1?'':'s')+' — tracked as '+
+            'written: each top-level list entry under a phase heading is an item, and '+
+            'ticking one writes <code>[x]</code> into its line. Saving records '+
+            '<code>items = "lists"</code>.'
+          : '<b>No checkboxes in this file</b>, and no list items under '+
+            '<code>### Phase &lt;id&gt;</code> headings, so this plan would read '+
+            '<b>0% forever</b>. Choose another file, or give it phase headings.');
+      var trackable = n || (hit.items && ph);
       // Checkboxes alone render an EMPTY dashboard: phases are declared in
       // docs/progress.toml ([[phase]] id/days/depends_on - what markdown cannot
       // say), and each pulls its checklist from its "### Phase <id>" section.
       // Without saying so here, "31 checkboxes but no phases" is a mystery.
       var tail = '';
-      if(n && !declared){
-        tail = '<div class="ready no">The dashboard will show <b>no phases</b>: '+
-          'this project’s <code>docs/progress.toml</code> declares none. '+
-          (ph ? 'This file has <b>'+ph+'</b> <code>### Phase …</code> heading'+
-                (ph===1?'':'s')+' — add a matching <code>[[phase]]</code> block '+
-                'per heading (id, days, depends_on) and each phase picks up its '+
-                'checklist from its section.'
-              : 'It also has no <code>### Phase &lt;id&gt; — …</code> headings, '+
-                'so add those to the plan AND <code>[[phase]]</code> blocks to the config.')+
-          '</div>';
-      } else if(n && declared && ph){
+      if(trackable && !declared){
+        // The config's [[phase]] blocks are generated from the headings - on
+        // Save, and by the dashboard itself when it finds headings undeclared.
+        tail = ph
+          ? '<div class="why" style="margin-top:4px">No phases declared yet: Save (or opening '+
+            'the dashboard) adds a <code>[[phase]]</code> block for each of the <b>'+ph+'</b> '+
+            'phase heading'+(ph===1?'':'s')+', with days and dependencies as TODO placeholders.</div>'
+          : '<div class="ready no">The dashboard will show <b>no phases</b>: this file has no '+
+            '<code>### Phase &lt;id&gt;: name</code> headings to derive them from.</div>';
+      } else if(trackable && declared && ph){
         tail = '<div class="why" style="margin-top:4px">'+declared+' phase'+
           (declared===1?'':'s')+' declared in the config</div>';
       }
-      boxNote.className = 'why planboxes' + (n ? '' : ' nobox');
+      boxNote.className = 'why planboxes' + (trackable ? '' : ' nobox');
       boxNote.innerHTML = head + tail;
     }
     planSel.addEventListener('change', planBoxes);
@@ -4043,7 +4226,7 @@ SETUP_JS = r"""
         if(d.config_error) say('#sw-pmsg','config unreadable: '+d.config_error,'err');
         $('#sw-host').value=(d.host_default||'127.0.0.1');
         renderLocal(); renderProject(); renderMine(); renderProjects(); renderSecrets();
-        if(typeof done === 'function') done();
+          if(typeof done === 'function') done();
       });
   }
   document.addEventListener('click',function(ev){
@@ -4745,6 +4928,10 @@ class Handler(BaseHTTPRequestHandler):
                                      str(body.get("item", "")),
                                      str(body.get("comment", "")),
                                      list(body.get("providers") or [])))
+            return
+
+        if path == "/api/phases/sync":
+            self._json(sync_phases_now())
             return
 
         if path == "/api/session":

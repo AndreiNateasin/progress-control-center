@@ -73,6 +73,14 @@ There is no status field, no percentage you maintain, and no second store — no
 database, not a ticket system. Tick a box in the markdown and the dashboard moves.
 Tick a box *in* the dashboard and it rewrites that line in the markdown.
 
+**A plan written without checkboxes works as it is.** If a plan has phase headings
+but no boxes — numbered steps, bullets, or a table under each phase — its top-level
+entries under each phase heading are the items (`items = "lists"`, detected and
+recorded for you). An entry with no mark is open; ticking it writes the mark into
+that line: `3. Define the schema` becomes `3. [x] Define the schema`, and a table
+row gets it at the start of its first cell. Nothing is converted up front, so a
+plan your team shares is never rewritten just to be tracked.
+
 Everything else — dependencies, effort estimates, lead times — lives in one
 `docs/progress.toml`, because markdown cannot express them.
 
@@ -228,8 +236,10 @@ rather than misconfiguration.
 
 Two things:
 
-1. **A plan in markdown** with `### Phase <id> — <name>` headings (or per-phase
-   docs), whose checkboxes are the only store of progress.
+1. **A plan in markdown** with `### Phase <id> — <name>` or `### Phase <id>: <name>`
+   headings at level 2 to 4 (or per-phase docs), whose checkboxes, or list entries
+   in `items = "lists"` mode, are the only store of progress. Opening the dashboard
+   adds a `[[phase]]` block for any heading the config does not declare yet.
 2. **`docs/progress.toml`** holding what markdown cannot express.
 
 ```toml

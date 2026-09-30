@@ -10,6 +10,16 @@ database, not a ticket system, not agent memory. Ticking in the dashboard rewrit
 the markdown, so the dashboard is an *editor for the plan*, never a copy of it. The
 plan and the report cannot disagree because there is only one of them.
 
+A plan with no checkboxes at all is not a reason to rewrite it. With
+`[project] items = "lists"` the top-level entries under each phase heading are the
+items — numbered or bulleted, or the body rows of a table when a phase has no list —
+and their state is an optional mark after the list marker (`3. [x] Foo`,
+`| [~] Foo | … |`). No mark is open. The mode is detected only when no checkbox
+exists anywhere, and recorded in the config on the first save or tick: once one
+line carries `[x]`, detection alone would flip the plan back to checkbox mode and
+hide every other entry. Nested bullets stay the entry's detail. Tick writes only
+lines the model already knows as items, and keeps the file's own line endings.
+
 Write-back matches the verbatim source line, not a line number: if the file changed
 since the page rendered, the match fails and you are told to refresh, rather than
 the wrong box being ticked.
