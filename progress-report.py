@@ -359,7 +359,9 @@ def _append_in_body(body: str, key: str, value) -> str:
     lines = body.splitlines(keepends=True)
     last = 0
     for i, l in enumerate(lines):
-        if l.strip():
+        # after the last KEY line: trailing comments usually introduce the
+        # next section, and a key appended below them reads as belonging there
+        if l.strip() and not l.lstrip().startswith("#"):
             last = i + 1
     head, tail = "".join(lines[:last]), "".join(lines[last:])
     if head and not head.endswith("\n"):
@@ -430,7 +432,14 @@ def set_toml_key(text: str, header: str, key: str, value) -> str:
     return text[:a] + _append_in_body(body, key, value) + text[b:]
 
 
-def set_phase_key(text: str, phase_id: str, key: str, value) -> str:
+def _span_in_plan(body: str, plan: str | None) -> bool:
+    if plan is None:
+        return True
+    m = re.search(r'^\s*plan\s*=\s*["\']([^"\']*)["\']', body, re.M)
+    return not m or plan_key(m.group(1)) == plan_key(plan)
+
+
+def set_phase_key(text: str, phase_id: str, key: str, value, plan: str | None = None) -> str:
     """Set one key inside the `[[phase]]` table whose id matches.
 
     `[[phase]]` is an array of tables, so there is no unique header to address —
@@ -455,7 +464,8 @@ def set_phase_key(text: str, phase_id: str, key: str, value) -> str:
 
     want = re.compile(r'^\s*id\s*=\s*["\']' + re.escape(str(phase_id)) + r'["\']', re.M)
     for a, b in spans:
-        if not want.search(text[a:b]):
+        # ids repeat across plans: only the block of the given plan qualifies
+        if not want.search(text[a:b]) or not _span_in_plan(text[a:b], plan):
             continue
         body = text[a:b]
         lit = _aligned_kv(body, key, value)
@@ -470,7 +480,8 @@ def set_phase_key(text: str, phase_id: str, key: str, value) -> str:
     raise KeyError(f"no [[phase]] with id = {phase_id!r}")
 
 
-def del_phase_key(text: str, phase_id: str, key: str, note: str = "") -> str:
+def del_phase_key(text: str, phase_id: str, key: str, note: str = "",
+                  plan: str | None = None) -> str:
     """Comment out one key inside the `[[phase]]` whose id matches.
 
     Commented, not deleted: the committed config keeps the record that this
@@ -499,7 +510,8 @@ def del_phase_key(text: str, phase_id: str, key: str, note: str = "") -> str:
 
     want = re.compile(r'^\s*id\s*=\s*["\']' + re.escape(str(phase_id)) + r'["\']', re.M)
     for a, b in spans:
-        if not want.search(text[a:b]):
+        # ids repeat across plans: only the block of the given plan qualifies
+        if not want.search(text[a:b]) or not _span_in_plan(text[a:b], plan):
             continue
         body = text[a:b]
         active = re.search(r"^([ \t]*)(" + re.escape(key) + r"\s*=.*?)(\r?\n|$)", body, re.M)
@@ -808,7 +820,7 @@ def detect_environment(repo: Path) -> dict:
         # --- project scope: what the committed config says now ----------------
         "project": {
             "name": proj.get("name", repo.name),
-            "phase_count": len(cfg.get("phase", []) or []),
+            "phase_count": len(scope_phases(cfg).get("phase") or []),
             "plan": proj.get("plan", (cands[0]["file"] if cands else "PLAN.md")),
             "plan_candidates": cands,
             "owner": proj.get("owner", ""),
@@ -937,7 +949,7 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
             notes.extend(sync_notes)
             # A plan with no checkboxes is tracked by its list entries. Record
             # that once, visibly, so the first tick cannot flip the mode.
-            cfg_now = tomllib.loads(text)
+            cfg_now = scope_phases(tomllib.loads(text))
             if not (cfg_now.get("project") or {}).get("items"):
                 m_now = resolve_items_mode(Path(repo), cfg_now, plan_phase_sections(plan_txt))
                 if m_now == "lists":
@@ -987,6 +999,9 @@ def check_config(repo: Path) -> int:
         print(f"FAIL  {cfgp} is not valid TOML: {exc}", file=sys.stderr)
         return 1
 
+    # Dormant plans' phases are history, not this plan's contract: their ids
+    # may repeat the active plan's, and their sections are not in this plan.
+    cfg = scope_phases(cfg)
     proj = cfg.get("project", {})
     for key in ("name", "start_date"):
         if not proj.get(key):
@@ -1439,6 +1454,46 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
     return out
 
 
+def plan_key(p) -> str:
+    """One spelling per plan file: './docs/X.md', 'docs/X.md' and a case
+    respelling on a case-insensitive filesystem are the same plan."""
+    return os.path.normcase(os.path.normpath(str(p))) if p else ""
+
+
+def active_plan(cfg: dict) -> str:
+    v = (cfg.get("project") or {}).get("plan", DEFAULT_PLAN)
+    return v if isinstance(v, str) else DEFAULT_PLAN
+
+
+def phase_in_plan(p: dict, plan: str) -> bool:
+    """An untagged [[phase]] belongs to whichever plan is active - every
+    single-plan config works unchanged. A tagged one belongs to its plan."""
+    tag = p.get("plan")
+    return not tag or plan_key(tag) == plan_key(plan)
+
+
+def scope_phases(cfg: dict) -> dict:
+    """The config as the ACTIVE plan sees it: other plans' phases are dormant
+    history - kept intact in the file so switching back restores them, but not
+    part of this plan's schedule, contract or ids."""
+    out = dict(cfg)
+    plan = active_plan(cfg)
+    out["phase"] = [p for p in (cfg.get("phase") or []) if phase_in_plan(p, plan)]
+    return out
+
+
+def known_plans(cfg: dict) -> list[str]:
+    """The active plan first, then every plan a [[phase]] block is tagged with."""
+    seen, out = set(), []
+    for p in [active_plan(cfg)] + [str(x["plan"]) for x in (cfg.get("phase") or [])
+                                   if x.get("plan")]:
+        k = plan_key(p)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
+
+
 def _clean_label(label: str) -> str:
     label = re.sub(r"\*\*(.+?)\*\*", r"\1", label)
     label = re.sub(r"`([^`]+)`", r"\1", label)
@@ -1608,42 +1663,59 @@ def sync_phases_with_plan(cfg_text: str, plan_text: str, plan_rel: str,
         return cfg_text, []                    # a plan with no headings syncs nothing
 
     try:
-        declared_tables = tomllib.loads(cfg_text).get("phase", []) or []
+        cfg_all = tomllib.loads(cfg_text)
     except tomllib.TOMLDecodeError as exc:
         return cfg_text, [f"phase sync skipped: config unparsable ({exc})"]
-    declared = {str(p.get("id", "")) for p in declared_tables}
+    declared_tables = cfg_all.get("phase", []) or []
     notes: list[str] = []
     lines = cfg_text.splitlines(keepends=True)
 
-    # retire only on a REAL plan switch — normalised, so './PLAN.md' over
-    # 'PLAN.md' (or a case respelling on a case-insensitive filesystem) is the
-    # same file, not a switch that disables hand-added phases.
-    def _norm(p: str) -> str:
-        return os.path.normcase(os.path.normpath(str(p or "")))
-    if old_plan_rel and _norm(old_plan_rel) != _norm(plan_rel):
+    def _nm(s) -> str:
+        return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+
+    switched = bool(old_plan_rel) and plan_key(old_plan_rel) != plan_key(plan_rel)
+    untagged = [t for t in declared_tables if not t.get("plan")]
+    # A moved or renamed plan file carries the same phases: same ids AND
+    # names. Those blocks stay as they are. Anything else is a different plan.
+    renamed = bool(switched and untagged and all(
+        str(t.get("id", "")) in desired
+        and _nm(t.get("name")) == _nm(desired[str(t.get("id", ""))]) for t in untagged))
+    old_mode = str((cfg_all.get("project") or {}).get("items") or "").strip().lower()
+    tagging = bool(switched and untagged and not renamed)
+    leaving = [t for t in declared_tables if (not t.get("plan") and tagging) or
+               (t.get("plan") and plan_key(t["plan"]) == plan_key(old_plan_rel))]
+    stamp_mode = bool(switched and not renamed and old_mode == "lists"
+                      and any(not t.get("items") for t in leaving))
+    if tagging or stamp_mode:
+        # The old plan's phases become DORMANT, not retired: tagged with their
+        # plan and left intact - names, days, dependencies, tickets - so
+        # switching back restores them exactly. Nothing is commented or lost.
         spans = _phase_block_spans(lines)
         if len(spans) != len(declared_tables):
-            notes.append("phase sync: block scan and parser disagree — "
-                         "retirement skipped, additions still applied")
-        else:
-            for (start, end), tbl in sorted(zip(spans, declared_tables),
-                                            key=lambda x: -x[0][0]):
-                pid = str(tbl.get("id", ""))
-                if pid in desired or "doc" in tbl:
-                    continue
-                # the tail of a span is often the banner introducing the NEXT
-                # section: trailing blanks and comment lines stay uncommented.
-                e = end
-                while e > start + 1 and (not lines[e - 1].strip()
-                                         or lines[e - 1].lstrip().startswith("#")):
-                    e -= 1
-                banner = (f"# --- phase {pid!r} of the previous plan ({old_plan_rel}), "
-                          f"retired {today} when the plan moved to {plan_rel}. "
-                          "History, not config. ---\n")
-                lines[start:e] = [banner] + ["# " + l if l.strip() else l
-                                             for l in lines[start:e]]
-                notes.append(f"[[phase]] {pid}: retired (was in {old_plan_rel})")
-                declared.discard(pid)
+            return cfg_text, ["phase sync: block scan and parser disagree - the plan "
+                              "switch was NOT applied to [[phase]] blocks; nothing changed"]
+        for (start, _end), tbl in sorted(zip(spans, declared_tables), key=lambda x: -x[0][0]):
+            if not any(tbl is x for x in leaving):
+                continue
+            add = []
+            if not tbl.get("plan"):
+                add.append(f"plan       = {_toml_str(old_plan_rel)}    # dormant since {today}: "
+                           f"the active plan is {plan_rel}\n")
+            # the plan's items mode travels with its blocks, so a switch back
+            # restores it instead of re-detecting it from a ticked file
+            if old_mode == "lists" and not tbl.get("items"):
+                add.append('items      = "lists"\n')
+            lines[start + 1:start + 1] = add
+        if tagging:
+            notes.append(f"{len(untagged)} [[phase]] block(s) kept for {old_plan_rel}, dormant - "
+                         "switch back to that plan to use them again")
+
+    # This plan's blocks: tagged with it, or untagged while no switch tagged them.
+    mine = [t for t in declared_tables
+            if (t.get("plan") and plan_key(t["plan"]) == plan_key(plan_rel))
+            or (not t.get("plan") and not tagging)]
+    declared = {str(t.get("id", "")) for t in mine}
+    tag_new = tagging or any(t.get("plan") for t in declared_tables)
 
     # chain in natural id order, not document order: an addendum phase can sit
     # anywhere in the file, and "0 depends on 5" is a bad guess.
@@ -1651,6 +1723,7 @@ def sync_phases_with_plan(cfg_text: str, plan_text: str, plan_rel: str,
         return (0, int(pid)) if pid.isdigit() else (1, pid)
     ordered = sorted(desired, key=_nat)
     missing = [pid for pid in ordered if pid not in declared]
+    body = "".join(lines)
     if missing:
         add = ["\n",
                f"# --- phases generated {today} from the \"### Phase\" headings of "
@@ -1665,15 +1738,26 @@ def sync_phases_with_plan(cfg_text: str, plan_text: str, plan_rel: str,
                 "\n[[phase]]\n"
                 f'id         = "{pid}"\n'
                 f'name       = {_toml_str(desired[pid])}\n'
-                "days       = 1                  # TODO: working days of focused effort\n"
+                + (f"plan       = {_toml_str(plan_rel)}\n" if tag_new else "")
+                + "days       = 1                  # TODO: working days of focused effort\n"
                 f"depends_on = {dep}             # TODO: the REAL technical dependency\n")
             notes.append(f"[[phase]] {pid}: generated from {plan_rel}")
             prev = pid
-        body = "".join(lines)
         if not body.endswith("\n"):
             body += "\n"
-        return body + "".join(add), notes
-    return "".join(lines), notes
+        body += "".join(add)
+
+    # The items mode belongs to the plan, not the project: a checkbox plan and
+    # a list plan can live in one config. On a switch it follows the plan -
+    # restored from a returning plan's blocks, otherwise detected.
+    if switched and not renamed:
+        back = [t for t in mine if t.get("plan")]
+        new_mode = ("lists" if any(str(t.get("items", "")).lower() == "lists" for t in back)
+                    else detect_items_mode(list(plan_phase_sections(plan_text).values())))
+        if (old_mode or new_mode == "lists") and old_mode != new_mode:
+            body = set_toml_key(body, "[project]", "items", new_mode)
+            notes.append(f'[project] items = "{new_mode}" - follows {plan_rel}')
+    return body, notes
 
 
 def plan_phase_sections(plan_text: str) -> dict[str, str]:
@@ -2126,7 +2210,8 @@ def _overlay_user_profile(devs: list, repo: Path) -> list:
 
 
 def build(repo: Path) -> dict:
-    cfg = tomllib.loads((repo / "docs" / "progress.toml").read_text(encoding="utf-8"))
+    raw_cfg = tomllib.loads((repo / "docs" / "progress.toml").read_text(encoding="utf-8"))
+    cfg = scope_phases(raw_cfg)
     proj = cfg["project"]
     plan_text = (repo / proj.get("plan", DEFAULT_PLAN)).read_text(encoding="utf-8", errors="replace")
     sections = plan_phase_sections(plan_text)
@@ -2381,6 +2466,7 @@ def build(repo: Path) -> dict:
         "today": today.isoformat(),
         "phases": phases,
         "items_mode": mode,
+        "plans": known_plans(raw_cfg),
         "levels": levels,
         "groups": groups,
         "ready": ready,

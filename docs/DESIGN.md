@@ -20,6 +20,17 @@ line carries `[x]`, detection alone would flip the plan back to checkbox mode an
 hide every other entry. Nested bullets stay the entry's detail. Tick writes only
 lines the model already knows as items, and keeps the file's own line endings.
 
+**A project may have more than one plan.** A `[[phase]]` block may carry
+`plan = "<path>"`; an untagged block belongs to whichever plan is active, so a
+single-plan config never needs the key. Everything that reads phases — the
+schedule, `--check`, re-plan, ticket links — sees only the active plan's blocks,
+so ids may repeat across plans. Switching plans tags the outgoing plan's untagged
+blocks and generates the incoming plan's; nothing is commented out or lost, and
+switching back restores the old blocks exactly. The items mode follows the plan:
+a list-mode plan's blocks carry `items = "lists"` when it is left, so returning to
+it restores the mode instead of re-detecting it from a file that now has ticks. A
+moved file — same ids and names — keeps its blocks as they are.
+
 Write-back matches the verbatim source line, not a line number: if the file changed
 since the page rendered, the match fails and you are told to refresh, rather than
 the wrong box being ticked.

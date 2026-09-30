@@ -240,6 +240,13 @@ Two things:
    headings at level 2 to 4 (or per-phase docs), whose checkboxes, or list entries
    in `items = "lists"` mode, are the only store of progress. Opening the dashboard
    adds a `[[phase]]` block for any heading the config does not declare yet.
+
+   **More than one plan.** Pointing the project at another plan file starts a new
+   plan without losing the old one: the old plan's `[[phase]]` blocks are tagged
+   `plan = "<its file>"` and kept intact, and fresh blocks are generated for the new
+   one, even where phase ids overlap. A select in the dashboard's bar switches
+   between a project's plans; each keeps its own days, dependencies, tickets and
+   items mode, and its progress stays in its own file.
 2. **`docs/progress.toml`** holding what markdown cannot express.
 
 ```toml

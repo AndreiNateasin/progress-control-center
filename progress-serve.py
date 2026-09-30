@@ -1614,7 +1614,7 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
     plan_rel = proj.get("plan", _pr.DEFAULT_PLAN)
     if not isinstance(plan_rel, str):
         plan_rel = _pr.DEFAULT_PLAN
-    phases = {str(p.get("id")): p for p in CFG.get("phase", []) or []}
+    phases = {str(p.get("id")): p for p in _pr.scope_phases(CFG).get("phase") or []}
     ph = phases.get(str(phase_id), {})
     # The list is exactly what the requester ticked: an empty list means
     # "consult nothing", not "consult everything" - unchecking every provider
@@ -1989,7 +1989,8 @@ def create_jira_issue(phase_id: str, summary: str, description: str) -> dict:
     in. A phase that already has a key is refused, so a double click or a
     retried request cannot raise a second ticket.
     """
-    ph_cfg = next((p for p in CFG.get("phase", []) if str(p.get("id")) == str(phase_id)), None)
+    ph_cfg = next((p for p in _pr.scope_phases(CFG).get("phase") or []
+                   if str(p.get("id")) == str(phase_id)), None)
     if ph_cfg is None:
         return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
     if ph_cfg.get("jira"):
@@ -2090,7 +2091,7 @@ def link_ticket(phase_id: str, key: str) -> dict:
     cfgp = REPO / "docs" / "progress.toml"
     try:
         text = cfgp.read_text(encoding="utf-8")
-        new = _pr.set_phase_key(text, str(phase_id), "jira", key)
+        new = _pr.set_phase_key(text, str(phase_id), "jira", key, plan=_pr.active_plan(CFG))
         tomllib.loads(new)                      # never write a file we just broke
         cfgp.write_text(new, encoding="utf-8")
     except KeyError:
@@ -2110,7 +2111,8 @@ def unlink_ticket(phase_id: str) -> dict:
     git already tracks, and the button names the key it will remove before you
     press it.
     """
-    ph_cfg = next((p for p in CFG.get("phase", []) if str(p.get("id")) == str(phase_id)), None)
+    ph_cfg = next((p for p in _pr.scope_phases(CFG).get("phase") or []
+                   if str(p.get("id")) == str(phase_id)), None)
     if ph_cfg is None:
         return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
     had = str(ph_cfg.get("jira", "") or "")
@@ -2121,7 +2123,8 @@ def unlink_ticket(phase_id: str) -> dict:
         import datetime
         text = cfgp.read_text(encoding="utf-8")
         new = _pr.del_phase_key(text, str(phase_id), "jira",
-                                f"unlinked {datetime.date.today().isoformat()}")
+                                f"unlinked {datetime.date.today().isoformat()}",
+                                plan=_pr.active_plan(CFG))
         tomllib.loads(new)                      # never write a file we just broke
         cfgp.write_text(new, encoding="utf-8")
     except KeyError:
@@ -2538,6 +2541,9 @@ JS = r"""
     // exact git-pull-during-load window the feature exists for.
     var v0 = window.__ANU_FRESH0__ || null;
     function tick(){
+      // A write this page started (plan switch, phase sync) reloads the page
+      // itself when it lands; the poll must not race it and drop its note.
+      if(window.__pccSelfWrite) return;
       fetch('/api/fresh').then(function(r){ return r.json(); }).then(function(d){
         if(!d || !d.v) return;
         if(v0 === null){ v0 = d.v; return; }
@@ -2549,6 +2555,26 @@ JS = r"""
       }).catch(function(){});
     }
         setInterval(tick, 4000); tick();
+  })();
+
+  // More than one plan: the bar's select makes another one active.
+  (function(){
+    var s = document.getElementById('pcc-plan'); if(!s) return;
+    var was = s.value;
+    s.addEventListener('change', function(){
+      s.disabled = true;
+      window.__pccSelfWrite = true;
+      api('/api/plan/switch', {plan: s.value}).then(function(d){
+        if(d && d.ok){
+          try { sessionStorage.setItem('pccPhaseSyncNote', 'active plan is now ' + s.value +
+                ((d.notes && d.notes.length) ? ' \u2014 ' + d.notes.join('; ') : '')); } catch(e){}
+          location.reload();
+        } else {
+          s.disabled = false; s.value = was; window.__pccSelfWrite = false;
+          alert((d && d.error) || 'could not switch plans');
+        }
+      });
+    });
   })();
 
   // Phase headings in the plan with no [[phase]] block: ask the server to add
@@ -2569,11 +2595,12 @@ JS = r"""
     if(!((g.missing && g.missing.length) || g.mode)) return;
     var sig = 'pccPhaseSync:' + (g.repo || '') + ':' + (g.missing || []).join(',') + (g.mode ? '+mode' : '');
     try { if(sessionStorage.getItem(sig)) return; sessionStorage.setItem(sig, '1'); } catch(e){ return; }
+    window.__pccSelfWrite = true;
     api('/api/phases/sync', {}).then(function(d){
       if(d && d.ok && d.written){
         try { sessionStorage.setItem('pccPhaseSyncNote', (d.notes || []).join('; ')); } catch(e){}
         location.reload();
-      } else if(d && !d.ok){ console.warn('phase sync: ' + d.error); }
+      } else { window.__pccSelfWrite = false; if(d && !d.ok) console.warn('phase sync: ' + d.error); }
     });
   })();
   window.__pccToolSelect__ = toolSelect;
@@ -3366,6 +3393,19 @@ def sync_phases_now() -> dict:
     return r
 
 
+def plan_switcher(model: dict) -> str:
+    """A select in the bar when the project has more than one plan."""
+    plans = model.get("plans") or []
+    if len(plans) < 2:
+        return ""
+    cur = _pr.plan_key((model.get("project") or {}).get("plan", ""))
+    opts = "".join(f'<option value="{_pr.e(p)}"{" selected" if _pr.plan_key(p) == cur else ""}>'
+                   f'{_pr.e(p)}</option>' for p in plans)
+    return ('<select id="pcc-plan" class="pcc-btn" aria-label="Active plan" title="This project '
+            'has more than one plan. Switching keeps each plan\'s phases - days, dependencies, '
+            'tickets - and its progress stays in its own file.">' + opts + '</select>')
+
+
 def action_layer(token: str, model: dict) -> str:
     """Everything the local build adds on top of the shared render()."""
     # label -> source line, so a click can find its way back into the markdown.
@@ -3393,6 +3433,7 @@ def action_layer(token: str, model: dict) -> str:
         '<div id="pcc-bar"><span class="lbl">local</span>' + buttons +
         '<button class="pcc-btn" id="pcc-replan-all" '
         'title="Reassess the whole plan in a code session">Re-plan…</button>'
+        + plan_switcher(model) +
         '<a class="pcc-btn" href="/setup" style="text-decoration:none;margin-left:auto"'
         ' title="configure this machine and this project">Setup</a>'
         '<span class="pcc-local">actions live</span></div>'
@@ -4605,6 +4646,22 @@ def setup_init(body: dict) -> dict:
             "log": out.getvalue().strip()}
 
 
+def switch_plan(plan: str) -> dict:
+    """Make another of this project's plans the active one. Only a plan the
+    config already knows, and only if its file still exists."""
+    try:
+        cfg_all = tomllib.loads((REPO / "docs" / "progress.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return {"ok": False, "error": f"config unreadable: {exc}"}
+    known = {_pr.plan_key(p): p for p in _pr.known_plans(cfg_all)}
+    plan = known.get(_pr.plan_key(plan))
+    if not plan:
+        return {"ok": False, "error": "not one of this project's plans - add a new one in Setup"}
+    if not (REPO / plan).is_file():
+        return {"ok": False, "error": f"{plan} no longer exists in this checkout"}
+    return setup_project({"fields": {"plan": plan}, "apply": True})
+
+
 def setup_project(body: dict) -> dict:
     """Preview or write the shared config. Writing reloads context providers but
     NOT the run-command allowlist: that one was approved at startup and a new
@@ -4928,6 +4985,10 @@ class Handler(BaseHTTPRequestHandler):
                                      str(body.get("item", "")),
                                      str(body.get("comment", "")),
                                      list(body.get("providers") or [])))
+            return
+
+        if path == "/api/plan/switch":
+            self._json(switch_plan(str(body.get("plan", ""))))
             return
 
         if path == "/api/phases/sync":
