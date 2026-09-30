@@ -1482,6 +1482,15 @@ def scope_phases(cfg: dict) -> dict:
     return out
 
 
+def plan_slug(plan: str) -> str:
+    """A file-name-safe name for one plan: readable stem plus a short hash of
+    its normalised path, so two plans called PLAN.md in different folders
+    never share per-plan state."""
+    import hashlib
+    stem = safe_id(Path(str(plan)).stem.lower())[:40]
+    return f"{stem}-{hashlib.sha1(plan_key(plan).encode('utf-8')).hexdigest()[:6]}"
+
+
 def known_plans(cfg: dict) -> list[str]:
     """The active plan first, then every plan a [[phase]] block is tagged with."""
     seen, out = set(), []

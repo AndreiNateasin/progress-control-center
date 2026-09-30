@@ -999,8 +999,23 @@ _SESS_LOCK = threading.Lock()
 PIN_BRIEF_DEFAULT = True     # profile.toml `pin_protocol = false` switches it off
 
 
+def _single_plan() -> bool:
+    return len(_pr.known_plans(CFG)) <= 1
+
+
 def _sessions_path() -> Path:
-    return PROMPT_DIR / "sessions.json"
+    """The session record of the ACTIVE plan. Phase ids repeat across plans,
+    so one shared file would send a new plan's Phase 0 to an old plan's
+    conversation. A pre-plan `sessions.json` is adopted while the project has
+    one plan - it can only be that plan's; with several it is left alone."""
+    per = PROMPT_DIR / f"sessions-{_pr.plan_slug(_pr.active_plan(CFG))}.json"
+    legacy = PROMPT_DIR / "sessions.json"
+    if not per.exists() and legacy.exists() and _single_plan():
+        try:
+            legacy.replace(per)
+        except OSError:
+            return legacy
+    return per
 
 
 def load_sessions() -> dict:
@@ -1800,7 +1815,17 @@ def ticket_prompt(ph: dict, plan: str, doc: str, open_items: list,
 
 
 def _draft_path(phase_id: str) -> Path:
-    return PROMPT_DIR / f"ticket-{_pr.safe_id(phase_id)}.json"
+    """Where the ACTIVE plan's draft for this phase lives - named for the plan,
+    because phase ids repeat across plans and a draft is about one of them."""
+    return (PROMPT_DIR / f"ticket-{_pr.plan_slug(_pr.active_plan(CFG))}-"
+                         f"{_pr.safe_id(phase_id)}.json")
+
+
+def _legacy_draft_path(phase_id: str) -> Path | None:
+    """A draft written before drafts were per plan. Only while the project has
+    one plan can it be known to belong to it; with several it stays unread."""
+    p = PROMPT_DIR / f"ticket-{_pr.safe_id(phase_id)}.json"
+    return p if _single_plan() and p.exists() else None
 
 
 def draft_ticket(phase_id: str, tool: str, model: dict) -> dict:
@@ -1865,6 +1890,8 @@ def read_ticket_draft(phase_id: str) -> dict:
     """Read a draft a session wrote. Treated as DATA: it is model-written text
     that a person reviews and submits, never something acted on directly."""
     p = _draft_path(phase_id)
+    if not p.exists():
+        p = _legacy_draft_path(phase_id) or p
     if not p.exists():
         return {"ok": True, "draft": None, "path": str(p), "jira": jira_target()}
     try:
@@ -2995,7 +3022,7 @@ JS = r"""
 
     var load = document.createElement('button');
     load.className = 'pcc-btn'; load.textContent = 'Load draft';
-    load.title = 'Read .pcc/ticket-' + p.id + '.json if a session has written it';
+    load.title = 'Read the draft a session wrote for this phase of the active plan (.pcc/ticket-<plan>-' + p.id + '.json)';
     load.addEventListener('click', function(){ loadDraft(p, act, say, host, true); });
     act.appendChild(load);
 
@@ -3040,7 +3067,7 @@ JS = r"""
   function loadDraft(p, act, say, host, loud, cb){
     api('/api/phase/ticket-draft', {phase: p.id}).then(function(d){
       if(!d.ok || !d.draft){
-        if(loud) say(d.error || ('no draft yet at ' + (d.path || '.pcc/ticket-' + p.id + '.json')), 'err');
+        if(loud) say(d.error || ('no draft yet for this phase of the active plan' + (d.path ? ' (' + d.path + ')' : '')), 'err');
         if(cb) cb(false);
         return;
       }

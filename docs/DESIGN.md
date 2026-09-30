@@ -31,6 +31,13 @@ a list-mode plan's blocks carry `items = "lists"` when it is left, so returning 
 it restores the mode instead of re-detecting it from a file that now has ticks. A
 moved file — same ids and names — keeps its blocks as they are.
 
+Per-phase state on this machine is per plan too: ticket drafts
+(`.pcc/ticket-<plan>-<id>.json`) and session records (`.pcc/sessions-<plan>.json`),
+where `<plan>` is the plan's file stem plus a short hash of its path. A new plan's
+Phase 0 therefore never shows an old plan's Phase 0 draft or resumes its
+conversation. A file from before this existed is read only while the project
+has a single plan, when it can only be that plan's.
+
 Write-back matches the verbatim source line, not a line number: if the file changed
 since the page rendered, the match fails and you are told to refresh, rather than
 the wrong box being ticked.
