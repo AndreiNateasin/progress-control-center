@@ -48,7 +48,7 @@ once: a session that already holds it gets only the next item.
 | pasting context into an AI session | click **Open session** — the prompt is built from the phase |
 | re-explaining the phase to a session that already knows it | click **Send to phase session** — only the item goes, into the same conversation |
 | leaving the terminal to fetch the next item | type `/next-item 0` — the session pulls it from the live checklist |
-| an agent running off in the wrong direction | the session must post its steps and acceptance criteria, and **wait for your confirmation**, before touching anything |
+| an agent running off in the wrong direction | the session posts a plain brief — decisions numbered, outcomes each with a check — and **waits for your confirmation** before touching anything |
 | writing a ticket from scratch | click **Draft ticket**, review, create — key written back |
 | rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
 | chasing "is your checkout the same as mine?" | teammates get a launch command for *their* machine |
@@ -100,10 +100,13 @@ are exactly where the parallelism shows up.
 
 **Actions on the phase, not beside it.** Run that phase's exit test and watch the
 output stream in. Open a coding session with a prompt already scoped to the phase, or
-to one checklist item. Every session opens **brief-first**: it must post its proposed
-steps (each naming the checklist item it serves) and acceptance criteria decidable by
-inspecting a named thing or running a named command, then ask *"confirm these steps,
-or redirect me?"* and wait — no code, no file edits, until you confirm. Ask a session
+to one checklist item. Every session opens **brief-first**, with a brief written for
+someone who is not a specialist: what the item is and why the plan needs it, what it
+found that changes the approach, the decisions it needs from you (numbered, each with
+options and a recommendation, so you can answer "1A, 2 default"), the steps it will take,
+how you will know it is done (each outcome with a named check), and what it will leave
+alone. Then it asks *"confirm these steps, or redirect me?"* and waits — no code, no
+file edits, until you confirm. Ask a session
 to draft a JIRA ticket, review it, and create it.
 
 **One phase session, told the phase once.** Every prompt has two shapes. The *cold*
