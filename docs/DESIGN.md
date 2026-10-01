@@ -224,6 +224,30 @@ it by name and offers to move it: the destination is written first and the
 original dropped only after that succeeds, so an interrupted move duplicates a
 token rather than losing one.
 
+## An agent per plan
+
+A plan may declare its own agent in its `[plans."<file>".agent]` table: a name, a
+description that doubles as the trigger phrase, an optional model, and `sources`
+— files or globs, folders, URLs, MCP server names and prior plans. That table is
+the only hand-written piece. On render the generator resolves the sources (which
+files a glob matched, whether a path exists, where an MCP name is declared, a
+change stamp), writes the agent body as a pointer list in the llms.txt shape with
+missing sources flagged rather than dropped, and projects it into
+`.claude/agents/<name>.md` (a session agent with `memory: project` and the
+next-item skill) and `.opencode/agents/<name>.md` (a primary agent whose
+permission allows the named MCP servers). A source manifest with the stamps goes
+to `.pcc/agent-<name>.json`. Generated files carry the generator's marker and a
+file without it is never overwritten; `--check` fails on that collision and warns
+on every missing source.
+
+Cold launches of Claude Code and opencode pass `--agent <name>`, so the session
+starts as the agent — its identity, memory and sources — while the pinned phase
+brief still adds the item protocol on top. A resumed session keeps the agent it
+started with. Codex has no agent files; it, and every other tool, gets the same
+source list inside the opening brief and the phase brief instead. Sources are
+pointers on purpose: the agent reads on demand, nothing is copied into a prompt,
+and URLs are listed but never fetched by the generator.
+
 ## Tickets are drafted by a coding session
 
 A ticket belongs to the PLAN, not to each phase: one row above the phases carries

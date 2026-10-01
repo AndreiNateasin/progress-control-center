@@ -58,6 +58,7 @@ once: a session that already holds it gets only the next item.
 
 | | |
 |---|---|
+| **Plan agents** | one named agent per plan, generated for Claude Code and opencode from a source list you declare once: files, folders, URLs, MCP servers, prior plans |
 | **Coding agents** | Claude Code, Codex, opencode, Cursor, VS Code — detected on PATH; one phase session per tool, resumed by id (Claude Code, opencode) or as the last session (Codex) |
 | **Issue tracking** | JIRA Cloud and Server/DC — one ticket per plan: draft, review, create over the API, key recorded on the plan |
 | **Knowledge** | any MCP provider (stateless or stateful HTTP) as a `[[context]]`, its usage rules injected into every session prompt |
@@ -273,6 +274,16 @@ owner      = "alice"
 
 [plans."PLAN.md"]                   # per-plan settings: one ticket for the whole plan
 jira = "PROJ-101"
+
+[plans."PLAN.md".agent]             # the plan's own agent, generated per tool
+name        = "plan-ingest"
+description = "Owns the ingest plan. Use for anything touching services/ingest."
+[plans."PLAN.md".agent.sources]     # its knowledge base - pointers, never copies
+files = ["docs/decisions/00[1-4]-*.md"]
+dirs  = ["services/ingest/"]
+urls  = ["https://docs.example.com/ingest"]
+mcp   = ["project-docs"]
+plans = ["OLD-PLAN.md"]
 
 [[action]]                          # the Run buttons
 id = "smoke"; label = "Smoke tests"; kind = "argv"; args = ["npm", "test"]

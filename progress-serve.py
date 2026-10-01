@@ -442,7 +442,7 @@ def build_launchers(cfg: dict | None = None) -> dict:
         # falls back to --continue, and the result says so.
         L["claude"] = {"label": "Claude Code — new session", "mode": "terminal",
                        "base": "claude",
-                       "cmd": "claude {sys}--session-id {sid} (Get-Content -Raw -Encoding UTF8 {pf})",
+                       "cmd": "claude {sys}{agent}--session-id {sid} (Get-Content -Raw -Encoding UTF8 {pf})",
                        "cmd_blank": "claude"}
         L["claude-continue"] = {"label": "Claude Code — continue phase session",
                                 "mode": "terminal", "base": "claude", "warm": True,
@@ -457,7 +457,7 @@ def build_launchers(cfg: dict | None = None) -> dict:
         # `opencode session list` for this directory right after it.
         L["opencode"] = {"label": "opencode — new session", "mode": "terminal",
                          "base": "opencode",
-                         "cmd": "opencode --prompt (Get-Content -Raw -Encoding UTF8 {pf})",
+                         "cmd": "opencode {agent}--prompt (Get-Content -Raw -Encoding UTF8 {pf})",
                          "cmd_blank": "opencode"}
         L["opencode-continue"] = {"label": "opencode — continue phase session",
                                   "mode": "terminal", "base": "opencode", "warm": True,
@@ -1540,8 +1540,22 @@ def open_session(phase_tag: str, prompt: str, tool: str = "claude",
         brief = PROMPT_DIR / _pr.brief_name(phase_id)
         if brief.exists():
             sys_arg = "--append-system-prompt-file " + _ps_lit(brief) + " "
+    # The plan's agent, on COLD launches of a tool that has agent files: the
+    # session starts AS the agent (its body, memory and sources), and the
+    # pinned brief still adds the phase's protocol on top. A resumed session
+    # keeps the agent it started with. The flag is passed only when the file
+    # the tool will look for is there - a name with no file fails at startup.
+    agent_arg, agent_name = "", ""
+    ag = _pr.plan_agent(CFG) if tracked and not warm else None
+    if ag and base in ("claude", "opencode"):
+        f = REPO / (".claude" if base == "claude" else ".opencode") / "agents" / f"{ag['name']}.md"
+        if f.is_file():
+            agent_arg, agent_name = f"--agent {ag['name']} ", ag["name"]
+        else:
+            notes.append(f"the plan's agent {ag['name']} has no {f.parent.name} file for {base} "
+                         "yet - starting without it")
     try:
-        cmd = cmd.format(pf=_ps_lit(pf), sid=sid, sys=sys_arg)
+        cmd = cmd.format(pf=_ps_lit(pf), sid=sid, sys=sys_arg, agent=agent_arg)
     except (KeyError, IndexError, ValueError) as exc:
         return {"ok": False, "error": f"launcher {tool!r} has a bad template: {exc}"}
 
@@ -1598,6 +1612,7 @@ def open_session(phase_tag: str, prompt: str, tool: str = "claude",
                     "shape": "warm" if warm else "cold", "session": sid or None,
                     "phase": phase_id, "kind": kind, "pinned": bool(sys_arg),
                     "tab": _tab_title(phase_id, base) if tracked and argv[0] == "wt.exe" else None,
+                    "agent": agent_name or None,
                     "note": "; ".join(notes)}
         tried.append(f"{argv[0]}: exited {rc}")
     return {"ok": False, "error":
@@ -2636,6 +2651,7 @@ JS = r"""
         if(!ok) cls = 'err';
       } else {
         msg = (d.shape === 'warm' ? 'Follow-up sent to ' : 'Session started in ') + name +
+              (d.agent ? ' as ' + d.agent : '') +
               (d.session ? ' · session ' + String(d.session).slice(0, 8) + '…' : '') +
               (d.pinned ? ' · brief pinned' : '') +
               (d.note ? ' — ' + d.note : '') + (ok ? ' · also on your clipboard' : '');
@@ -3160,6 +3176,17 @@ JS = r"""
     var lbl = document.createElement('span'); lbl.className = 'eyebrow'; lbl.textContent = 'Plan ticket';
     var nm = document.createElement('span'); nm.className = 'quiet'; nm.textContent = P0.name;
     head.appendChild(lbl); head.appendChild(nm);
+    if(P0.agent){
+      var ag = document.createElement('span'); ag.className = 'quiet';
+      var miss = (P0.agent.missing || []).length;
+      ag.textContent = '\u00b7 agent ' + P0.agent.name + ' \u00b7 ' + P0.agent.sources + ' source' +
+        (P0.agent.sources === 1 ? '' : 's') + (miss ? ' (' + miss + ' missing)' : '') +
+        ' \u00b7 files for ' + (P0.agent.files.length ? P0.agent.files.join(', ') : 'no tool yet');
+      ag.title = miss ? 'Missing: ' + P0.agent.missing.join(', ') + ' \u2014 declared in docs/progress.toml but not found'
+                      : 'Cold launches of ' + (P0.agent.files.join(' and ') || 'nothing') + ' start as this agent';
+      if(miss) ag.className = 'warn';
+      head.appendChild(ag);
+    }
     var act = document.createElement('div'); act.className = 'dact';
     var msg = document.createElement('div'); msg.className = 'dstatus';
     function say(t, c){ msg.textContent = t || ''; msg.className = 'dstatus ' + (c||''); }
@@ -3616,6 +3643,13 @@ def action_layer(token: str, model: dict) -> str:
         "window.__ANU_PLAN__=" + _pr.js({
             "id": PLAN_ID, "name": (model.get("project") or {}).get("plan", "the plan"),
             "jira": model.get("plan_ticket", ""),
+            "agent": ({"name": model["agent"]["name"],
+                       "sources": len(model["agent"]["resolved"]),
+                       "missing": model["agent"]["missing"],
+                       "files": [t for t in ("claude", "opencode") if
+                                 (REPO / (".claude" if t == "claude" else ".opencode") / "agents"
+                                  / (model["agent"]["name"] + ".md")).is_file()]}
+                      if model.get("agent") else None),
             "jira_create_tmpl": ("" if model.get("plan_ticket") else
                                  ((CFG.get("integrations", {}) or {}).get("jira", {}) or {})
                                  .get("create_url", ""))}) + ";"
@@ -4942,6 +4976,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 model = build(REPO)
                 _pr.write_briefs(model, REPO)   # so /next-item and a pinned launch never read a stale brief
+                try:
+                    r_ag = _pr.write_agent_files(model, REPO)
+                    for s in r_ag.get("skipped", []):
+                        print("  agent files: " + s, file=sys.stderr)
+                except Exception as exc:          # noqa: BLE001 - never block a render
+                    print(f"  agent files: not written ({type(exc).__name__}: {exc})", file=sys.stderr)
                 # render() returns an artifact-safe FRAGMENT (no doctype, html,
                 # head or body — the artifact wrapper supplies those). Served
                 # directly it therefore had no <html lang>, which screen readers
