@@ -226,7 +226,13 @@ token rather than losing one.
 
 ## Tickets are drafted by a coding session
 
-"Draft ticket" hands a prompt to a session, which writes `.pcc/ticket-<id>.json`;
+A ticket belongs to the PLAN, not to each phase: one row above the phases carries
+Draft ticket, Load draft, Link ticket and Unlink, and the key is kept per plan in
+`[plans."<plan file>"] jira = "KEY"`, so each of a project's plans has its own. The
+draft's scope is one line per phase. A phase may still carry its own `jira` key in a
+hand-written config, and it is still shown, but phases offer no ticket actions.
+
+"Draft ticket" hands a prompt to a session, which writes `.pcc/ticket-<plan>-_plan.json`;
 the dashboard picks it up into an editable form. It is not an LLM call from here —
 the session already has the repo, the plan, the phase doc and every configured
 context provider, and already routes through whichever model you set up. So there is

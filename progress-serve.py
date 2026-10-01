@@ -1771,6 +1771,65 @@ def fresh_stamp() -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
+PLAN_ID = "_plan"          # ticket target meaning "the active plan", not a phase
+
+
+def plan_ticket_prompt(model: dict, project: str, out: Path, cap: int = 2000) -> str:
+    """The drafting prompt for ONE ticket covering the whole plan: the same
+    work-order discipline as a phase ticket, with the phases as its scope."""
+    plan = model["project"].get("plan", "the plan")
+    rows = []
+    for p in model.get("phases", []):
+        open_n = sum(1 for i in p.get("items", []) if i["state"] != "done")
+        rows.append(f"  - Phase {p['id']} - {p['name']}: {open_n} of {p['total']} items open"
+                    + (f"; exit test: {p['exit_test']}" if p.get("exit_test") else ""))
+    return (
+        f"Draft ONE JIRA ticket for the whole plan {plan} "
+        f"({model['project'].get('name', '')}).\n\n"
+        f"Read {plan} for context first - then write a short work order, not a summary of "
+        "the plan. The point of reading is that the scope and the acceptance criteria "
+        "are TRUE.\n\n"
+        "The plan's phases:\n" + ("\n".join(rows) or "  (none)") + "\n"
+        + (f"JIRA project key: {project}\n" if project else "")
+        + "\nWrite EXACTLY this structure into the description, in this order, using these "
+        "headings verbatim:\n\n"
+        "Goal\n"
+        "- 1 to 2 bullets: what the plan delivers when it is done.\n"
+        "Scope\n"
+        "- One bullet per phase, in plan order: 'Phase <id> - <name>: <what it delivers>'. "
+        "One line each.\n"
+        "Out of scope\n"
+        "- 0 to 3 bullets. Things a reader would otherwise assume are included.\n"
+        "Acceptance criteria\n"
+        "- 3 to 7 bullets, each decidable by INSPECTING A NAMED THING or RUNNING A NAMED "
+        "COMMAND. One assertion per bullet. No judgement words (appropriate, properly, "
+        "correctly, clean, secure).\n"
+        "Blockers\n"
+        "- 0 to 3 bullets, only things that genuinely stop the work starting.\n"
+        "Open questions\n"
+        "- 0 to 3 bullets, one line each, only where the answer changes what gets built. "
+        "Omit the heading if there are none.\n\n"
+        f"HARD LIMITS. summary: one imperative line, at most 80 characters. description: "
+        f"at most {cap} characters TOTAL - count it, and cut until it fits. Every bullet "
+        "one line. No sub-bullets.\n\n"
+        "Do NOT include: a summary of the repository's state, file inventories, rationale, "
+        "quotations, or notes about your own process.\n\n"
+        f"Write the result as JSON to {out} with exactly two keys, summary and description, "
+        "serialised with a JSON library so the newlines in the description are escaped.\n\n"
+        "Write ONLY that file. Do not create the ticket, do not call any JIRA API, and do "
+        "not modify the plan - a person reviews this draft and submits it."
+    )
+
+
+def _write_keep_eol(path: Path, text: str) -> None:
+    """Write a config edit in the file's own line endings."""
+    try:
+        eol = "\r\n" if b"\r\n" in path.read_bytes() else "\n"
+    except OSError:
+        eol = "\n"
+    path.write_bytes(text.replace("\r\n", "\n").replace("\n", eol).encode("utf-8"))
+
+
 def ticket_prompt(ph: dict, plan: str, doc: str, open_items: list,
                   project: str, out: Path, cap: int = 1600) -> str:
     """The drafting prompt.
@@ -1870,8 +1929,9 @@ def draft_ticket(phase_id: str, tool: str, model: dict) -> dict:
     no additional credential to hold. It hands over a prompt; the session writes
     the JSON; this reads it back.
     """
+    is_plan = phase_id == PLAN_ID
     ph = next((p for p in model.get("phases", []) if str(p["id"]) == str(phase_id)), None)
-    if ph is None:
+    if ph is None and not is_plan:
         return {"ok": False, "error": "unknown phase " + repr(phase_id)}
 
     # This prompt asks a session to WRITE A FILE. A clipboard-mode launcher only
@@ -1890,14 +1950,17 @@ def draft_ticket(phase_id: str, tool: str, model: dict) -> dict:
                  "No terminal launcher (claude / opencode) was found on this machine.")}
 
     out = _draft_path(phase_id)
-    open_items = [i["label"] for i in ph.get("items", []) if i["state"] != "done"]
     jira_cfg = (CFG.get("integrations", {}) or {}).get("jira", {}) or {}
     project = jira_cfg.get("project_key") or jira_cfg.get("project") or ""
-    doc = ph.get("source") or f"the Phase {ph['id']} section of the plan"
-
-    cap = int(jira_cfg.get("draft_max_chars", 1600) or 1600)
-    prompt = ticket_prompt(ph, model['project'].get('plan', 'the plan'), doc,
-                           open_items, project, out, cap)
+    if is_plan:
+        cap = int(jira_cfg.get("draft_max_chars_plan", 2000) or 2000)
+        prompt = plan_ticket_prompt(model, project, out, cap)
+    else:
+        open_items = [i["label"] for i in ph.get("items", []) if i["state"] != "done"]
+        doc = ph.get("source") or f"the Phase {ph['id']} section of the plan"
+        cap = int(jira_cfg.get("draft_max_chars", 1600) or 1600)
+        prompt = ticket_prompt(ph, model['project'].get('plan', 'the plan'), doc,
+                               open_items, project, out, cap)
     PROMPT_DIR.mkdir(exist_ok=True)
     try:
         out.unlink()                      # so a stale draft cannot look like a new one
@@ -2048,14 +2111,20 @@ def create_jira_issue(phase_id: str, summary: str, description: str) -> dict:
     in. A phase that already has a key is refused, so a double click or a
     retried request cannot raise a second ticket.
     """
-    ph_cfg = next((p for p in _pr.scope_phases(CFG).get("phase") or []
-                   if str(p.get("id")) == str(phase_id)), None)
-    if ph_cfg is None:
-        return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
-    if ph_cfg.get("jira"):
-        return {"ok": False, "error": f"phase {phase_id} already has ticket "
-                f"{ph_cfg['jira']} — use Unlink on this phase first if you "
-                "meant to raise a different one"}
+    if phase_id == PLAN_ID:
+        have = _pr.plan_ticket(CFG)
+        if have:
+            return {"ok": False, "error": f"this plan already has ticket {have} - use "
+                    "Unlink first if you meant to raise a different one"}
+    else:
+        ph_cfg = next((p for p in _pr.scope_phases(CFG).get("phase") or []
+                       if str(p.get("id")) == str(phase_id)), None)
+        if ph_cfg is None:
+            return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
+        if ph_cfg.get("jira"):
+            return {"ok": False, "error": f"phase {phase_id} already has ticket "
+                    f"{ph_cfg['jira']} — use Unlink on this phase first if you "
+                    "meant to raise a different one"}
     summary = str(summary or "").strip()
     description = str(description or "").strip()
     if not summary:
@@ -2150,9 +2219,12 @@ def link_ticket(phase_id: str, key: str) -> dict:
     cfgp = REPO / "docs" / "progress.toml"
     try:
         text = cfgp.read_text(encoding="utf-8")
-        new = _pr.set_phase_key(text, str(phase_id), "jira", key, plan=_pr.active_plan(CFG))
+        if phase_id == PLAN_ID:
+            new = _pr.set_toml_key(text, _pr.plan_header(_pr.active_plan(CFG)), "jira", key)
+        else:
+            new = _pr.set_phase_key(text, str(phase_id), "jira", key, plan=_pr.active_plan(CFG))
         tomllib.loads(new)                      # never write a file we just broke
-        cfgp.write_text(new, encoding="utf-8")
+        _write_keep_eol(cfgp, new)
     except KeyError:
         return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r} in progress.toml"}
     except (OSError, tomllib.TOMLDecodeError) as exc:
@@ -2170,22 +2242,30 @@ def unlink_ticket(phase_id: str) -> dict:
     git already tracks, and the button names the key it will remove before you
     press it.
     """
-    ph_cfg = next((p for p in _pr.scope_phases(CFG).get("phase") or []
-                   if str(p.get("id")) == str(phase_id)), None)
-    if ph_cfg is None:
-        return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
-    had = str(ph_cfg.get("jira", "") or "")
-    if not had:
-        return {"ok": False, "error": f"phase {phase_id} has no ticket linked"}
+    if phase_id == PLAN_ID:
+        had = _pr.plan_ticket(CFG)
+        if not had:
+            return {"ok": False, "error": "this plan has no ticket linked"}
+    else:
+        ph_cfg = next((p for p in _pr.scope_phases(CFG).get("phase") or []
+                       if str(p.get("id")) == str(phase_id)), None)
+        if ph_cfg is None:
+            return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r}"}
+        had = str(ph_cfg.get("jira", "") or "")
+        if not had:
+            return {"ok": False, "error": f"phase {phase_id} has no ticket linked"}
     cfgp = REPO / "docs" / "progress.toml"
     try:
         import datetime
         text = cfgp.read_text(encoding="utf-8")
-        new = _pr.del_phase_key(text, str(phase_id), "jira",
-                                f"unlinked {datetime.date.today().isoformat()}",
-                                plan=_pr.active_plan(CFG))
+        note = f"unlinked {datetime.date.today().isoformat()}"
+        if phase_id == PLAN_ID:
+            new = _pr.del_toml_key(text, _pr.plan_header(_pr.active_plan(CFG)), "jira", note)
+        else:
+            new = _pr.del_phase_key(text, str(phase_id), "jira", note,
+                                    plan=_pr.active_plan(CFG))
         tomllib.loads(new)                      # never write a file we just broke
-        cfgp.write_text(new, encoding="utf-8")
+        _write_keep_eol(cfgp, new)
     except KeyError:
         return {"ok": False, "error": f"no [[phase]] with id = {phase_id!r} in progress.toml"}
     except (OSError, tomllib.TOMLDecodeError) as exc:
@@ -2221,6 +2301,10 @@ CSS = """
 .pcc-btn[disabled]{opacity:.5;cursor:progress}
 .pcc-btn.run{border-color:var(--accent);background:var(--accent);color:#fff}
 .pcc-btn.run:hover{color:#fff;filter:brightness(1.08)}
+.planbar{margin:18px 0 6px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
+ background:var(--panel)}
+.planbar-head{display:flex;gap:10px;align-items:baseline;margin-bottom:8px;flex-wrap:wrap}
+.planbar .dact{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
 .psess{margin:6px 0 4px;font-family:var(--mono);font-size:11px;color:var(--ink-3);
  display:flex;flex-direction:column;gap:4px;line-height:1.5}
 .psess .warn{color:var(--warn)}
@@ -2943,7 +3027,6 @@ JS = r"""
     });
     act.appendChild(rg);
 
-    ticketControls(p, act, say, host);
     if(!p.test) say('no test wired — set `test = "<action id>"` on this phase to run its ' +
                     'exit test from here');
   }
@@ -2956,6 +3039,7 @@ JS = r"""
   // config and no extra credential. It asks for a draft, the session writes
   // .pcc/ticket-<phase>.json, this picks it up.
   function ticketControls(p, act, say, host){
+    var what = p.id === '_plan' ? 'plan' : 'phase';
     // One slot, two states. A phase that has a ticket offers to remove it, with
     // the key in the button so it says what it will do; a phase without one
     // offers the key input. Either action swaps the slot in place - no reload
@@ -2971,7 +3055,7 @@ JS = r"""
       if(cur){
         var un = document.createElement('button');
         un.className = 'pcc-btn'; un.textContent = 'Unlink ' + cur;
-        un.title = 'Remove this ticket from the phase in docs/progress.toml. The '
+        un.title = 'Remove this ticket from the ' + what + ' in docs/progress.toml. The '
                  + 'issue itself is not touched - only the link.';
         un.addEventListener('click', function(){
           un.disabled = true;
@@ -2994,7 +3078,7 @@ JS = r"""
       inp.style.width = '110px'; inp.style.cursor = 'text';
       var lk = document.createElement('button');
       lk.className = 'pcc-btn'; lk.textContent = 'Link ticket';
-      lk.title = 'Record an EXISTING ticket key on this phase (docs/progress.toml)';
+      lk.title = 'Record an EXISTING ticket key on this ' + what + ' (docs/progress.toml)';
       function doLink(){
         if(!inp.value.trim()){
           say('type the key of a ticket that already exists (e.g. PROJ-123), or ' +
@@ -3031,7 +3115,7 @@ JS = r"""
       draft.disabled = true;
       draft.title = 'Needs a terminal launcher (claude or opencode) — none found on this machine';
     } else {
-      draft.title = 'Ask the selected terminal tool to write a ticket from this phase, ' +
+      draft.title = 'Ask the selected terminal tool to write a ticket from this ' + what + ', ' +
                     'then review it here before anything is created';
       draft.addEventListener('click', function(){
         // Resolve the tool AT CLICK TIME from the row's select, so changing it
@@ -3054,7 +3138,7 @@ JS = r"""
 
     var load = document.createElement('button');
     load.className = 'pcc-btn'; load.textContent = 'Load draft';
-    load.title = 'Read the draft a session wrote for this phase of the active plan (.pcc/ticket-<plan>-' + p.id + '.json)';
+    load.title = 'Read the draft a session wrote for this ' + what + ' (.pcc/ticket-<plan>-' + p.id + '.json)';
     load.addEventListener('click', function(){ loadDraft(p, act, say, host, true); });
     act.appendChild(load);
 
@@ -3064,6 +3148,34 @@ JS = r"""
       if(!found) resumeWatch(p, act, say, host);   // a reload mid-drafting resumes
     });
   }
+
+  // One ticket for the PLAN, not one per phase: a row above the tabs with the
+  // same draft -> review -> create/link flow, aimed at the active plan.
+  (function(){
+    var P0 = window.__ANU_PLAN__; if(!P0) return;
+    var anchor = document.querySelector('nav.tabs'); if(!anchor) return;
+    var panel = document.createElement('section'); panel.className = 'planbar';
+    panel.setAttribute('aria-label', 'Plan ticket');
+    var head = document.createElement('div'); head.className = 'planbar-head';
+    var lbl = document.createElement('span'); lbl.className = 'eyebrow'; lbl.textContent = 'Plan ticket';
+    var nm = document.createElement('span'); nm.className = 'quiet'; nm.textContent = P0.name;
+    head.appendChild(lbl); head.appendChild(nm);
+    var act = document.createElement('div'); act.className = 'dact';
+    var msg = document.createElement('div'); msg.className = 'dstatus';
+    function say(t, c){ msg.textContent = t || ''; msg.className = 'dstatus ' + (c||''); }
+    var terms = terminalTools();
+    if(terms.length && !P0.jira){
+      var sel = toolSelect();
+      // only tools that can RUN and write the draft file; a clipboard app cannot
+      [].slice.call(sel.options).forEach(function(o){ if(terms.indexOf(o.value) < 0) sel.removeChild(o); });
+      if(terms.indexOf(sel.value) < 0) sel.value = terms[0];
+      sel.setAttribute('aria-label', 'Coding tool that drafts the plan ticket');
+      act.appendChild(sel);
+    }
+    panel.appendChild(head); panel.appendChild(act); panel.appendChild(msg);
+    anchor.parentNode.insertBefore(panel, anchor);
+    ticketControls(P0, act, say, panel);
+  })();
 
   // Watch for the draft the session is writing. Recorded in sessionStorage so a
   // reload mid-drafting resumes the watch instead of leaving you to remember to
@@ -3177,11 +3289,12 @@ JS = r"""
           }
           box.innerHTML = '';
           var done = document.createElement('div'); done.className = 'dstatus ok';
-          done.innerHTML = 'Created <b>' + d.key + '</b> and recorded it on this phase' +
+          done.innerHTML = 'Created <b>' + d.key + '</b> and recorded it on this ' +
+            (p.id === '_plan' ? 'plan' : 'phase') +
             (d.linked ? '' : ' (writing it to progress.toml failed: ' + d.link_error + ')') +
             ' — <a href="' + d.url + '" target="_blank" rel="noopener">open it ↗</a>';
           box.appendChild(done);
-          window.__PCC_PHASES__[p.id].jira = d.key;
+          if(window.__PCC_PHASES__ && window.__PCC_PHASES__[p.id]) window.__PCC_PHASES__[p.id].jira = d.key;
           setTimeout(function(){ location.reload(); }, 2500);
         });
       });
@@ -3500,6 +3613,12 @@ def action_layer(token: str, model: dict) -> str:
         "window.__ANU_FRESH0__=" + _pr.js(fresh_stamp()) + ";"
         "window.__ANU_ITEMS__=" + _pr.js(idx) + ";"
         "window.__ANU_PHASE_GAP__=" + _pr.js(phase_gap(model)) + ";"
+        "window.__ANU_PLAN__=" + _pr.js({
+            "id": PLAN_ID, "name": (model.get("project") or {}).get("plan", "the plan"),
+            "jira": model.get("plan_ticket", ""),
+            "jira_create_tmpl": ("" if model.get("plan_ticket") else
+                                 ((CFG.get("integrations", {}) or {}).get("jira", {}) or {})
+                                 .get("create_url", ""))}) + ";"
         "window.__ANU_PROFILE_TOOL__=" + _pr.js(
             (_pr.load_user_profile() or {}).get("tool", "")) + ";"
         "window.__ANU_PROVIDERS__=" + _pr.js(

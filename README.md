@@ -49,7 +49,7 @@ once: a session that already holds it gets only the next item.
 | re-explaining the phase to a session that already knows it | click **Send to phase session** — only the item goes, into the same conversation |
 | leaving the terminal to fetch the next item | type `/next-item 0` — the session pulls it from the live checklist |
 | an agent running off in the wrong direction | the session posts a plain brief — decisions numbered, outcomes each with a check — and **waits for your confirmation** before touching anything |
-| writing a ticket from scratch | click **Draft ticket**, review, create — key written back |
+| writing a ticket from scratch | click **Draft ticket** on the plan, review, create — key written back |
 | rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
 | chasing "is your checkout the same as mine?" | teammates get a launch command for *their* machine |
 | a standup document | `--standup` writes it from the snapshot diff |
@@ -59,7 +59,7 @@ once: a session that already holds it gets only the next item.
 | | |
 |---|---|
 | **Coding agents** | Claude Code, Codex, opencode, Cursor, VS Code — detected on PATH; one phase session per tool, resumed by id (Claude Code, opencode) or as the last session (Codex) |
-| **Issue tracking** | JIRA Cloud and Server/DC — draft, review, create over the API, key recorded on the phase |
+| **Issue tracking** | JIRA Cloud and Server/DC — one ticket per plan: draft, review, create over the API, key recorded on the plan |
 | **Knowledge** | any MCP provider (stateless or stateful HTTP) as a `[[context]]`, its usage rules injected into every session prompt |
 | **Your repo** | git activity per phase, checkbox write-back, `--check` contract lint |
 | **Your services** | TCP reachability probes across one or more hosts, adopted as context providers |
@@ -106,8 +106,9 @@ found that changes the approach, the decisions it needs from you (numbered, each
 options and a recommendation, so you can answer "1A, 2 default"), the steps it will take,
 how you will know it is done (each outcome with a named check), and what it will leave
 alone. Then it asks *"confirm these steps, or redirect me?"* and waits — no code, no
-file edits, until you confirm. Ask a session
-to draft a JIRA ticket, review it, and create it.
+file edits, until you confirm. Above the phases, the plan has one ticket of its own: a
+session drafts it from the whole plan, you review it, and create it or link an existing
+key.
 
 **One phase session, told the phase once.** Every prompt has two shapes. The *cold*
 one carries the phase — doc, exit test, modules, open items, the protocol — and goes
@@ -269,7 +270,9 @@ exit_test  = "curl /health -> 200"
 modules    = ["services/ingest"]    # paths; the phase shows git activity under them
 test       = "smoke"                # id of an [[action]] — never a command itself
 owner      = "alice"
-jira       = "PROJ-101"
+
+[plans."PLAN.md"]                   # per-plan settings: one ticket for the whole plan
+jira = "PROJ-101"
 
 [[action]]                          # the Run buttons
 id = "smoke"; label = "Smoke tests"; kind = "argv"; args = ["npm", "test"]

@@ -1491,6 +1491,36 @@ def plan_slug(plan: str) -> str:
     return f"{stem}-{hashlib.sha1(plan_key(plan).encode('utf-8')).hexdigest()[:6]}"
 
 
+def plan_header(plan: str) -> str:
+    """The per-plan table's header: [plans."<plan file>"]."""
+    return "[plans." + _toml_str(str(plan)) + "]"
+
+
+def plan_ticket(cfg: dict) -> str:
+    """The ACTIVE plan's ticket key, from its [plans."<file>"] table."""
+    plan = active_plan(cfg)
+    for k, v in (cfg.get("plans") or {}).items():
+        if isinstance(v, dict) and plan_key(k) == plan_key(plan):
+            return str(v.get("jira") or "")
+    return ""
+
+
+def del_toml_key(text: str, header: str, key: str, note: str = "") -> str:
+    """Comment out one key in one section - kept as a record, like unlinking a
+    phase's ticket. A section or key that is absent is not an error."""
+    span = _section_body(text, header)
+    if span is None:
+        return text
+    a, b = span
+    body = text[a:b]
+    m = re.search(r"^([ \t]*)(" + re.escape(key) + r"\s*=.*?)(\r?\n|$)", body, re.M)
+    if not m:
+        return text
+    tail = f"    # {note}" if note else ""
+    return (text[:a] + body[:m.start()] + f"{m.group(1)}# {m.group(2).rstrip()}{tail}{m.group(3)}"
+            + body[m.end():] + text[b:])
+
+
 def known_plans(cfg: dict) -> list[str]:
     """The active plan first, then every plan a [[phase]] block is tagged with."""
     seen, out = set(), []
@@ -1904,8 +1934,8 @@ def _phase_context(p: dict, plan_name: str) -> str:
     bits = [f"Context: {_source(p, plan_name)}."]
     if p.get("modules"):
         bits.append("Modules: " + ", ".join(p["modules"]) + ".")
-    if p.get("jira"):
-        bits.append(f"Ticket: {p['jira']}.")
+    if p.get("jira") or p.get("plan_ticket"):
+        bits.append(f"Ticket: {p.get('jira') or p.get('plan_ticket')}.")
     return " ".join(bits)
 
 
@@ -1924,8 +1954,8 @@ def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
     lines = [f"- Read now: {doc}.",
              f"- Exit test: {p.get('exit_test') or 'see plan'}",
              "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
-    if p.get("jira"):
-        lines.append(f"- Ticket: {p['jira']} - reference it in commits.")
+    if p.get("jira") or p.get("plan_ticket"):
+        lines.append(f"- Ticket: {p.get('jira') or p.get('plan_ticket')} - reference it in commits.")
     if p.get("blocked_by"):
         lines.append("- NOTE: depends on Phase " + ", Phase ".join(p["blocked_by"]) +
                      ", not finished - read in and prepare, but expect to be gated.")
@@ -2029,8 +2059,8 @@ def phase_brief(p: dict, plan_name: str, providers: list) -> str:
              f"- Phase context: {_source(p, plan_name)}",
              f"- Exit test: {p.get('exit_test') or 'see plan'}",
              "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
-    if p.get("jira"):
-        facts.append(f"- Ticket: {p['jira']}")
+    if p.get("jira") or p.get("plan_ticket"):
+        facts.append(f"- Ticket: {p.get('jira') or p.get('plan_ticket')}")
     if p.get("depends_on"):
         facts.append("- Depends on: Phase " + ", Phase ".join(str(x) for x in p["depends_on"]))
     if p.get("dependents"):
@@ -2481,6 +2511,7 @@ def build(repo: Path) -> dict:
         # the launcher is known - here both are just built.
         plan_name, providers = proj.get("plan", "the plan"), cfg.get("context", [])
         p["items_mode"] = mode
+        p["plan_ticket"] = plan_ticket(cfg)
         p["source"] = phase_source(p, plan_name, plan_text, sections, repo)
         p["tick_file"] = tick_file_of(p, plan_name)
         p["prompt"] = phase_prompt(p, plan_name, providers)
@@ -2508,6 +2539,7 @@ def build(repo: Path) -> dict:
         "phases": phases,
         "items_mode": mode,
         "plans": known_plans(raw_cfg),
+        "plan_ticket": plan_ticket(raw_cfg),
         "levels": levels,
         "groups": groups,
         "ready": ready,
@@ -3557,6 +3589,12 @@ def render(d: dict) -> str:
     # blocked one, which is exactly when reading yourself in is worth doing.
     jtmpl = d.get("jira", {}).get("browse_url", "")
     ctmpl_all = d.get("jira", {}).get("create_url", "")
+    _pt = d.get("plan_ticket") or ""
+    _pt_url = (_pt if _pt.startswith("http") else
+               (d.get("jira", {}).get("browse_url", "") or "").replace("{key}", _pt)) if _pt else ""
+    plan_ticket_html = ("" if not _pt else
+                        " · " + (f'<a href="{e(_pt_url)}" target="_blank" rel="noopener">{e(_pt)} ↗</a>'
+                                 if _pt_url else e(_pt)))
     pdata = {}
     for p in d["phases"]:
         jurl = ""
@@ -3605,7 +3643,7 @@ def render(d: dict) -> str:
 <div class="wrap">
 <header>
   <div>
-    <div class="eyebrow">Control Center · {e(P.get('plan','plan'))}</div>
+    <div class="eyebrow">Control Center · {e(P.get('plan','plan'))}{plan_ticket_html}</div>
     <h1>{e(P['name'])}</h1>
     <div class="sub">{e(P.get('subtitle',''))}</div>
   </div>
