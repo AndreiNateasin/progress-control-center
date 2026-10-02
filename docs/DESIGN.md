@@ -229,7 +229,13 @@ token rather than losing one.
 A plan may declare its own agent in its `[plans."<file>".agent]` table: a name, a
 description that doubles as the trigger phrase, an optional model, and `sources`
 — files or globs, folders, URLs, MCP server names and prior plans. That table is
-the only hand-written piece. On render the generator resolves the sources (which
+the only hand-written piece, and Setup → *This project* writes it for you: an
+Agent block with the name, the description, the lists with Browse, a checklist of
+the MCP servers the project declares, and *Suggest sources*, which offers paths
+the plan mentions, the phases' modules, decision records that name the plan and
+the project's other plans as ticks — nothing is written until Save. Save regenerates
+the agent files and reports which sources resolved. *Remove agent* comments the
+tables out under a dated banner; the generated files are left for you. On render the generator resolves the sources (which
 files a glob matched, whether a path exists, where an MCP name is declared, a
 change stamp), writes the agent body as a pointer list in the llms.txt shape with
 missing sources flagged rather than dropped, and projects it into

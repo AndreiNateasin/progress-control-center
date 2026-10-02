@@ -4331,6 +4331,163 @@ SETUP_JS = r"""
     });
     redraw();
 
+    // ---- The plan's agent: defined here, generated from here. ------------
+    // One object per plan in docs/progress.toml; this block edits it. Sources
+    // are POINTERS (paths, globs, URLs, MCP names, prior plans) - the agent
+    // reads them on demand, nothing is copied anywhere.
+    var A = P.agent || null;
+    var agentState = {remove: false};
+    if(A){
+      var abody = el('div',{class:'abody'});
+      var ahead = el('h3',{text:'Agent for this plan'});
+      ahead.style.cssText = 'margin:18px 0 4px;font-size:13px';
+      box.appendChild(ahead);
+      box.appendChild(el('div',{class:'why',html:
+        'A named agent whose knowledge base is this plan\u2019s. Saved as '+
+        '<code>[plans."'+esc(A.plan)+'".agent]</code>; Save then writes '+
+        '<code>.claude/agents/&lt;name&gt;.md</code> and <code>.opencode/agents/&lt;name&gt;.md</code>, '+
+        'and cold launches of those tools start as the agent. '+
+        (A.declared ? 'Currently <b>'+esc(A.name)+'</b>'+
+           (A.file_claude||A.file_opencode ? ' \u00b7 files for '+[A.file_claude?'claude':'',A.file_opencode?'opencode':''].filter(Boolean).join(', ') : ' \u00b7 no files yet')+'.'
+         : 'This plan has <b>no agent yet</b>.')}));
+      var enable = el('input',{type:'checkbox',id:'p-ag-on'}); enable.checked = A.declared;
+      var enableRow = el('div',{class:'row'},[enable, el('label',{class:'k',text:'Define an agent',for:'p-ag-on'}),
+        el('div',{class:'v'},[el('div',{class:'why',text:'ticked: the fields below are saved with the config; unticked: nothing about the agent is sent'})])]);
+      box.appendChild(enableRow);
+      box.appendChild(abody);
+      function arow(label, ctl, why){
+        var v = el('div',{class:'v'}); v.appendChild(ctl);
+        if(why) v.appendChild(el('div',{class:'why',html:why}));
+        return el('div',{class:'row'},[el('span'), el('label',{class:'k',text:label}), v]);
+      }
+      abody.appendChild(arow('Name', inp('p-ag-name', A.name, 'plan-my-topic'),
+        'lowercase letters, digits and dashes \u2014 it becomes the file name and the <code>--agent</code> argument'));
+      var desc = el('textarea',{id:'p-ag-desc',rows:'2',placeholder:'Owns the X migration. Use for anything touching A, B or C.'});
+      desc.value = A.description || '';
+      abody.appendChild(arow('Description', desc,
+        'doubles as the <b>trigger phrase</b>: name the topics it owns, so a tool picks it for matching work'));
+      abody.appendChild(arow('Model', inp('p-ag-model', A.model, 'optional \u2014 e.g. opus'),
+        'optional; Claude Code takes a model alias, opencode a provider/model id'));
+
+      // one-per-line lists with Browse, and checkable suggestions beneath
+      var S = A.sources || {}, C = A.candidates || {};
+      function listArea(id, kind, lines, ph, want){
+        var ta = el('textarea',{id:id,rows:'3',placeholder:ph,spellcheck:'false'});
+        ta.value = (lines||[]).join('\n');
+        var wrap = el('div',{},[ta]);
+        if(want){
+          var bar = el('div',{class:'bar'});
+          var probe = el('input',{type:'hidden'});
+          bar.appendChild(pathPicker(probe, want, E.repo));
+          function take(){
+            var v = (probe.value||'').trim(); if(!v) return;
+            v = v.replace(/\\/g,'/');
+            if(want === 'dir' && !/\/$/.test(v)) v += '/';
+            var cur = ta.value.split('\n').map(function(s){return s.trim()}).filter(Boolean);
+            if(cur.indexOf(v) < 0){ cur.push(v); ta.value = cur.join('\n'); ta.dispatchEvent(new Event('input',{bubbles:true})); }
+            probe.value = '';
+          }
+          probe.addEventListener('input', take); probe.addEventListener('change', take);
+          wrap.appendChild(bar);
+        }
+        var sug = el('div',{class:'why'}); wrap.appendChild(sug);
+        wrap._ta = ta; wrap._sug = sug; wrap._kind = kind;
+        return wrap;
+      }
+      function chips(wrap, items, label){
+        wrap._sug.textContent = '';
+        if(!items || !items.length){ return; }
+        var cur = wrap._ta.value.split('\n').map(function(s){return s.trim()});
+        var fresh = items.filter(function(x){ return cur.indexOf(x) < 0; });
+        if(!fresh.length){ return; }
+        wrap._sug.appendChild(el('span',{text: label + ' '}));
+        fresh.forEach(function(x){
+          var c = el('label',{class:'chip',style:'cursor:pointer;margin:2px 4px 2px 0;display:inline-block'});
+          var cb = el('input',{type:'checkbox'}); cb.style.marginRight='4px';
+          c.appendChild(cb); c.appendChild(document.createTextNode(x));
+          cb.addEventListener('change', function(){
+            var lines = wrap._ta.value.split('\n').map(function(s){return s.trim()}).filter(Boolean);
+            var i = lines.indexOf(x);
+            if(cb.checked && i < 0) lines.push(x);
+            if(!cb.checked && i >= 0) lines.splice(i,1);
+            wrap._ta.value = lines.join('\n');
+            wrap._ta.dispatchEvent(new Event('input',{bubbles:true}));
+          });
+          wrap._sug.appendChild(c);
+        });
+      }
+      var wFiles = listArea('p-ag-files','files', S.files, 'docs/decisions/01[4-9]-*.md\none path or glob per line', 'md');
+      var wDirs  = listArea('p-ag-dirs','dirs', S.dirs, 'modules/connect/\none folder per line', 'dir');
+      var wUrls  = listArea('p-ag-urls','urls', S.urls, 'https://docs.example.com/\none URL per line \u2014 listed for the agent, never fetched here', null);
+      var wPlans = listArea('p-ag-plans','plans', S.plans, 'OLD-PLAN.md\nprior plans, read-only context', 'md');
+      abody.appendChild(arow('Files', wFiles, 'paths or globs, relative to the repo'));
+      abody.appendChild(arow('Folders', wDirs, ''));
+      abody.appendChild(arow('URLs', wUrls, ''));
+      // MCP: a checklist of what the project already declares, plus free names
+      var mcpWrap = el('div',{});
+      var mcpKnown = (C.mcp||[]).slice();
+      (S.mcp||[]).forEach(function(n){ if(mcpKnown.indexOf(n)<0) mcpKnown.push(n); });
+      mcpKnown.forEach(function(n){
+        var c = el('label',{class:'chip',style:'cursor:pointer;margin:2px 6px 2px 0;display:inline-block'});
+        var cb = el('input',{type:'checkbox'}); cb.value = n; cb.className='p-ag-mcp'; cb.checked = (S.mcp||[]).indexOf(n)>=0;
+        cb.style.marginRight='4px'; c.appendChild(cb); c.appendChild(document.createTextNode(n));
+        mcpWrap.appendChild(c);
+      });
+      if(!mcpKnown.length) mcpWrap.appendChild(el('span',{class:'why',text:'no MCP servers declared in [[context]], .mcp.json or opencode.json'}));
+      abody.appendChild(arow('MCP servers', mcpWrap, 'from <code>[[context]]</code>, <code>.mcp.json</code> and <code>opencode.json</code>; opencode is allowed only these'));
+      abody.appendChild(arow('Prior plans', wPlans, 'other plans of this project, as read-only context'));
+
+      // suggest: from the plan text, the phases' modules, decision records
+      var sbar = el('div',{class:'bar'});
+      var suggest = el('button',{class:'act',text:'Suggest sources'});
+      suggest.title = 'Offer paths the plan mentions, the phases\u2019 modules, decision records that name the plan, every declared MCP server and the other plans \u2014 as ticks, nothing is written';
+      suggest.addEventListener('click', function(){
+        chips(wFiles, C.files, 'mentioned in the plan or naming it:');
+        chips(wDirs,  C.dirs,  'folders the plan or its phases name:');
+        chips(wPlans, C.plans, 'other plans:');
+        document.querySelectorAll('.p-ag-mcp').forEach(function(cb){ if(!cb.checked) cb.parentNode.style.outline='1px dashed var(--accent)'; });
+        var n = (C.files||[]).length + (C.dirs||[]).length + (C.plans||[]).length + (C.mcp||[]).length;
+        say('#sw-pmsg', n ? n + ' suggestion(s) shown as ticks \u2014 tick what applies, then Save' : 'nothing to suggest: the plan names no existing paths and no decision record names it', n ? '' : 'err');
+      });
+      sbar.appendChild(suggest);
+      if(A.declared){
+        var rm = el('button',{class:'act',text:'Remove agent'});
+        rm.title = 'Comments the agent tables out of docs/progress.toml on Save (dated, not deleted); the generated files are left for you to delete';
+        rm.addEventListener('click', function(){
+          agentState.remove = !agentState.remove;
+          rm.textContent = agentState.remove ? 'Removal pending \u2014 click to keep' : 'Remove agent';
+          abody.style.opacity = agentState.remove ? '.45' : '';
+          say('#sw-pmsg', agentState.remove ? 'the agent will be removed on Save' : 'removal cancelled', '');
+          $('#sw-writecard').classList.add('dirty');
+        });
+        sbar.appendChild(rm);
+      }
+      abody.appendChild(arow('', sbar, ''));
+
+      // how the declared sources resolve right now
+      if(A.declared && (A.resolved||[]).length){
+        var res = el('div',{class:'why'});
+        res.innerHTML = '<b>Now:</b> ' + A.resolved.map(function(s){
+          var st = s.ok === true ? 'ok' : (s.ok === false ? 'MISSING' : 'listed');
+          return '<code>'+esc(s.spec)+'</code> '+(s.kind==='file' && s.ok ? s.paths.length+' file'+(s.paths.length===1?'':'s') : st);
+        }).join(' \u00b7 ');
+        abody.appendChild(arow('', res, ''));
+      }
+      function syncEnable(){ abody.style.display = enable.checked ? '' : 'none'; }
+      enable.addEventListener('change', function(){ syncEnable(); $('#sw-writecard').classList.add('dirty'); say('#sw-pmsg','Unsaved changes.',''); });
+      syncEnable();
+    }
+    window.__agentPayload__ = function(){
+      if(!A) return null;
+      if(agentState.remove) return {remove: true};
+      if(!$('#p-ag-on') || !$('#p-ag-on').checked) return null;
+      function lines(id){ var n=$('#'+id); return n ? n.value.split('\n').map(function(s){return s.trim()}).filter(Boolean) : []; }
+      return {name: val('p-ag-name'), description: ($('#p-ag-desc')||{}).value||'', model: val('p-ag-model'),
+              sources: {files: lines('p-ag-files'), dirs: lines('p-ag-dirs'), urls: lines('p-ag-urls'),
+                        mcp: [].slice.call(document.querySelectorAll('.p-ag-mcp')).filter(function(c){return c.checked}).map(function(c){return c.value}),
+                        plans: lines('p-ag-plans')}};
+    };
+
     if(P.actions.length) $('#sw-actions').innerHTML =
       'This project defines <b>'+P.actions.length+'</b> run command(s): <code>'+
       P.actions.join('</code> <code>')+'</code>. The wizard cannot add or change those \u2014 '+
@@ -4562,7 +4719,7 @@ SETUP_JS = r"""
     // invalidates a diff the user should no longer trust.
     function disarm(){ diff($('#sw-diff'),''); }
     $('#sw-preview').addEventListener('click',function(){
-      api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:false})
+      api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),agent:(window.__agentPayload__?window.__agentPayload__():null),apply:false})
         .then(function(d){
           if(!d.ok){say('#sw-pmsg',d.error,'err');diff($('#sw-diff'),'');return}
           diff($('#sw-diff'),d.diff);
@@ -4576,10 +4733,21 @@ SETUP_JS = r"""
       // one a preview predicted - which is the stronger guarantee anyway.
       var b = this;
       b.disabled = true;
-      api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),apply:true})
+      api('/api/setup/project',{fields:projFields(),contexts:pickedContexts(),agent:(window.__agentPayload__?window.__agentPayload__():null),apply:true})
         .then(function(d){
           b.disabled = false;
           if(!d.ok){ say('#sw-pmsg',d.error,'err'); return }
+          if(d.agent_files){
+            var af = d.agent_files, ar = d.agent_resolved;
+            var bits = [];
+            if(af.written && af.written.length) bits.push('agent files written: ' + af.written.join(', '));
+            if(af.skipped && af.skipped.length) bits.push(af.skipped.join('; '));
+            if(ar) bits.push(ar.name + ': ' + ar.sources + ' source' + (ar.sources===1?'':'s') + (ar.missing.length ? ', MISSING: ' + ar.missing.join(', ') : ', all found'));
+            if(af.error) bits.push('agent files: ' + af.error);
+            if(bits.length) setTimeout(function(){ say('#sw-pmsg', 'Saved. ' + bits.join(' \u00b7 '), (ar && ar.missing.length) || af.error ? 'err' : 'ok'); }, 0);
+            // the view (resolved sources, file state) is stale after a write
+            setTimeout(function(){ load(); }, 1500);
+          }
           if(!d.changed){
             diff($('#sw-diff'),'');
             say('#sw-pmsg','Nothing to save - already up to date.','');
@@ -4880,8 +5048,22 @@ def setup_project(body: dict) -> dict:
     command must go through the trust prompt on a restart, not a form post."""
     r = _pr.apply_project_edits(REPO, body.get("fields") or {},
                                 body.get("contexts") or [],
-                                dry_run=not body.get("apply"))
+                                dry_run=not body.get("apply"),
+                                agent=body.get("agent") if isinstance(body.get("agent"), dict) else None)
     if r.get("ok") and r.get("written"):
+        # The agent files follow the config: regenerate them now and say what
+        # resolved, so a typo in a source is seen here and not at launch.
+        try:
+            refresh_cfg()
+            m = build(REPO)
+            ag = _pr.write_agent_files(m, REPO)
+            r["agent_files"] = ag
+            if m.get("agent"):
+                r["agent_resolved"] = {"name": m["agent"]["name"],
+                                       "sources": len(m["agent"]["resolved"]),
+                                       "missing": m["agent"]["missing"]}
+        except Exception as exc:          # noqa: BLE001 - the save itself succeeded
+            r["agent_files"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         try:
             CFG.clear()
             CFG.update(tomllib.loads((REPO / "docs" / "progress.toml").read_text(encoding="utf-8")))

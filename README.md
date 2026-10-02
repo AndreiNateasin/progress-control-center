@@ -58,7 +58,7 @@ once: a session that already holds it gets only the next item.
 
 | | |
 |---|---|
-| **Plan agents** | one named agent per plan, generated for Claude Code and opencode from a source list you declare once: files, folders, URLs, MCP servers, prior plans |
+| **Plan agents** | one named agent per plan, defined in Setup (with suggested sources) or in the config, generated for Claude Code and opencode from a source list you declare once: files, folders, URLs, MCP servers, prior plans |
 | **Coding agents** | Claude Code, Codex, opencode, Cursor, VS Code — detected on PATH; one phase session per tool, resumed by id (Claude Code, opencode) or as the last session (Codex) |
 | **Issue tracking** | JIRA Cloud and Server/DC — one ticket per plan: draft, review, create over the API, key recorded on the plan |
 | **Knowledge** | any MCP provider (stateless or stateful HTTP) as a `[[context]]`, its usage rules injected into every session prompt |

@@ -332,6 +332,8 @@ def _toml_val(v) -> str:
         return "true" if v else "false"
     if isinstance(v, (int, float)):
         return str(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_str(str(x)) for x in v) + "]"
     return _toml_str(v)
 
 
@@ -840,6 +842,7 @@ def detect_environment(repo: Path) -> dict:
                           "auth_env": c.get("auth_env", ""),
                           "probe": bool(c.get("probe"))} for c in cfg.get("context", [])],
             "actions": [a.get("id", "") for a in cfg.get("action", [])],
+            "agent": agent_setup_view(repo, cfg) if cfgp.exists() else None,
         },
     }
 
@@ -873,7 +876,7 @@ _KEYNAME = {"jira_browse": "browse_url", "jira_create": "create_url",
 
 
 def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
-                        dry_run: bool = True) -> dict:
+                        dry_run: bool = True, agent: dict | None = None) -> dict:
     """Apply wizard changes to docs/progress.toml, or preview them.
 
     Returns a unified diff either way. This file is COMMITTED, so a wizard that
@@ -928,6 +931,19 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
         text += context_block(nm, str(c.get("label", nm)), str(c.get("kind", "prompt-only")),
                               url, str(c.get("auth_env", "")), bool(c.get("probe", True)))
         notes.append(f"[[context]] + {nm} -> {url}")
+
+    if isinstance(agent, dict) and agent:
+        try:
+            import datetime as _dt
+            cur_plan = (tomllib.loads(text).get("project") or {}).get("plan", "")
+            if not isinstance(cur_plan, str) or not cur_plan:
+                return {"ok": False, "error": "no plan is set, so there is nothing to attach an agent to"}
+            text, agent_notes = apply_agent_edit(text, cur_plan, agent, _dt.date.today().isoformat())
+            notes.extend(agent_notes)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        except tomllib.TOMLDecodeError as exc:
+            return {"ok": False, "error": f"config unparsable before the agent edit: {exc}"}
 
     # The plan drives the phases: after every save the effective plan's
     # headings are reconciled into [[phase]] blocks, so picking a plan is
@@ -1768,6 +1784,137 @@ def write_agent_files(d: dict, repo: Path) -> dict:
     except OSError as exc:
         skipped.append(f"manifest: {exc}")
     return {"ok": True, "agent": a["name"], "written": written, "skipped": skipped}
+
+
+def comment_section(text: str, header: str, note: str = "") -> str:
+    """Comment a whole section out, under a dated banner - the same instinct
+    as retiring a phase: the committed file keeps the record. Absent: no-op."""
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, l in enumerate(lines) if l.strip() == header), None)
+    if start is None:
+        return text
+    end = start + 1
+    while end < len(lines):
+        s = lines[end].strip()
+        if s.startswith("[") and not s.startswith("#"):
+            break
+        end += 1
+    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+        end -= 1
+    banner = f"# --- {note} ---\n" if note else ""
+    body = ["# " + l if l.strip() else l for l in lines[start:end]]
+    return "".join(lines[:start]) + banner + "".join(body) + "".join(lines[end:])
+
+
+def agent_suggestions(repo: Path, cfg: dict) -> dict:
+    """Sources worth offering for the active plan's agent, from what is
+    already written down: paths the plan text mentions that exist, the
+    phases' modules, decision records that name the plan, every declared
+    MCP server, and the project's other plans. Offered, never written."""
+    repo = repo.resolve()
+    plan = active_plan(cfg)
+    files, dirs = [], []
+    seen = set()
+
+    def offer(rel: str):
+        rel = rel.replace("\\", "/").strip("`'\"()[]<>,.;:")
+        if not rel or rel in seen or plan_key(rel) == plan_key(plan):
+            return
+        p = repo / rel
+        try:
+            if p.is_dir():
+                seen.add(rel); dirs.append(rel.rstrip("/") + "/")
+            elif p.is_file():
+                seen.add(rel); files.append(rel)
+        except OSError:
+            pass
+
+    try:
+        text = (repo / plan).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    for m in re.finditer(r"(?<![\w/])((?:[\w.-]+/)+[\w.-]*|[\w-]+\.(?:md|toml|json|ya?ml|cs|ts|py|csproj))", text):
+        if len(files) + len(dirs) >= 40:
+            break
+        offer(m.group(1))
+    for p in scope_phases(cfg).get("phase") or []:
+        for mod in p.get("modules") or []:
+            offer(str(mod))
+    stem = Path(plan).stem.lower()
+    for d in ("docs/decisions", "docs/adr", "decisions", "adr"):
+        dd = repo / d
+        if not dd.is_dir():
+            continue
+        for f in sorted(dd.glob("*.md"))[:200]:
+            try:
+                body = f.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if stem in body or Path(plan).name.lower() in body:
+                offer(f.relative_to(repo).as_posix())
+    return {"files": files, "dirs": dirs,
+            "mcp": sorted(_mcp_servers_declared(repo, cfg)),
+            "plans": [p for p in known_plans(cfg) if plan_key(p) != plan_key(plan)]}
+
+
+def agent_setup_view(repo: Path, cfg: dict) -> dict:
+    """What the Setup page needs: the declared agent (or a prefilled blank),
+    how each declared source resolves now, and the candidates to pick from."""
+    a = plan_agent(cfg)
+    plan = active_plan(cfg)
+    view = {"declared": bool(a), "plan": plan,
+            "name": a["name"] if a else "plan-" + re.sub(r"[^a-z0-9-]+", "-", Path(plan).stem.lower()).strip("-")[:40],
+            "description": a["description"] if a else "",
+            "model": a["model"] if a else "",
+            "sources": a["sources"] if a else {k: [] for k in SOURCE_KINDS},
+            "resolved": resolve_sources(repo, a, cfg) if a else [],
+            "candidates": agent_suggestions(repo, cfg)}
+    for t, d in (("claude", ".claude"), ("opencode", ".opencode")):
+        view[f"file_{t}"] = (repo / d / "agents" / (view["name"] + ".md")).is_file()
+    return view
+
+
+def apply_agent_edit(text: str, plan: str, agent: dict, today: str) -> tuple[str, list[str]]:
+    """Write (or remove) the active plan's agent tables in the config text.
+
+    `agent` is the wizard's object: name, description, model, sources{kind: [..]}
+    - or {"remove": true}. The name is sanitised the way plan_agent reads it,
+    so the config holds exactly the name the files will carry.
+    """
+    notes: list[str] = []
+    head, shead = plan_header(plan)[:-1] + ".agent]", plan_header(plan)[:-1] + ".agent.sources]"
+    if agent.get("remove"):
+        new = comment_section(text, shead, "")
+        new = comment_section(new, head, f"agent of {plan} removed {today} - history, not config")
+        if new != text:
+            notes.append(f"agent removed from {plan} (tables commented out)")
+        return new, notes
+    raw = str(agent.get("name") or "").strip()
+    name = re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")[:48]
+    if not name:
+        raise ValueError("the agent needs a name (lowercase letters, digits and '-')")
+    desc = str(agent.get("description") or "").strip()
+    if not desc:
+        raise ValueError("the agent needs a description - it is the phrase that triggers it")
+    text = set_toml_key(text, head, "name", name)
+    text = set_toml_key(text, head, "description", desc)
+    model = str(agent.get("model") or "").strip()
+    if model:
+        text = set_toml_key(text, head, "model", model)
+    else:
+        text = del_toml_key(text, head, "model")
+    src = agent.get("sources") if isinstance(agent.get("sources"), dict) else {}
+    for kind in SOURCE_KINDS:
+        vals = src.get(kind) or []
+        vals = [str(v).strip() for v in (vals if isinstance(vals, list) else [vals]) if str(v).strip()]
+        seen, uniq = set(), []
+        for v in vals:
+            if v not in seen:
+                seen.add(v); uniq.append(v)
+        text = set_toml_key(text, shead, kind, uniq)
+    notes.append(f"agent {name} for {plan}: " +
+                 ", ".join(f"{len(src.get(k) or [])} {k}" for k in SOURCE_KINDS))
+    return text, notes
 
 
 def known_plans(cfg: dict) -> list[str]:
