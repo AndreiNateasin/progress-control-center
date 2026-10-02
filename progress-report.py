@@ -3238,7 +3238,7 @@ details.promptfold pre{white-space:pre-wrap;font-family:var(--mono);font-size:11
   padding:2.5px 7px;border-radius:999px;background:var(--todo-soft);color:var(--ink-2);white-space:nowrap;font-weight:600}
 .pill.done{background:var(--done-soft);color:var(--done)}
 .pill.active{background:var(--accent-soft);color:var(--accent)}
-.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}.pill.sha{text-transform:none;letter-spacing:0}
 .pill.crit{background:var(--crit-soft);color:var(--crit)}
 
 /* gantt */
@@ -4206,15 +4206,12 @@ def prev_snapshot(today: str) -> dict | None:
     return json.loads(files[-1].read_text(encoding="utf-8")) if files else None
 
 
-def standup(d: dict, since_days: int = 1) -> str:
-    """Short, factual 'what moved' report for a daily meeting.
-
-    Built from the snapshot diff and git log — never from prose. If nothing
-    changed it says so; a standup that invents progress is worse than a short one.
-    """
+def standup_data(d: dict, since_days: int = 1) -> dict:
+    """Everything a standup says, computed once: the snapshot diff, the git
+    window, the delta, blockers and what is next. Both renderings (markdown
+    and HTML) read this, so they cannot disagree."""
     prev = prev_snapshot(d["today"])
     since = (date.fromisoformat(d["today"]) - timedelta(days=since_days)).isoformat()
-
     completed, started, regressed = [], [], []
     if prev:
         for p in d["phases"]:
@@ -4232,24 +4229,58 @@ def standup(d: dict, since_days: int = 1) -> str:
                     started.append(entry)
                 elif was == "done" and state != "done":
                     regressed.append(entry)
-
     commits = [c for c in
                (git("log", f"--since={since}", "--pretty=%h|%ad|%s", "--date=short") or "").splitlines() if c]
     files = git("diff", "--stat", f"@{{{since_days} days ago}}", "--", ".") or ""
+    delta = None
+    if prev:
+        delta = {"overall": d["overall"] - prev["overall"],
+                 "remaining": d["remaining_days"] - prev["remaining_days"],
+                 "finish_was": prev["finish_date"], "finish_moved": d["finish_date"] != prev["finish_date"]}
+    phases = []
+    for p in d["phases"]:
+        old = (prev or {}).get("phases", {}).get(p["id"]) if prev else None
+        phases.append({"id": p["id"], "name": p["name"], "status": p["status"], "pct": p["pct"],
+                       "done": p["done"], "total": p["total"], "critical": p.get("critical", False),
+                       "pct_was": old["pct"] if old else None,
+                       "start": p.get("start_date", ""), "end": p.get("end_date", "")})
+    nxt = d["ready"][0] if d["ready"] else None
+    summary = files.strip().splitlines()[-1].strip() if files.strip() else ""
+    return {"today": d["today"], "generated": d["generated"], "since": since, "since_days": since_days,
+            "project": d["project"].get("name", ""), "plan": d["project"].get("plan", ""),
+            "ticket": d.get("plan_ticket", ""), "first": prev is None,
+            "overall": d["overall"], "done_phases": d["done_phases"], "total_phases": d["total_phases"],
+            "remaining_days": d["remaining_days"], "finish_date": d["finish_date"],
+            "current": d["current"], "completed": completed, "started": started, "regressed": regressed,
+            "delta": delta, "phases": phases,
+            "blockers": [r for r in d["risks"] if r["severity"] == "critical"],
+            "warnings": [r for r in d["risks"] if r["severity"] == "warning"],
+            "next": ({"id": nxt["phase"]["id"], "name": nxt["phase"]["name"], "critical": nxt["critical"],
+                      "items": [i["label"] for i in nxt["items"][:5]], "open": len(nxt["items"])} if nxt else None),
+            "commits": [{"sha": c.split("|")[0], "date": c.split("|")[1], "subject": c.split("|", 2)[2]}
+                        for c in commits if c.count("|") >= 2],
+            "files_stat": files.strip(), "files_summary": summary}
 
+
+def standup(d: dict, since_days: int = 1) -> str:
+    """Short, factual 'what moved' report for a daily meeting, as markdown.
+
+    Built from the snapshot diff and git log — never from prose. If nothing
+    changed it says so; a standup that invents progress is worse than a short one.
+    """
+    s = standup_data(d, since_days)
+    completed, started, regressed, prev = s["completed"], s["started"], s["regressed"], not s["first"]
     L = [f"# Standup — {d['today']}", ""]
     cur = d["current"]
     L.append(f"**Focus:** {'Phase ' + cur['id'] + ' — ' + cur['name'] if cur else 'between phases'}"
              f"  ·  **Overall:** {d['overall']}%"
              f"  ·  **Remaining:** {d['remaining_days']}d → {d['finish_date']}")
     L.append("")
-
     if not prev:
         L += ["_First snapshot — no prior state to compare against. "
               "From tomorrow this section reports what actually changed._", ""]
     elif not (completed or started or regressed):
         L += ["**No checklist movement since the last snapshot.**", ""]
-
     if completed:
         L.append(f"### Done ({len(completed)})")
         L += [f"- `P{pid}` {lbl}" for pid, lbl in completed[:12]]
@@ -4264,36 +4295,155 @@ def standup(d: dict, since_days: int = 1) -> str:
         L.append("### Reopened")
         L += [f"- `P{pid}` {lbl}" for pid, lbl in regressed]
         L.append("")
-
-    if prev:
-        dp = d["overall"] - prev["overall"]
-        dr = d["remaining_days"] - prev["remaining_days"]
-        drift = ("finish date unchanged" if d["finish_date"] == prev["finish_date"]
-                 else f"finish moved {prev['finish_date']} → {d['finish_date']}")
-        L += [f"**Delta:** overall {dp:+d}pp · remaining {dr:+d}d · {drift}", ""]
-
-    crit = [r for r in d["risks"] if r["severity"] == "critical"]
-    if crit:
-        L.append(f"### Blockers ({len(crit)})")
-        L += [f"- {r['risk']}" for r in crit[:5]]
+    if s["delta"]:
+        dl = s["delta"]
+        drift = ("finish date unchanged" if not dl["finish_moved"]
+                 else f"finish moved {dl['finish_was']} → {d['finish_date']}")
+        L += [f"**Delta:** overall {dl['overall']:+d}pp · remaining {dl['remaining']:+d}d · {drift}", ""]
+    if s["blockers"]:
+        L.append(f"### Blockers ({len(s['blockers'])})")
+        L += [f"- {r['risk']}" for r in s["blockers"][:5]]
         L.append("")
-
-    if d["ready"]:
-        nxt = d["ready"][0]
-        L += [f"**Next up:** Phase {nxt['phase']['id']} — {nxt['phase']['name']} "
-              f"({len(nxt['items'])} open items"
-              + (", on the critical path" if nxt["critical"] else "") + ")", ""]
-
-    if commits:
-        L.append(f"<details><summary>{len(commits)} commit(s) since {since}</summary>")
+    if s["next"]:
+        n = s["next"]
+        L += [f"**Next up:** Phase {n['id']} — {n['name']} ({n['open']} open items"
+              + (", on the critical path" if n["critical"] else "") + ")", ""]
+    if s["commits"]:
+        L.append(f"<details><summary>{len(s['commits'])} commit(s) since {s['since']}</summary>")
         L.append("")
-        L += [f"- `{c.split('|')[0]}` {c.split('|', 2)[2]}" for c in commits[:15]]
+        L += [f"- `{c['sha']}` {c['subject']}" for c in s["commits"][:15]]
         L += ["", "</details>", ""]
-    if files.strip():
+    if s["files_stat"]:
         L += ["<details><summary>Files changed</summary>", "", "```",
-              files.strip()[-1200:], "```", "", "</details>", ""]
-
+              s["files_stat"][-1200:], "```", "", "</details>", ""]
     return "\n".join(L)
+
+
+STANDUP_CSS = """
+:root{--bg:#FBFCFD;--panel:#FFFFFF;--panel-2:#F3F5F8;--line:#DFE4EC;--ink:#141A22;--ink-2:#48525F;
+ --ink-3:#65707D;--accent:#4B5BD6;--accent-soft:#E6E9FB;--done:#1B7758;--done-soft:#DFF1EA;
+ --warn:#91601B;--warn-soft:#FBEEDA;--crit:#B24139;--crit-soft:#FBE4E2;--todo:#808FA0;--todo-soft:#EDF0F4;
+ --mono:ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;
+ --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
+@media (prefers-color-scheme:dark){:root{--bg:#0E131A;--panel:#161D26;--panel-2:#1D2732;--line:#28323E;
+ --ink:#E8EDF3;--ink-2:#A6B2C0;--ink-3:#84909C;--accent:#8B97F7;--accent-soft:#232A4A;--done:#4FBF95;
+ --done-soft:#12332A;--warn:#E0A855;--warn-soft:#35290F;--crit:#EC7268;--crit-soft:#3A1E1C;--todo:#7E8A97;
+ --todo-soft:#1E262F}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans)}
+.wrap{max-width:880px;margin:0 auto;padding:28px 20px 48px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3)}
+h1{font-size:24px;margin:4px 0 2px}h2{font-size:14px;margin:26px 0 10px;letter-spacing:.02em}
+.sub{color:var(--ink-2);margin:0 0 18px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.tile{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:9px;padding:12px 14px}
+.tile .n{font-family:var(--mono);font-size:22px;font-weight:700;line-height:1.1}.tile .k{font-size:11px;color:var(--ink-3);
+ text-transform:uppercase;letter-spacing:.1em;margin-top:4px}.tile .d{font-size:12px;color:var(--ink-2);margin-top:2px}
+.tile.done{border-left-color:var(--done)}.tile.warn{border-left-color:var(--warn)}.tile.crit{border-left-color:var(--crit)}
+.delta{font-family:var(--mono);font-size:12px}.up{color:var(--done)}.dn{color:var(--crit)}.flat{color:var(--ink-3)}
+ul.moves{list-style:none;padding:0;margin:0}ul.moves li{padding:7px 10px;border:1px solid var(--line);border-radius:7px;
+ background:var(--panel);margin-bottom:6px;display:flex;gap:10px;align-items:baseline}
+.pill{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:5px;
+ background:var(--todo-soft);color:var(--todo);white-space:nowrap}.pill.done{background:var(--done-soft);color:var(--done)}
+.pill.active{background:var(--accent-soft);color:var(--accent)}.pill.crit{background:var(--crit-soft);color:var(--crit)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+th{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);text-align:left;
+ padding:8px 10px;border-bottom:1px solid var(--line);background:var(--panel-2)}td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:0}.num{font-family:var(--mono);font-size:12px;text-align:right;white-space:nowrap}
+.bar{height:6px;background:var(--todo-soft);border-radius:4px;min-width:90px}.bar i{display:block;height:100%;background:var(--done);border-radius:4px}
+.quiet{color:var(--ink-3)}.note{background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:var(--ink-2)}
+details{margin-top:10px}summary{cursor:pointer;color:var(--ink-2);font-size:13px}pre{font:11.5px/1.5 var(--mono);background:var(--panel-2);
+ border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow:auto;white-space:pre-wrap}
+.foot{margin-top:28px;font-size:12px;color:var(--ink-3)}
+@media print{body{background:#fff}.tile,table{break-inside:avoid}}
+"""
+
+
+def standup_html(d: dict, since_days: int = 1) -> str:
+    """The standup as one self-contained page: KPI tiles, what moved, the
+    phases with their change since the snapshot, blockers, next up, activity.
+    No script, no external resource - it has to survive as an attachment."""
+    s = standup_data(d, since_days)
+    cur = s["current"]
+    dl = s["delta"]
+
+    def dtxt(v, unit="", good_up=True):
+        if v is None:
+            return ""
+        cls = "flat" if v == 0 else (("up" if v > 0 else "dn") if good_up else ("dn" if v > 0 else "up"))
+        return f'<span class="delta {cls}">{v:+d}{unit}</span>'
+
+    tiles = [
+        ("done" if s["overall"] == 100 else "", f"{s['overall']}%", "overall",
+         f"{s['done_phases']} of {s['total_phases']} phases complete " + (dtxt(dl["overall"], "pp") if dl else "")),
+        ("", "Phase " + cur["id"] if cur else "—", "current phase", e(cur["name"]) if cur else "nothing in flight"),
+        ("warn" if s["remaining_days"] else "done", f"{s['remaining_days']}d", "remaining",
+         "on the critical path " + (dtxt(dl["remaining"], "d", good_up=False) if dl else "")),
+        ("", e(s["finish_date"]), "projected finish",
+         (("moved from " + e(dl["finish_was"])) if dl and dl["finish_moved"] else "unchanged") if dl else "first snapshot"),
+        ("crit" if s["blockers"] else "", str(len(s["blockers"])), "blockers",
+         f"{len(s['warnings'])} warning(s)"),
+        ("done" if s["completed"] else "", str(len(s["completed"])), "done since last",
+         f"{len(s['started'])} started · {len(s['regressed'])} reopened"),
+    ]
+    tiles_html = "".join(f'<div class="tile {c}"><div class="n">{n}</div><div class="k">{k}</div><div class="d">{dd}</div></div>'
+                         for c, n, k, dd in tiles)
+    names = {p["id"]: p["name"] for p in s["phases"]}
+
+    def moves(title, entries, pill):
+        if not entries:
+            return ""
+        lis = "".join(f'<li><span class="pill {pill}">P{e(pid)}</span><span>{e(lbl)}</span>'
+                      f'<span class="quiet" style="margin-left:auto;white-space:nowrap">{e(names.get(pid, ""))[:40]}</span></li>'
+                      for pid, lbl in entries[:20])
+        more = f'<li class="quiet">…and {len(entries) - 20} more</li>' if len(entries) > 20 else ""
+        return f"<h2>{title} ({len(entries)})</h2><ul class=\"moves\">{lis}{more}</ul>"
+
+    moved = moves("Done", s["completed"], "done") + moves("In progress", s["started"], "active") + moves("Reopened", s["regressed"], "crit")
+    if s["first"]:
+        moved = '<div class="note">First snapshot — no prior state to compare against. From the next run this section reports what actually changed.</div>'
+    elif not moved:
+        moved = '<div class="note">No checklist movement since the last snapshot.</div>'
+
+    rows = ""
+    for p in s["phases"]:
+        dpct = (p["pct"] - p["pct_was"]) if p["pct_was"] is not None else None
+        rows += (f'<tr><td class="num">{e(p["id"])}</td><td>{e(p["name"])}'
+                 + (' <span class="pill crit">critical</span>' if p["critical"] else "") + "</td>"
+                 f'<td><span class="pill {e(p["status"])}">{e(p["status"])}</span></td>'
+                 f'<td class="num">{p["done"]}/{p["total"]}</td>'
+                 f'<td><div class="bar"><i style="width:{p["pct"]}%"></i></div></td>'
+                 f'<td class="num">{p["pct"]}% {dtxt(dpct, "pp") if dpct is not None else ""}</td>'
+                 f'<td class="num quiet">{e(p["start"])} → {e(p["end"])}</td></tr>')
+
+    blockers = ("".join(f'<li><span class="pill crit">blocker</span><span>{e(r["risk"])}'
+                        f'<div class="quiet">{e(r.get("mitigation", "") or r.get("detail", ""))}</div></span></li>'
+                        for r in s["blockers"][:6]))
+    nxt = s["next"]
+    nxt_html = ("" if not nxt else
+                f'<h2>Next up</h2><div class="note"><b>Phase {e(nxt["id"])} — {e(nxt["name"])}</b> · {nxt["open"]} open item(s)'
+                + (" · on the critical path" if nxt["critical"] else "") + "<ul>"
+                + "".join(f"<li>{e(i)}</li>" for i in nxt["items"]) + "</ul></div>")
+    commits = ("".join(f'<li><span class="pill sha">{e(c["sha"])}</span><span>{e(c["subject"])}</span>'
+                       f'<span class="quiet" style="margin-left:auto">{e(c["date"])}</span></li>' for c in s["commits"][:25]))
+    activity = (f'<h2>Activity since {e(s["since"])}</h2>'
+                + (f'<ul class="moves">{commits}</ul>' if commits else '<div class="note">No commits in the window.</div>')
+                + (f'<details><summary>Files changed — {e(s["files_summary"])}</summary><pre>{e(s["files_stat"][-3000:])}</pre></details>'
+                   if s["files_stat"] else ""))
+    ticket = f' · ticket {e(s["ticket"])}' if s["ticket"] else ""
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Standup {e(s["today"])} — {e(s["project"])}</title><style>{STANDUP_CSS}</style></head><body><div class="wrap">'
+            f'<div class="eyebrow">Standup · {e(s["project"])}{ticket}</div><h1>{e(s["today"])}</h1>'
+            f'<p class="sub">Window: since {e(s["since"])} ({s["since_days"]} day{"s" if s["since_days"] != 1 else ""}) · '
+            f'plan {e(s["plan"])} · generated {e(s["generated"])}</p>'
+            f'<div class="tiles">{tiles_html}</div>'
+            f'{moved}'
+            f'<h2>Phases</h2><table><thead><tr><th></th><th>phase</th><th>status</th><th>items</th><th>progress</th><th>%</th><th>window</th></tr></thead><tbody>{rows}</tbody></table>'
+            + (f'<h2>Blockers ({len(s["blockers"])})</h2><ul class="moves">{blockers}</ul>' if blockers else "")
+            + nxt_html + activity +
+            f'<div class="foot">Derived from the plan\'s checkboxes and the git log by the control center; nothing here was typed. '
+            f'Progress is read from {e(s["plan"])} and docs/progress.toml.</div></div></body></html>')
 
 
 def print_ready(d: dict) -> None:
@@ -4493,10 +4643,15 @@ def main() -> int:
         sp = REPO / "docs" / "standups" / f"{d['today']}.md"
         sp.parent.mkdir(parents=True, exist_ok=True)
         sp.write_text(text, encoding="utf-8")
+        # The same facts as a page: tiles, what moved, phases with their
+        # change, blockers, next, activity - self-contained, so it can be
+        # downloaded, mailed or attached to the plan's ticket.
+        hp = sp.with_suffix(".html")
+        hp.write_text(standup_html(d, a.since), encoding="utf-8")
         if not a.quiet:
             print(text)
-        else:
-            print(f"wrote {sp}")
+        print(f"wrote {sp}")
+        print(f"wrote {hp}")
 
     # Snapshot AFTER the standup so the diff compares against the previous day,
     # not against a snapshot this same run just wrote.

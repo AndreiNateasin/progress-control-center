@@ -254,6 +254,17 @@ source list inside the opening brief and the phase brief instead. Sources are
 pointers on purpose: the agent reads on demand, nothing is copied into a prompt,
 and URLs are listed but never fetched by the generator.
 
+## The standup is one computation, two renderings
+
+`--standup` computes what moved once — the snapshot diff, the git window, the
+delta, blockers, what is next — and renders it twice: `docs/standups/<date>.md`
+for the repo and `docs/standups/<date>.html` for people. The page carries its own
+light and dark tokens and no script or external resource, so it survives as a mail
+attachment or on a ticket. The dashboard's Standup button offers it as a page, as a
+download, and — when the plan has a linked ticket and the JIRA API is configured —
+*Attach to <KEY>*, which arms on the first click, uploads the file as an attachment
+and leaves a one-line comment, then reports exactly what JIRA created.
+
 ## Tickets are drafted by a coding session
 
 A ticket belongs to the PLAN, not to each phase: one row above the phases carries

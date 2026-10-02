@@ -52,7 +52,7 @@ once: a session that already holds it gets only the next item.
 | writing a ticket from scratch | click **Draft ticket** on the plan, review, create — key written back |
 | rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
 | chasing "is your checkout the same as mine?" | teammates get a launch command for *their* machine |
-| a standup document | `--standup` writes it from the snapshot diff |
+| a standup document | `--standup` writes it from the snapshot diff: markdown for the repo, and a self-contained HTML report to open, download or attach to the plan's ticket |
 
 ## What it integrates
 

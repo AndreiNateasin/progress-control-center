@@ -2094,6 +2094,110 @@ def _adf(text: str) -> dict:
     return {"type": "doc", "version": 1, "content": content}
 
 
+def _jira_auth_header(t: dict) -> tuple[str, str]:
+    """(Authorization header, "") or ("", error). The token is read on demand
+    and never returned to the page."""
+    token = _read_secret(t["auth_env"])
+    if not token:
+        return "", f"${t['auth_env']} is not set"
+    if t["auth_mode"] == "basic":
+        user = str(((CFG.get("integrations", {}) or {}).get("jira", {}) or {}).get("auth_user", ""))
+        if not user:
+            return "", "auth_mode = basic needs [integrations.jira].auth_user"
+        import base64
+        return "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode(), ""
+    return "Bearer " + token, ""
+
+
+_STANDUP_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2}|latest)\.html$")
+
+
+def standup_file(name: str) -> Path | None:
+    """docs/standups/<date>.html, or the newest for 'latest'. None if absent
+    or the name is not a date - nothing else under docs/ is served this way."""
+    m = _STANDUP_NAME.match(name or "")
+    if not m:
+        return None
+    d = REPO / "docs" / "standups"
+    if m.group(1) == "latest":
+        files = sorted(d.glob("????-??-??.html")) if d.is_dir() else []
+        return files[-1] if files else None
+    p = d / name
+    return p if p.is_file() else None
+
+
+def attach_standup(name: str) -> dict:
+    """Attach a standup HTML to the plan's ticket and leave a one-line comment.
+
+    Outward-facing: the caller confirmed it in the UI, the button names the
+    ticket, and the response says exactly what JIRA created. The file is the
+    one on disk - what you opened is what gets attached.
+    """
+    key = _pr.plan_ticket(CFG)
+    if not key:
+        return {"ok": False, "error": "this plan has no linked ticket - link one in the plan row first"}
+    if key.startswith("http"):
+        key = key.rstrip("/").rsplit("/", 1)[-1]
+    p = standup_file(name)
+    if p is None:
+        return {"ok": False, "error": f"no standup file {name!r} - run Standup first"}
+    t = jira_target()
+    if not t["configured"]:
+        return {"ok": False, "error": "JIRA API is not configured: " + "; ".join(t["missing"])}
+    auth, err = _jira_auth_header(t)
+    if err:
+        return {"ok": False, "error": err}
+    import urllib.error
+    import urllib.request
+    import uuid
+    boundary = "----pcc" + uuid.uuid4().hex
+    fname = f"standup-{p.stem}.html"
+    data = p.read_bytes()
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n\r\n").encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    base, v = t["base"], t["api_version"]
+    req = urllib.request.Request(f"{base}/rest/api/{v}/issue/{key}/attachments", data=body, method="POST", headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}", "Accept": "application/json",
+        "X-Atlassian-Token": "no-check", "Authorization": auth, "User-Agent": "progress-control-center"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            created = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8", "replace"))
+            msg = "; ".join(detail.get("errorMessages", []) or [f"{k}: {v}" for k, v in (detail.get("errors") or {}).items()])
+        except (ValueError, OSError):
+            msg = ""
+        hint = (" - attachments may be disabled for this project, or the token lacks Create Attachments"
+                if exc.code == 403 else "")
+        return {"ok": False, "error": f"JIRA said {exc.code} {exc.reason}" + (f" - {msg}" if msg else "") + hint}
+    except urllib.error.URLError as exc:
+        return {"ok": False, "error": f"could not reach {base}: {exc.reason}"}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    att = created[0] if isinstance(created, list) and created else {}
+    # A short comment so the attachment is found from the ticket's timeline.
+    try:
+        s = _pr.standup_data(build(REPO), 1)
+        line = (f"Standup {s['today']} attached ({fname}): overall {s['overall']}%, "
+                f"{len(s['completed'])} done, {len(s['started'])} started, "
+                f"{s['remaining_days']}d remaining to {s['finish_date']}.")
+        cbody = {"body": _adf(line) if v >= 3 else line}
+        creq = urllib.request.Request(f"{base}/rest/api/{v}/issue/{key}/comment", data=json.dumps(cbody).encode("utf-8"),
+                                      method="POST", headers={"Content-Type": "application/json", "Accept": "application/json",
+                                                              "Authorization": auth, "User-Agent": "progress-control-center"})
+        with urllib.request.urlopen(creq, timeout=30):
+            commented = True
+    except Exception as exc:          # noqa: BLE001 - the attachment succeeded; say the comment did not
+        commented = False
+        comment_error = f"{type(exc).__name__}: {exc}"
+    browse = ((CFG.get("integrations", {}) or {}).get("jira", {}) or {}).get("browse_url", "")
+    return {"ok": True, "key": key, "filename": att.get("filename", fname), "size": att.get("size", len(data)),
+            "url": browse.replace("{key}", key) if browse else f"{base}/browse/{key}",
+            "content": att.get("content", ""), "commented": commented,
+            **({} if commented else {"comment_error": comment_error})}
+
+
 def jira_target() -> dict:
     """What API creation would do, and what is missing. Shown BEFORE the button
     is armed: an outward-facing write should never be a surprise."""
@@ -2329,6 +2433,8 @@ CSS = """
  max-height:52vh;display:none;flex-direction:column;background:var(--panel);
  border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
 #pcc-out.on{display:flex}
+#pcc-out .links{display:flex;gap:7px;padding:8px 11px;border-top:1px solid var(--line);flex-wrap:wrap}
+#pcc-out .links a{text-decoration:none}
 #pcc-out header{display:flex;align-items:center;justify-content:space-between;gap:10px;
  padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel-2)}
 #pcc-out h4{margin:0;font-size:12.5px;font-weight:650}
@@ -2398,14 +2504,63 @@ JS = r"""
           rcEl.textContent = 'exit ' + d.rc;
           rcEl.className = 'rc ' + (d.rc === 0 ? 'ok' : 'bad');
           enable(true);
+          if(ttl.textContent === 'Standup' && d.rc === 0) standupLinks();
         }
       }).catch(function(){ clearInterval(poll); enable(true); });
     }, 400);
   }
 
+  // After a standup: the report as a page, as a download, and - when the plan
+  // has a ticket and the API is configured - attached to that ticket. The
+  // attach is outward-facing, so it arms on the first click and names the
+  // ticket before it does anything.
+  function standupLinks(){
+    var old = out.querySelector('.links'); if(old) old.remove();
+    var row = document.createElement('div'); row.className = 'links';
+    var openA = document.createElement('a'); openA.className = 'pcc-btn'; openA.textContent = 'Open report \u2197';
+    openA.href = '/standup/latest.html'; openA.target = '_blank'; openA.rel = 'noopener';
+    openA.title = 'The standup as a page - tiles, what moved, phases, blockers, next, activity';
+    var dl = document.createElement('a'); dl.className = 'pcc-btn'; dl.textContent = 'Download HTML';
+    dl.href = '/standup/latest.html?download=1'; dl.title = 'One self-contained file - mail it or drop it in a ticket';
+    row.appendChild(openA); row.appendChild(dl);
+    var P0 = window.__ANU_PLAN__ || {};
+    if(P0.jira){
+      var at = document.createElement('button'); at.className = 'pcc-btn';
+      var armed = false, key = String(P0.jira).replace(/\/+$/, '').split('/').pop();
+      if(!P0.jira_api_ready){
+        at.textContent = 'Attach to ' + key; at.disabled = true;
+        at.title = 'Needs the JIRA API configured in Setup (site, project key, token) - the download works without it';
+      } else {
+        at.textContent = 'Attach to ' + key + '\u2026';
+        at.title = 'Attaches this file to the ticket and leaves a one-line comment. First click arms it.';
+        at.addEventListener('click', function(){
+          if(!armed){
+            armed = true; at.textContent = 'Confirm: attach to ' + key;
+            at.style.background = 'var(--crit)'; at.style.borderColor = 'var(--crit)'; at.style.color = '#fff';
+            return;
+          }
+          at.disabled = true; at.textContent = 'Attaching\u2026';
+          api('/api/standup/attach', {name: 'latest.html'}).then(function(d){
+            if(!d.ok){ at.disabled = false; armed = false; at.textContent = 'Attach to ' + key + '\u2026';
+                       at.style.background = ''; at.style.borderColor = ''; at.style.color = '';
+                       pre.textContent += '\n\nattach failed: ' + d.error; pre.scrollTop = pre.scrollHeight; return; }
+            at.textContent = 'Attached \u2713';
+            at.style.background = ''; at.style.borderColor = ''; at.style.color = '';
+            pre.textContent += '\n\nattached ' + d.filename + ' (' + d.size + ' bytes) to ' + d.key +
+              (d.commented ? ' with a comment' : ' - comment failed: ' + d.comment_error) + '\n' + d.url;
+            pre.scrollTop = pre.scrollHeight;
+          }).catch(function(){ at.disabled = false; armed = false; at.textContent = 'Attach to ' + key + '\u2026'; });
+        });
+      }
+      row.appendChild(at);
+    }
+    out.appendChild(row);
+  }
+
   btns.forEach(function(b){
     b.addEventListener('click', function(){
       enable(false);
+      var old = out.querySelector('.links'); if(old) old.remove();
       show(b.dataset.label);
       api('/api/run', {task: b.dataset.task}).then(function(d){
         if(d.run_id){ tail(d.run_id); }
@@ -3643,6 +3798,7 @@ def action_layer(token: str, model: dict) -> str:
         "window.__ANU_PLAN__=" + _pr.js({
             "id": PLAN_ID, "name": (model.get("project") or {}).get("plan", "the plan"),
             "jira": model.get("plan_ticket", ""),
+            "jira_api_ready": bool(jira_target().get("configured")),
             "agent": ({"name": model["agent"]["name"],
                        "sources": len(model["agent"]["resolved"]),
                        "missing": model["agent"]["missing"],
@@ -5162,6 +5318,26 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"v": fresh_stamp()})
             return
 
+        if path.startswith("/standup/"):
+            # docs/standups/<date>.html as a page, or as a download with ?download=1.
+            q = urlparse(self.path).query
+            f = standup_file(path.rsplit("/", 1)[-1])
+            if f is None:
+                self._json({"error": "no such standup - run Standup first"}, 404)
+                return
+            data = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            if "download=1" in q:
+                self.send_header("Content-Disposition", f'attachment; filename="standup-{f.stem}.html"')
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except CLIENT_GONE:
+                pass
+            return
+
         if path == "/":
             if not (REPO / "docs" / "progress.toml").exists():
                 self._redirect("/setup")     # nothing to render yet; go configure
@@ -5402,6 +5578,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/plan/switch":
             self._json(switch_plan(str(body.get("plan", ""))))
+            return
+
+        if path == "/api/standup/attach":
+            self._json(attach_standup(str(body.get("name", "latest.html"))))
             return
 
         if path == "/api/phases/sync":
