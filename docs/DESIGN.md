@@ -254,6 +254,24 @@ source list inside the opening brief and the phase brief instead. Sources are
 pointers on purpose: the agent reads on demand, nothing is copied into a prompt,
 and URLs are listed but never fetched by the generator.
 
+## The estimate is measured, because the effort is attention
+
+With LLM-driven development the implementation time of an item is small and
+roughly uniform; what varies is the owner's attention. So the estimate is built
+from three measured quantities rather than typed days: the **rate** (items ticked
+per active day, from the snapshot history — a day is active when items moved or a
+session was launched), the **pace** (active days per week over the history's span),
+and the longest outstanding blocker lead. Finish = today + items left ÷ rate ÷ pace
+× 7, floored by that lead. Both the rate and the pace can be set in `[project]`
+(`items_per_active_day`, `active_days_per_week`) and are otherwise measured, or
+assumed (2 per day, 3 days a week) until two days of movement exist — and the tiles
+say which. Two finishes are shown when the recent rate differs from the all-time
+rate, because that spread is the uncertainty. The tile also names the limiting
+factor: *attention* when the measured pace is under two days a week, *waiting* when
+a blocker's lead exceeds the work, otherwise the work itself. The typed `days`
+still drive the timeline and the critical path; they are the floor for phases that
+are genuinely time-bound.
+
 ## The standup is one computation, two renderings
 
 `--standup` computes what moved once — the snapshot diff, the git window, the

@@ -827,6 +827,9 @@ def detect_environment(repo: Path) -> dict:
             "plan_candidates": cands,
             "owner": proj.get("owner", ""),
             "start_date": proj.get("start_date", ""),
+            "active_days_per_week": proj.get("active_days_per_week", ""),
+            "items_per_active_day": proj.get("items_per_active_day", ""),
+            "pace": (lambda m: m.get("pace"))(build(repo)) if cfgp.exists() and (repo / str(proj.get("plan", DEFAULT_PLAN))).is_file() else None,
             "allow_artifact_publish": bool(proj.get("allow_artifact_publish", False)),
             "jira_browse": ((cfg.get("integrations", {}) or {}).get("jira", {}) or {}).get("browse_url", ""),
             "jira_create": ((cfg.get("integrations", {}) or {}).get("jira", {}) or {}).get("create_url", ""),
@@ -856,6 +859,10 @@ PROJECT_FIELDS = {
     "items": ("[project]", str),
     "owner": ("[project]", str), "start_date": ("[project]", str),
     "allow_artifact_publish": ("[project]", bool),
+    # Pace, for the estimate: how many days a week the owner actually works on
+    # this, and (rarely) a rate override. Both measured when unset.
+    "active_days_per_week": ("[project]", float),
+    "items_per_active_day": ("[project]", float),
     "jira_browse": ("[integrations.jira]", str),
     "jira_create": ("[integrations.jira]", str),
     # Direct API creation. Optional: without these the ticket route stays the
@@ -904,6 +911,15 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
                 val = int(str(val).strip())
             except ValueError:
                 return {"ok": False, "error": f"{_KEYNAME.get(key, key)} must be a whole number"}
+        elif typ is float:
+            try:
+                val = float(str(val).strip())
+            except ValueError:
+                return {"ok": False, "error": f"{_KEYNAME.get(key, key)} must be a number"}
+            if key == "active_days_per_week" and not 0 < val <= 7:
+                return {"ok": False, "error": "active days per week must be between 0 and 7"}
+            if key == "items_per_active_day" and val <= 0:
+                return {"ok": False, "error": "items per active day must be above 0"}
         else:
             val = str(val)
         if key == "items" and val not in ITEM_MODES:
@@ -2319,7 +2335,22 @@ def protocol_block(tick_file: str, mode: str = "checkboxes") -> str:
            "file - this plan tracks its list entries, not checkboxes."
            if mode == "lists" else
            f"4. Tick only in {tick_file}: change that item's `- [ ]` to `- [x]` on its "
-           "exact line, nothing else, no other file."))
+           "exact line, nothing else, no other file.")
+        + " Rule 5 is the only other change allowed in the plan.\n"
+        + steering_rule(tick_file))
+
+
+def steering_rule(tick_file: str) -> str:
+    """Rule 5: the plan is steered as work goes, not left to drift. An item's
+    findings and decisions often change what later items assume; a plan that
+    still describes the old assumption sends the next session down it."""
+    return (
+        "5. Steer the plan. When this item's findings or decisions change what a later "
+        "item assumes (its scope, names, order, or a decision taken), say so in the "
+        "brief (b or c) and, once confirmed, update those later items in "
+        f"{tick_file} in the same change, in plain words. Never rewrite a ticked item: "
+        'record the change as a dated line under the plan\'s "Plan changes along the '
+        'way" section (create it if missing). List every plan edit in your closing report.')
 
 
 def phase_source(p: dict, plan_name: str, plan_text: str, sections: dict, repo: Path) -> str:
@@ -2453,9 +2484,10 @@ def phase_item_prompt_warm_tmpl(p: dict, plan_name: str) -> str:
             "found, decisions for you, what I'll do, how we'll know it's done, not in this "
             'item), end with "confirm these steps, or redirect me?", and WAIT. Only this '
             "item; when done, "
-            f"tick its exact line in {tick} and nothing else"
+            f"tick its exact line in {tick}"
             + (" (write `[x] ` right after its list marker, or at the start of a table row's first cell)" if p.get("items_mode") == "lists" else "")
-            + ".\n\n"
+            + ". Steer the plan as you go (rule 5): if the work changed what later items "
+            "assume, update those later items too and list the plan edits when you report.\n\n"
             f"If this conversation has not already read {tick}, you are not the Phase "
             f"{p['id']} session: say so, read it, then post the brief.")
 
@@ -2786,6 +2818,10 @@ def build(repo: Path) -> dict:
     remaining = sum(p.get("days", 0) * (1 - p["pct"] / 100)
                     for p in phases if p["id"] in cpath)
     finish = to_date(max((p["end_day"] for p in phases if not p.get("continuous")), default=0))
+    # The typed `days` schedule above is the timeline's floor. The finish the
+    # tiles show comes from measured pace: see pace_model.
+    pace = pace_model({"today": today.isoformat(), "phases": phases, "blockers": blockers},
+                      repo, proj)
 
     # ---- derived risks --------------------------------------------------
     risks = []
@@ -2982,6 +3018,7 @@ def build(repo: Path) -> dict:
         "saved_days": sequential - parallel,
         "remaining_days": round(remaining),
         "finish_date": finish.isoformat(),
+        "pace": pace,
         "current": next((p for p in phases if p["status"] == "active" and not p.get("continuous")), None),
         "commits": commits,
         # Optional per-project integrations — absent tables mean absent features.
@@ -3779,14 +3816,25 @@ def render(d: dict) -> str:
     today_off = min(pct_of(wd), 100)
 
     # tiles
+    pc = d.get("pace") or {"sessions_left": 0, "active_days_needed": 0, "rate": 0, "rate_src": "assumed",
+                           "finish": d["finish_date"], "finish_recent": None, "finish_alltime": None,
+                           "pace": 0, "pace_src": "assumed", "limiting": "nothing left"}
     tiles = [
         ("Overall", f"{d['overall']}%", f"{d['done_phases']} of {d['total_phases']} phases complete",
          "var(--accent)"),
         ("Current phase", f"Phase {cur['id']}" if cur else "—",
          (cur["name"] if cur else "nothing in flight"), "var(--accent)"),
-        ("Effort remaining", f"{d['remaining_days']}d", "on the critical path", "var(--warn)"),
-        ("Projected finish", d["finish_date"], f"target for Phase {d['critical_path'][-1]}" if d["critical_path"] else "",
-         "var(--todo)"),
+        # One brief-and-confirm cycle per item is the unit of effort when a
+        # model does the implementing; the rate and the pace are measured from
+        # the snapshots, and say so, rather than typed into the config.
+        ("Sessions left", str(pc["sessions_left"]),
+         (f"~{pc['active_days_needed']} active day(s) at {pc['rate']:g} items/day ({pc['rate_src']})"
+          if pc["sessions_left"] else "every item is ticked"), "var(--warn)"),
+        ("Projected finish", pc["finish"],
+         (("range " + " – ".join(sorted({x for x in (pc["finish_recent"], pc["finish_alltime"]) if x}))
+           + " · " if pc["finish_recent"] and pc["finish_alltime"] and pc["finish_recent"] != pc["finish_alltime"] else "")
+          + f"{pc['pace']:g} active days/wk ({pc['pace_src']}) · limited by {pc['limiting']}")
+         if pc["sessions_left"] else "done", "var(--todo)"),
         ("Parallel saving", f"{d['saved_days']}d",
          f"{d['sequential_days']}d sequential vs {d['parallel_days']}d scheduled", "var(--done)"),
         ("Open risks", str(sum(1 for r in d["risks"] if r["severity"] in ("critical", "warning"))),
@@ -4175,6 +4223,136 @@ def render(d: dict) -> str:
 
 HIST = REPO / "docs" / "progress-history"
 
+# Before any history exists: one brief-and-confirm cycle per item, two of
+# them per active day, three active days a week. Stated as ASSUMED on the
+# page until the snapshots say otherwise.
+ASSUMED_ITEMS_PER_ACTIVE_DAY = 2.0
+ASSUMED_ACTIVE_DAYS_PER_WEEK = 3.0
+
+
+def pace_model(d: dict, repo: Path, proj: dict) -> dict:
+    """How fast the work actually moves, and what that makes of the finish.
+
+    Rate = items ticked per ACTIVE day, from the snapshot history (a day is
+    active when items moved or a session was launched). Pace = active days per
+    week, measured over the history's span, or set in [project]. Finish =
+    today + items left / rate / pace, floored by the longest outstanding
+    blocker lead. Two finishes are reported - at the recent rate and at the
+    all-time rate - because the spread between them IS the uncertainty.
+    """
+    import math
+    today = date.fromisoformat(d["today"])
+    counted = [p for p in d["phases"] if not p.get("continuous")]
+    done_now = sum(p["done"] for p in counted)
+    items_left = sum(p["total"] - p["done"] for p in counted)
+
+    pts: list[tuple[date, int]] = []
+    hist = repo / "docs" / "progress-history"
+    if hist.is_dir():
+        for f in sorted(hist.glob("????-??-??.json")):
+            try:
+                s = json.loads(f.read_text(encoding="utf-8"))
+                pts.append((date.fromisoformat(s["date"]),
+                            sum(int(v.get("done", 0)) for v in (s.get("phases") or {}).values())))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    pts = [p for p in pts if p[0] < today] + [(today, done_now)]
+
+    movement: set[date] = set()
+    for (d0, n0), (d1, n1) in zip(pts, pts[1:]):
+        if n1 > n0:
+            movement.add(d1)
+    launches: set[date] = set()
+    wd = repo / WORK_DIR
+    if wd.is_dir():
+        for f in wd.glob("sessions-*.json"):
+            try:
+                for tools in (json.loads(f.read_text(encoding="utf-8")).get("phases") or {}).values():
+                    for rec in tools.values():
+                        for stamp in (rec.get("started"), (rec.get("last_sent") or {}).get("at"),
+                                      (rec.get("last_sync") or {}).get("at")):
+                            if stamp:
+                                launches.add(date.fromisoformat(str(stamp)[:10]))
+            except (OSError, ValueError, AttributeError, TypeError):
+                continue
+    first = pts[0][0]
+    span = max(1, (today - first).days)
+    active = {x for x in movement | launches if first <= x <= today}
+    items_done = pts[-1][1] - pts[0][1]
+    measured = len(movement) >= 2 and items_done > 0
+
+    rate_all = (items_done / len(active)) if measured and active else None
+    cutoff = today - timedelta(days=14)
+    recent_pts = [p for p in pts if p[0] >= cutoff]
+    rec_done = (recent_pts[-1][1] - recent_pts[0][1]) if len(recent_pts) >= 2 else 0
+    rec_active = {x for x in active if x >= cutoff}
+    rate_recent = (rec_done / len(rec_active)) if rec_done > 0 and rec_active else None
+    days_pw_measured = (len(active) / span * 7) if span >= 7 and active else None
+
+    override_rate = proj.get("items_per_active_day")
+    override_pace = proj.get("active_days_per_week")
+    try:
+        override_rate = float(override_rate) if override_rate else None
+        override_pace = float(override_pace) if override_pace else None
+    except (TypeError, ValueError):
+        override_rate = override_pace = None
+    rate, rate_src = ((override_rate, "set") if override_rate else
+                      (rate_all, "measured") if rate_all else
+                      (ASSUMED_ITEMS_PER_ACTIVE_DAY, "assumed"))
+    pace, pace_src = ((override_pace, "set") if override_pace else
+                      (days_pw_measured, "measured") if days_pw_measured else
+                      (ASSUMED_ACTIVE_DAYS_PER_WEEK, "assumed"))
+    pace = max(0.2, min(7.0, pace))
+
+    def calendar(r: float | None) -> int | None:
+        if not items_left:
+            return 0
+        if not r:
+            return None
+        return math.ceil(math.ceil(items_left / r) / pace * 7)
+
+    waits = 0
+    wait_name = ""
+    bmap = {b.get("id"): b for b in d.get("blockers") or []}
+    for p in counted:
+        if p["status"] == "done":
+            continue
+        for bid in p.get("external_blockers") or []:
+            b = bmap.get(bid) or {}
+            if b.get("status") == "done":
+                continue
+            lead = int(b.get("lead_days") or 0)
+            if lead > waits:
+                waits, wait_name = lead, str(b.get("name") or bid)
+
+    cal = calendar(rate)
+    cal_recent = calendar(rate_recent) if rate_recent else None
+    cal_all = calendar(rate_all) if rate_all else None
+    finish = today + timedelta(days=max(cal or 0, waits)) if items_left else today
+    active_needed = math.ceil(items_left / rate) if items_left else 0
+    if not items_left:
+        limiting = "nothing left"
+    elif waits and waits >= (cal or 0):
+        limiting = f"waiting: {wait_name} ({waits}d lead)"
+    elif pace_src == "measured" and pace < 2:
+        limiting = f"attention: {len(active)} active day(s) in {span}"
+    else:
+        limiting = "the work itself"
+    return {
+        "items_left": items_left, "sessions_left": items_left, "active_days_needed": active_needed,
+        "rate": round(rate, 2), "rate_src": rate_src,
+        "rate_all": round(rate_all, 2) if rate_all else None,
+        "rate_recent": round(rate_recent, 2) if rate_recent else None,
+        "pace": round(pace, 1), "pace_src": pace_src,
+        "pace_measured": round(days_pw_measured, 1) if days_pw_measured else None,
+        "active_days": len(active), "span_days": span, "movement_days": len(movement),
+        "measured": measured, "calendar_days": cal, "waits": waits, "wait_name": wait_name,
+        "finish": finish.isoformat(),
+        "finish_recent": (today + timedelta(days=max(cal_recent, waits))).isoformat() if cal_recent is not None else None,
+        "finish_alltime": (today + timedelta(days=max(cal_all, waits))).isoformat() if cal_all is not None else None,
+        "limiting": limiting,
+    }
+
 
 def snapshot(d: dict) -> Path:
     """Persist today's state so the next run can diff against it.
@@ -4250,7 +4428,7 @@ def standup_data(d: dict, since_days: int = 1) -> dict:
             "project": d["project"].get("name", ""), "plan": d["project"].get("plan", ""),
             "ticket": d.get("plan_ticket", ""), "first": prev is None,
             "overall": d["overall"], "done_phases": d["done_phases"], "total_phases": d["total_phases"],
-            "remaining_days": d["remaining_days"], "finish_date": d["finish_date"],
+            "remaining_days": d["remaining_days"], "finish_date": d["finish_date"], "pace": d.get("pace"),
             "current": d["current"], "completed": completed, "started": started, "regressed": regressed,
             "delta": delta, "phases": phases,
             "blockers": [r for r in d["risks"] if r["severity"] == "critical"],
@@ -4366,6 +4544,7 @@ def standup_html(d: dict, since_days: int = 1) -> str:
     s = standup_data(d, since_days)
     cur = s["current"]
     dl = s["delta"]
+    pc = s.get("pace")
 
     def dtxt(v, unit="", good_up=True):
         if v is None:
@@ -4377,10 +4556,12 @@ def standup_html(d: dict, since_days: int = 1) -> str:
         ("done" if s["overall"] == 100 else "", f"{s['overall']}%", "overall",
          f"{s['done_phases']} of {s['total_phases']} phases complete " + (dtxt(dl["overall"], "pp") if dl else "")),
         ("", "Phase " + cur["id"] if cur else "—", "current phase", e(cur["name"]) if cur else "nothing in flight"),
-        ("warn" if s["remaining_days"] else "done", f"{s['remaining_days']}d", "remaining",
-         "on the critical path " + (dtxt(dl["remaining"], "d", good_up=False) if dl else "")),
-        ("", e(s["finish_date"]), "projected finish",
-         (("moved from " + e(dl["finish_was"])) if dl and dl["finish_moved"] else "unchanged") if dl else "first snapshot"),
+        ("warn" if pc and pc["sessions_left"] else "done", str(pc["sessions_left"]) if pc else f"{s['remaining_days']}d", "sessions left",
+         (f"~{pc['active_days_needed']} active day(s) at {pc['rate']:g}/day ({pc['rate_src']})" if pc and pc["sessions_left"]
+          else ("every item is ticked" if pc else "on the critical path"))),
+        ("", e(pc["finish"] if pc else s["finish_date"]), "projected finish",
+         ((f"{pc['pace']:g} active days/wk ({pc['pace_src']}) · limited by {e(pc['limiting'])}") if pc else
+          ((("moved from " + e(dl["finish_was"])) if dl and dl["finish_moved"] else "unchanged") if dl else "first snapshot"))),
         ("crit" if s["blockers"] else "", str(len(s["blockers"])), "blockers",
          f"{len(s['warnings'])} warning(s)"),
         ("done" if s["completed"] else "", str(len(s["completed"])), "done since last",

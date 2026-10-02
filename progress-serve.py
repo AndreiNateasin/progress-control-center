@@ -4421,6 +4421,20 @@ SETUP_JS = r"""
       ' \u00b7 scanned <b>'+RAW.length+'</b> file(s) under this repo'));
     box.appendChild(row('owner','Default owner',inp('p-owner',P.owner,'optional'),
       'used for phases with no explicit owner'));
+    var pcm = P.pace || null;
+    var paceIn = inp('p-pace', P.active_days_per_week, pcm && pcm.pace_measured ? 'measured: ' + pcm.pace_measured : 'e.g. 3', 'number');
+    paceIn.min = '0.5'; paceIn.max = '7'; paceIn.step = '0.5';
+    box.appendChild(row('active_days_per_week','Active days per week', paceIn,
+      'How many days a week you actually work on this plan. It sets the calendar: items left \u00f7 items per active day '+
+      '\u00f7 this \u00d7 7. Leave it empty to use the <b>measured</b> value from the snapshot history'+
+      (pcm ? ' \u2014 currently <b>'+pcm.pace+'</b> ('+pcm.pace_src+'), '+pcm.active_days+' active day(s) in '+pcm.span_days : '')+'.',
+      !!P.active_days_per_week));
+    var ipdIn = inp('p-ipd', P.items_per_active_day, pcm && pcm.rate_all ? 'measured: ' + pcm.rate_all : 'e.g. 2', 'number');
+    ipdIn.min = '0.1'; ipdIn.step = '0.1';
+    box.appendChild(row('items_per_active_day','Items per active day', ipdIn,
+      'One checklist item is one brief-and-confirm cycle. Leave it empty to use the <b>measured</b> rate'+
+      (pcm ? ' \u2014 currently <b>'+pcm.rate+'</b> ('+pcm.rate_src+')'+(pcm.rate_recent ? ', last two weeks '+pcm.rate_recent : '') : '')+
+      '. Set it only to plan against a pace you intend rather than the one observed.', !!P.items_per_active_day));
     box.appendChild(row('start_date','Start date',inp('p-start',P.start_date,'YYYY-MM-DD','date'),
       'the schedule is projected forward from here'));
 
@@ -4770,6 +4784,8 @@ SETUP_JS = r"""
     if(on('plan')) f.plan=val('p-plan');
     if(on('owner')) f.owner=val('p-owner');
     if(on('start_date')) f.start_date=val('p-start');
+    if(on('active_days_per_week') && val('p-pace')) f.active_days_per_week=val('p-pace');
+    if(on('items_per_active_day') && val('p-ipd')) f.items_per_active_day=val('p-ipd');
     if(on('allow_artifact_publish')) f.allow_artifact_publish=$('#p-pub').checked;
     // The two merged fields expand here, so progress.toml keeps its explicit
     // keys and nothing downstream has to know they were derived.

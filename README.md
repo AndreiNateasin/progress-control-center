@@ -44,7 +44,7 @@ once: a session that already holds it gets only the next item.
 |---|---|
 | writing a status report | open the page — progress is derived, nothing to update |
 | working out what can start now | read *Ready* — dependencies are resolved for you |
-| guessing the finish date | read the projected finish and the critical path |
+| guessing the finish date | read the projected finish, computed from your **measured** pace — items per active day and active days per week — not from typed days |
 | pasting context into an AI session | click **Open session** — the prompt is built from the phase |
 | re-explaining the phase to a session that already knows it | click **Send to phase session** — only the item goes, into the same conversation |
 | leaving the terminal to fetch the next item | type `/next-item 0` — the session pulls it from the live checklist |
@@ -95,9 +95,18 @@ unlocks, and the git activity under its modules. Filter to what's *ready* (every
 dependency met), what's *blocked*, or what's *done*.
 
 **A schedule you did not write.** From `depends_on` and `days` it computes the
-critical path, what can run in parallel, when each phase can start, and a projected
-finish. Phases whose real technical dependency differs from their order in the plan
-are exactly where the parallelism shows up.
+critical path, what can run in parallel, when each phase can start. Phases whose real
+technical dependency differs from their order in the plan are exactly where the
+parallelism shows up.
+
+**An estimate that matches how the work is done.** When a model does the
+implementing, a checklist item costs one brief-and-confirm cycle of your attention,
+so effort is *sessions left*, and the calendar is set by how often you sit down and
+what you wait on. The dashboard measures both from the snapshot history — items
+ticked per active day, active days per week — and projects the finish from them,
+labelled *measured* or *assumed*, as a range when the recent pace differs from the
+all-time pace, and naming what limits the date: attention, an external wait, or the
+work itself. Typed `days` remain the timeline's floor for genuinely time-bound work.
 
 **Actions on the phase, not beside it.** Run that phase's exit test and watch the
 output stream in. Open a coding session with a prompt already scoped to the phase, or
