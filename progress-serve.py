@@ -1134,7 +1134,10 @@ def record_session(phase_id: str, base: str, sid: str | None = None, item: str =
         if via:
             stamp["via"] = via
         if kind == "phase":
-            rec["last_sync"] = stamp       # a re-sync is not an item send
+            # a re-sync is not an item send - and a COLD phase launch is not a
+            # re-sync either: "started" already says what happened
+            if not new:
+                rec["last_sync"] = stamp
         else:
             rec["last_sent"] = stamp
         ph[base] = rec
@@ -3007,6 +3010,11 @@ JS = r"""
           go.title = (rec && rec.id)
             ? 'No transcript on disk for the recorded session: this continues the most recent conversation in the repo, which may not be it'
             : 'No session is recorded for this phase: this continues the most recent conversation in the repo, which may not be it';
+        } else if(L.mode === 'clipboard'){
+          // No prompt argument: the brief goes to the clipboard and the app is
+          // opened. No session id, no pinned brief, nothing to send to later.
+          go.textContent = 'Copy item brief for ' + L.label.replace(/\s*\(.*$/, '');
+          go.title = 'This tool takes no prompt: the full brief for this item goes to your clipboard and the app is opened - paste it in. Sessions are not tracked for it.';
         } else {
           go.textContent = 'Open session on this item';
           go.title = 'Opens a new session with the full brief for this one item; it becomes the phase session';
@@ -3142,6 +3150,9 @@ JS = r"""
         } else if(L.warm){
           open.textContent = 'Continue last session';
           open.title = 'No session recorded for this phase — continues the most recent conversation in the repo, which may not be it';
+        } else if(L.mode === 'clipboard'){
+          open.textContent = 'Copy phase brief for ' + L.label.replace(/\s*\(.*$/, '');
+          open.title = 'This tool takes no prompt: the phase brief goes to your clipboard and the app is opened - paste it in. Sessions are not tracked for it; the strip above describes terminal sessions only.';
         } else {
           open.textContent = 'Start phase session';
           open.title = p.startable ? 'Opens a session with the phase brief; it reads in, then waits for the items you send'
