@@ -910,6 +910,23 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
             return {"ok": False, "error": f"items must be one of {', '.join(ITEM_MODES)}"}
         if typ is str and not val.strip():
             continue                                   # empty means "leave alone"
+        if key == "plan":
+            # The plan lives IN this checkout: everything else is derived
+            # against the served folder, and an absolute path into another
+            # checkout points phases, git activity and prompts at the wrong
+            # tree while the plan text comes from elsewhere. Inside the repo
+            # it is stored relative, so the file is the same for every clone.
+            pp = Path(val)
+            if pp.is_absolute():
+                try:
+                    val = pp.resolve().relative_to(Path(repo).resolve()).as_posix()
+                except ValueError:
+                    return {"ok": False, "error":
+                            f"{val} is outside this project's checkout ({Path(repo).resolve()}). "
+                            "The plan must live inside it - to work on another checkout, open "
+                            "that folder from the Projects tab instead."}
+            else:
+                val = val.replace("\\", "/")
         # Already correct? Leave the author's line exactly as written. Rewriting
         # an unchanged value put noise in the diff and, before the fix above,
         # ate its trailing comment for nothing.

@@ -4193,7 +4193,18 @@ SETUP_JS = r"""
       if(!f){ boxNote.textContent=''; boxNote.className='why planboxes'; return }
       if(n === null){
         boxNote.className='why planboxes';
-        boxNote.innerHTML='not in the last scan \u2014 press <b>Rescan</b> if you just added it';
+        var abs = /^([A-Za-z]:[\\/]|\/)/.test(f);
+        var inside = abs && (E.repo||'') && f.replace(/\\/g,'/').toLowerCase().indexOf(String(E.repo).replace(/\\/g,'/').toLowerCase().replace(/\/$/,'') + '/') === 0;
+        if(abs && !inside){
+          boxNote.className='why planboxes nobox';
+          boxNote.innerHTML='<b>Outside this project.</b> This page serves <code>'+esc(E.repo)+'</code>, and '+
+            'phases, git activity, agent files and prompts are all derived from that folder - a plan in '+
+            'another checkout would be read from there while everything else points here. Save will refuse it. '+
+            'To work on that checkout, open it from the <b>Projects</b> tab.';
+          return;
+        }
+        boxNote.innerHTML = (abs ? 'inside this project \u2014 saved as a path relative to it \u00b7 ' : '') +
+          'not in the last scan \u2014 press <b>Rescan</b> if you just added it';
         return;
       }
       // The one failure this field exists to prevent, said BEFORE it happens
