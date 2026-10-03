@@ -1479,6 +1479,12 @@ def _state(mark: str) -> str:
     return {"x": "done", "X": "done", "~": "active", "/": "active", "-": "active"}.get(mark, "todo")
 
 
+# An OPEN item a re-plan or an applied proposal has dropped: it stays in the
+# plan as history (` — superseded: <reason>`) but is no work and not done work,
+# so it leaves the counts. A ticked item stays counted - it happened.
+SUPERSEDED = re.compile(r"(?:\u2014|\u2013|--|\s-)\s*superseded:", re.I)
+
+
 def parse_checklist(text: str, file: str | None = None) -> list[dict]:
     """Pull `- [ ]` items out of a markdown blob, keeping order and state.
 
@@ -1519,6 +1525,8 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
         # and the flag says the new direction wants it redone. The redo itself
         # is a separate open item, so the maths stays honest either way.
         redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
+        if state != "done" and SUPERSEDED.search(label):
+            continue
         out.append({"state": state, "label": label.strip(),
                     "file": file, "raw": raw, "redo": redo})
     return out
@@ -2006,6 +2014,8 @@ def parse_list_items(text: str, file: str | None = None) -> list[dict]:
         label = _clean_label(" ".join(parts))
         state = _state(m.group(2)) if m.group(2) is not None else "todo"
         redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
+        if state != "done" and SUPERSEDED.search(label):
+            continue
         out.append({"state": state, "label": label, "file": file, "raw": raw,
                     "redo": redo, "implied": m.group(2) is None})
     # A phase written as a table ("today | becomes") has no list entries; its
@@ -2032,6 +2042,8 @@ def _parse_table_items(text: str, file: str | None = None) -> list[dict]:
         label = _clean_label(" \u2192 ".join(cells[:2]))
         state = _state(m.group(2)) if m.group(2) is not None else "todo"
         redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
+        if state != "done" and SUPERSEDED.search(label):
+            continue
         out.append({"state": state, "label": label, "file": file, "raw": ln,
                     "redo": redo, "implied": m.group(2) is None})
     return out
@@ -2300,7 +2312,7 @@ def tick_file_of(p: dict, plan_name: str) -> str:
     return str(p.get("doc") or plan_name)
 
 
-def protocol_block(tick_file: str, mode: str = "checkboxes") -> str:
+def protocol_block(tick_file: str, mode: str = "checkboxes", proposals_file: str = "") -> str:
     """The standing rules of a working session, stated ONCE per session.
 
     Every cold shape carries them - the item prompt, the phase opening brief,
@@ -2309,6 +2321,7 @@ def protocol_block(tick_file: str, mode: str = "checkboxes") -> str:
     follow-up that skipped the bullet counts and the exact closing question
     bought drift, not savings.
     """
+    proposals_file = proposals_file or proposals_file_of(DEFAULT_PLAN)
     return (
         "Protocol for every checklist item in this session:\n"
         "1. Brief first, then WAIT. Before changing anything, post a brief a "
@@ -2336,21 +2349,405 @@ def protocol_block(tick_file: str, mode: str = "checkboxes") -> str:
            if mode == "lists" else
            f"4. Tick only in {tick_file}: change that item's `- [ ]` to `- [x]` on its "
            "exact line, nothing else, no other file.")
-        + " Rule 5 is the only other change allowed in the plan.\n"
-        + steering_rule(tick_file))
+        + f" The only other file you write for the plan is {proposals_file} (rule 5).\n"
+        + steering_rule(proposals_file))
 
 
-def steering_rule(tick_file: str) -> str:
+def steering_rule(proposals_file: str) -> str:
     """Rule 5: the plan is steered as work goes, not left to drift. An item's
     findings and decisions often change what later items assume; a plan that
-    still describes the old assumption sends the next session down it."""
+    still describes the old assumption sends the next session down it.
+
+    By PROPOSAL, not by edit: the session appends one JSON line per change and
+    the dashboard applies it only after a person confirms the exact lines (see
+    plan_proposal). A session editing later items itself was steering nobody
+    could review before it landed."""
     return (
-        "5. Steer the plan. When this item's findings or decisions change what a later "
-        "item assumes (its scope, names, order, or a decision taken), say so in the "
-        "brief (b or c) and, once confirmed, update those later items in "
-        f"{tick_file} in the same change, in plain words. Never rewrite a ticked item: "
-        'record the change as a dated line under the plan\'s "Plan changes along the '
-        'way" section (create it if missing). List every plan edit in your closing report.')
+        "5. Steer the plan by proposal. When this item's findings or decisions change what "
+        "a later item assumes (its scope, names, order, or a decision taken), say so in the "
+        "brief (b or c). Once confirmed, do not edit the plan for it: append one JSON line "
+        f"per change to {proposals_file} (create it if missing), shaped like "
+        '{"phase": "4", "from": "<this item>", "kind": "reword", "target": "<the later item, '
+        'exactly as the plan reads>", "text": "<the new wording>", "why": "<one line>"}. '
+        "kind is reword (an open item's text), add (a new item; target = the item it follows, "
+        'or "" for the end of the phase), drop (an open item no longer needed), redo (a ticked '
+        "item the new direction invalidates; text = the redo work) or note (anything else, "
+        "said in text). The user applies each from the dashboard, which edits the plan and "
+        'logs it under "Plan changes along the way"; never rewrite a ticked item yourself. '
+        "List what you proposed in your closing report.")
+
+# ------------------------------------------------------------ plan proposals --
+# Rule 5's write path. A working session that finds a later item is now wrong
+# does not edit the plan: it appends one JSON line per change to a per-plan
+# proposals file in WORK_DIR. The dashboard shows each as the exact lines it
+# would change, and nothing lands until a person presses Apply and confirms.
+# Sessions only ever APPEND to that file; the dashboard keeps its verdicts
+# (applied, dismissed, sent to re-plan) in a separate state file, so a session
+# writing while the page writes can never lose a line.
+
+PROPOSAL_KINDS = ("reword", "add", "drop", "redo", "note")
+CHANGES_HEADING = "Plan changes along the way"
+_ITEM_HEAD = re.compile(r"^(\s*[-*]\s*\[[ xX~/-]\]\s*|(?:\d+[.)]|[-*+])[ \t]+(?:\[[ xX~/-]\][ \t]+)?)(\S.*?)\s*$")
+_LABEL_CONT = re.compile(r"^\s{2,}(?![-*+>]\s|\d+[.)]\s)\S")
+
+
+class _Refuse(Exception):
+    """A proposal that cannot become a line edit as written; the message says why."""
+
+
+def proposals_name(plan: str) -> str:
+    return f"proposals-{plan_slug(plan)}.jsonl"
+
+
+def proposals_file_of(plan: str) -> str:
+    """Where a session appends proposals for this plan, relative to the repo."""
+    return f"{WORK_DIR}/{proposals_name(plan)}"
+
+
+def read_proposals(path: Path) -> list[dict]:
+    """Every distinct line of a proposals file, oldest first. An identical line
+    appended twice is one proposal - its id is the line's hash. A line that is
+    not a JSON object is kept as "unreadable", so it can be seen and dismissed
+    instead of vanishing."""
+    import hashlib
+    try:
+        text = path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out, seen = [], set()
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s:
+            continue
+        pid = hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            rec = json.loads(s)
+        except ValueError:
+            rec = None
+        if not isinstance(rec, dict):
+            out.append({"id": pid, "line": n, "kind": "unreadable", "phase": "", "from": "",
+                        "target": "", "text": s[:400], "why": "",
+                        "problem": "not a JSON object - the session wrote this line in another shape"})
+            continue
+
+        def g(k: str) -> str:
+            v = rec.get(k)
+            return re.sub(r"\s+", " ", "" if v is None else str(v)).strip()
+        kind = g("kind").lower() or "note"
+        r = {"id": pid, "line": n, "kind": kind,
+             "phase": re.sub(r"(?i)^phase\s*", "", g("phase")),
+             "from": g("from"), "target": g("target"), "text": g("text"), "why": g("why")}
+        if kind not in PROPOSAL_KINDS:
+            r["problem"] = f'unknown kind "{kind}" - expected one of {", ".join(PROPOSAL_KINDS)}'
+        out.append(r)
+    return out
+
+
+def _norm_label(s: str) -> str:
+    """An item's text as a comparison key: list marker, checkbox and markdown
+    emphasis gone, whitespace collapsed, case folded."""
+    s = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", str(s))
+    s = re.sub(r"^\s*\[[ xX~/-]\]\s+", "", s)
+    s = _clean_label(s)
+    return re.sub(r"\s+", " ", s).strip().lower().rstrip(" .;:")
+
+
+def find_target(phases: list, phase_id: str, target: str) -> tuple:
+    """(phase, item, problem) for a proposal's target text: an exact match,
+    else a unique prefix, else a unique substring - in the named phase first,
+    then across the plan (a session can name the wrong phase). Ambiguity is a
+    problem, never a guess: Apply edits exactly one line."""
+    want = _norm_label(target)
+    if not want:
+        return None, None, "no target item named"
+    named = [p for p in phases if str(p["id"]) == str(phase_id)]
+    tests = (lambda lab: lab == want,
+             lambda lab: len(want) >= 12 and lab.startswith(want),
+             lambda lab: len(want) >= 12 and want in lab)
+    for scope in ([named, phases] if named else [phases]):
+        pairs = [(p, i) for p in scope for i in (p.get("items") or [])]
+        for test in tests:
+            hits = [(p, i) for p, i in pairs if test(_norm_label(i["label"]))]
+            if len(hits) == 1:
+                return hits[0][0], hits[0][1], ""
+            if len(hits) > 1:
+                return None, None, (f'"{target}" matches {len(hits)} items - the proposal '
+                                    "must name one exactly")
+    where = f"Phase {phase_id}" if named else "this plan"
+    return None, None, (f'no item in {where} reads "{target}" - it may have been reworded, '
+                        "ticked or already changed")
+
+
+def _file_eol(lines: list[str]) -> str:
+    for ln in lines:
+        body = ln.rstrip("\r\n")
+        if len(body) != len(ln):
+            return ln[len(body):]
+    return "\n"
+
+
+def _label_end(lines: list[str], n: int) -> int:
+    """Index past the item's label: its line plus wrapped continuation lines."""
+    k = n + 1
+    while (k < len(lines) and lines[k].strip() and _LABEL_CONT.match(lines[k])
+           and not CHECK.match(lines[k])):
+        k += 1
+    return k
+
+
+def _block_end(lines: list[str], n: int) -> int:
+    """Index past the item and everything nested under it (detail, sub-items)."""
+    ind = len(lines[n]) - len(lines[n].lstrip())
+    k = _label_end(lines, n)
+    while k < len(lines) and lines[k].strip() and len(lines[k]) - len(lines[k].lstrip()) > ind:
+        k += 1
+    return k
+
+
+def _new_item_line(anchor_raw: str, text: str) -> str | None:
+    """A new open item written the way its neighbour is: same indent and bullet
+    for a checkbox; the next number, or the same bullet, and NO mark for a list
+    entry - an unmarked entry is open, and a box in a list-tracked plan would
+    change how the whole plan is read. None for a table row."""
+    m = re.match(r"^(\s*[-*]\s*)\[[ xX~/-]\]", anchor_raw)
+    if m:
+        return f"{m.group(1)}[ ] {text}"
+    m = re.match(r"^(\d+)([.)])([ \t]+)", anchor_raw)
+    if m:
+        return f"{int(m.group(1)) + 1}{m.group(2)}{m.group(3)}{text}"
+    m = re.match(r"^([-*+])([ \t]+)", anchor_raw)
+    if m:
+        return f"{m.group(1)}{m.group(2)}{text}"
+    return None
+
+
+def _append_change_log(lines: list[str], entry: str) -> str:
+    """One dated line under the plan's "Plan changes along the way" section.
+    The section is created as an h2 at the end when it is missing, or when the
+    one found sits INSIDE a phase (a list-tracked plan would read its lines as
+    items). Returns the heading line when it was created, else ""."""
+    eol = _file_eol(lines)
+    levels = [len(m.group(1)) for m in PHASE_HEAD.finditer("".join(lines))]
+    top = min(levels) if levels else 2
+    head = re.compile(r"^(#{1,6})[ \t]+" + re.escape(CHANGES_HEADING) + r"[ \t#]*$", re.I)
+    for n, ln in enumerate(lines):
+        m = head.match(ln.rstrip("\r\n"))
+        if not m or len(m.group(1)) > top:
+            continue
+        nxt = re.compile(r"^#{1,%d}[ \t]" % len(m.group(1)))
+        k = n + 1
+        while k < len(lines) and not nxt.match(lines[k]):
+            k += 1
+        while k > n + 1 and not lines[k - 1].strip():
+            k -= 1
+        if not lines[k - 1].endswith(("\n", "\r")):
+            lines[k - 1] += eol
+        lines[k:k] = ([eol] if k == n + 1 else []) + [entry + eol]
+        return ""
+    heading = "## " + CHANGES_HEADING
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += eol
+    lines.extend(([eol] if lines and lines[-1].strip() else []) + [heading + eol, eol, entry + eol])
+    return heading
+
+
+def _drop_empty_section(lines: list[str], heading: str) -> None:
+    """Undo of the first logged change: the section Apply created goes once it
+    holds nothing - a heading over no lines is noise in the plan."""
+    hits = [n for n, ln in enumerate(lines) if ln.rstrip("\r\n") == heading]
+    if len(hits) != 1:
+        return
+    n = hits[0]
+    nxt = re.compile(r"^#{1,%d}[ \t]" % (len(heading) - len(heading.lstrip("#"))))
+    k = n + 1
+    while k < len(lines) and not nxt.match(lines[k]):
+        if lines[k].strip():
+            return
+        k += 1
+    s = n
+    while s > 0 and not lines[s - 1].strip():
+        s -= 1
+    lines[s:k] = [_file_eol(lines)] if k < len(lines) else []
+
+
+def _md_lines(repo: Path, texts: dict, rel: str) -> list[str]:
+    if rel not in texts:
+        f = (repo / rel).resolve()
+        if repo.resolve() not in f.parents or f.suffix.lower() != ".md" or not f.is_file():
+            raise _Refuse(f"{rel} is not a markdown file inside this project")
+        # bytes, not text mode: one edit must not rewrite every line ending
+        texts[rel] = f.read_bytes().decode("utf-8").splitlines(keepends=True)
+    return texts[rel]
+
+
+def plan_proposal(repo: Path, model: dict, rec: dict, today: str) -> dict:
+    """What Apply would do to the files as they are NOW: the edited blocks
+    (`ops`, also the undo record), the log line, the new file texts and a
+    digest of the change. Pure - nothing is written here; the server writes
+    `files` under its lock after a confirm whose digest still matches.
+    {"ok": False, "problem"} when the proposal cannot be a line edit as
+    written: a note, a stale or ambiguous target, a ticked item."""
+    try:
+        return _plan_proposal(repo, model, rec, today)
+    except _Refuse as exc:
+        return {"ok": False, "problem": str(exc)}
+
+
+def _plan_proposal(repo: Path, model: dict, rec: dict, today: str) -> dict:
+    import hashlib
+    if rec.get("problem"):
+        raise _Refuse(rec["problem"])
+    kind = rec.get("kind", "note")
+    if kind == "note":
+        raise _Refuse("a note needs judgment, not a line edit - Re-plan with this, then dismiss it")
+    phases = model.get("phases") or []
+    plan_rel = (model.get("project") or {}).get("plan", DEFAULT_PLAN)
+    pid, text, why = str(rec.get("phase", "")), rec.get("text", ""), rec.get("why", "")
+    texts: dict[str, list[str]] = {}
+
+    def locate(it: dict) -> tuple[list[str], int]:
+        L = _md_lines(repo, texts, it["file"])
+        hits = [n for n, ln in enumerate(L) if ln.rstrip("\r\n") == it["raw"]]
+        if len(hits) != 1:
+            raise _Refuse(f'the line for "{it["label"]}" '
+                          + ("is no longer in " if not hits else f"appears {len(hits)} times in ")
+                          + it["file"] + " - reload and review again")
+        return L, hits[0]
+
+    def insert_after(L: list[str], n: int, line: str) -> None:
+        at = _block_end(L, n)
+        if not L[at - 1].endswith(("\n", "\r")):
+            L[at - 1] += _file_eol(L)
+        L.insert(at, line + _file_eol(L))
+
+    ops: list[dict] = []
+    if kind == "add":
+        if not text:
+            raise _Refuse("an add needs the new item's text")
+        if rec.get("target"):
+            ph, anchor, prob = find_target(phases, pid, rec["target"])
+            if prob:
+                raise _Refuse(prob)
+        else:
+            ph = next((p for p in phases if str(p["id"]) == pid), None)
+            if ph is None:
+                raise _Refuse(f"no Phase {pid or '?'} in this plan - name the phase, or the "
+                              "item the new one follows")
+            if not ph.get("items"):
+                raise _Refuse(f"Phase {pid} has no items to add after - Re-plan with this instead")
+            anchor = ph["items"][-1]
+        if any(_norm_label(i["label"]) == _norm_label(text) for i in ph.get("items") or []):
+            raise _Refuse(f'Phase {ph["id"]} already has "{text}"')
+        new = _new_item_line(anchor["raw"], text)
+        if new is None:
+            raise _Refuse(f"Phase {ph['id']}'s items are table rows - Apply edits list items "
+                          "only; Re-plan with this instead")
+        L, n = locate(anchor)
+        insert_after(L, n, new)
+        ops.append({"file": anchor["file"], "before": [], "after": [new]})
+        where = f' after "{anchor["label"]}"' if rec.get("target") else " at the end"
+        summary = f'add to Phase {ph["id"]}: "{text}"{where}'
+        logline = f'added "{text}"{where}'
+    elif kind in ("reword", "drop", "redo"):
+        ph, it, prob = find_target(phases, pid, rec.get("target", ""))
+        if prob:
+            raise _Refuse(prob)
+        done = it["state"] == "done"
+        if done and kind != "redo":
+            raise _Refuse(f'"{it["label"]}" is ticked - history stays as written; propose '
+                          "redo instead")
+        if kind == "redo" and not done:
+            raise _Refuse(f'"{it["label"]}" is not ticked - nothing to redo; propose reword instead')
+        if kind == "redo" and it.get("redo"):
+            raise _Refuse(f'"{it["label"]}" is already flagged needs redo')
+        L, n = locate(it)
+        if L[n].lstrip().startswith("|"):
+            raise _Refuse("this item is a table row - Apply edits list items only; Re-plan "
+                          "with this instead")
+        end = _label_end(L, n)
+        before = [x.rstrip("\r\n") for x in L[n:end]]
+        if kind == "reword":
+            m = _ITEM_HEAD.match(before[0])
+            if not text:
+                raise _Refuse("a reword needs the new text")
+            if not m:
+                raise _Refuse("the item's line has no list marker to keep")
+            if _norm_label(text) == _norm_label(it["label"]):
+                raise _Refuse("the new wording is the same as the plan's")
+            after = [m.group(1) + text]
+            summary = f'reword in Phase {ph["id"]}: "{it["label"]}" \u2192 "{text}"'
+            logline = f'reworded "{it["label"]}" \u2192 "{text}"'
+        elif kind == "drop":
+            after = before[:-1] + [before[-1] + f" \u2014 superseded: {why or 'no longer needed'}"]
+            summary = f'drop from Phase {ph["id"]}: "{it["label"]}" (kept in the plan, marked superseded)'
+            logline = f'dropped "{it["label"]}" (kept in the plan, marked superseded)'
+        else:
+            after = before[:-1] + [before[-1] + " \u2014 needs redo: "
+                                   + (why or "the new direction invalidates it")]
+            summary = f'redo in Phase {ph["id"]}: "{it["label"]}" flagged needs redo'
+            logline = f'flagged "{it["label"]}" needs redo'
+        L[n:end] = [x + _file_eol(L) for x in after]
+        ops.append({"file": it["file"], "before": before, "after": after})
+        if kind == "redo":
+            redo_text = text or ("Redo: " + it["label"])
+            new = _new_item_line(it["raw"], redo_text)
+            if new is None:
+                raise _Refuse("this item is a table row - Re-plan with this instead")
+            insert_after(L, n, new)
+            ops.append({"file": it["file"], "before": [], "after": [new]})
+            summary += f', new item "{redo_text}"'
+            logline += f', added "{redo_text}"'
+    else:
+        raise _Refuse(f'unknown kind "{kind}"')
+
+    entry = (f"- {today} \u00b7 Phase {ph['id']} \u00b7 {logline}"
+             + (f" \u2014 {why}" if why else "")
+             + (f" (from {rec['from']})" if rec.get("from") else ""))
+    heading = _append_change_log(_md_lines(repo, texts, plan_rel), entry)
+    ops.append({"file": plan_rel, "log": entry, "heading": heading})
+    digest = hashlib.sha1(json.dumps(ops, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return {"ok": True, "summary": summary[:1].upper() + summary[1:], "ops": ops,
+            "digest": digest, "files": {rel: "".join(texts[rel]) for rel in {o["file"] for o in ops}}}
+
+
+def undo_ops(repo: Path, ops: list[dict]) -> dict:
+    """Reverse an applied proposal. Every edited block must still read exactly
+    as Apply left it - found by content, so ticks and edits elsewhere do not
+    matter - or nothing is touched. The log line goes too, and a section Apply
+    created goes when that leaves it empty."""
+    texts: dict[str, list[str]] = {}
+    warnings: list[str] = []
+    try:
+        for op in ops:
+            L = _md_lines(repo, texts, op["file"])
+            if "log" in op:
+                hits = [n for n, ln in enumerate(L) if ln.rstrip("\r\n") == op["log"]]
+                if len(hits) == 1:
+                    del L[hits[0]]
+                    if op.get("heading"):
+                        _drop_empty_section(L, op["heading"])
+                else:
+                    warnings.append(f"its log line in {op['file']} was "
+                                    + ("not found" if not hits else "there more than once")
+                                    + " - left as is")
+                continue
+            after = op.get("after") or []
+            hits = [n for n in range(len(L) - len(after) + 1)
+                    if [x.rstrip("\r\n") for x in L[n:n + len(after)]] == after]
+            if len(hits) != 1:
+                raise _Refuse(f"{op['file']} no longer reads as this change left it ("
+                              + ("edited or ticked since" if not hits else
+                                 "the changed lines appear more than once")
+                              + ") - undo it by hand")
+            n = hits[0]
+            L[n:n + len(after)] = [x + _file_eol(L) for x in op.get("before") or []]
+    except _Refuse as exc:
+        return {"ok": False, "problem": str(exc)}
+    return {"ok": True, "warnings": warnings,
+            "files": {rel: "".join(L) for rel, L in texts.items()}}
 
 
 def phase_source(p: dict, plan_name: str, plan_text: str, sections: dict, repo: Path) -> str:
@@ -2426,7 +2823,7 @@ def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
     return (f"You are the working session for Phase {p['id']} ({p['name']}) of {plan_name}. "
             'Items will be sent to you one at a time as messages beginning "Next item"; '
             "this message opens the session.\n\nPHASE BRIEF\n" + "\n".join(lines) + "\n\n"
-            + protocol_block(tick, p.get("items_mode", "checkboxes")) + "\n\n"
+            + protocol_block(tick, p.get("items_mode", "checkboxes"), proposals_file_of(plan_name)) + "\n\n"
             'Later "Next item" messages rely on this brief and this protocol; do not ask '
             "for them again. If the plan may have changed since you read it, re-read the "
             "item's section before briefing."
@@ -2464,7 +2861,7 @@ def phase_item_prompt_tmpl(p: dict, plan_name: str, providers: list) -> str:
     return (f"In Phase {p['id']} ({p['name']}) of {plan_name}, work on exactly one "
             f"checklist item:\n\n    {ITEM_SLOT}\n\n"
             + _phase_context(p, plan_name) + "\n\n"
-            + protocol_block(tick, p.get("items_mode", "checkboxes")) + "\n\n"
+            + protocol_block(tick, p.get("items_mode", "checkboxes"), proposals_file_of(plan_name)) + "\n\n"
             f"This is the Phase {p['id']} session: later items arrive as short "
             '"Next item" messages naming only the item; apply the same protocol '
             "without asking for it again."
@@ -2486,8 +2883,9 @@ def phase_item_prompt_warm_tmpl(p: dict, plan_name: str) -> str:
             "item; when done, "
             f"tick its exact line in {tick}"
             + (" (write `[x] ` right after its list marker, or at the start of a table row's first cell)" if p.get("items_mode") == "lists" else "")
-            + ". Steer the plan as you go (rule 5): if the work changed what later items "
-            "assume, update those later items too and list the plan edits when you report.\n\n"
+            + ". Steer the plan by proposal (rule 5): if the work changed what later items "
+            f"assume, append one JSON line per change to {proposals_file_of(plan_name)} "
+            "instead of editing the plan, and list your proposals when you report.\n\n"
             f"If this conversation has not already read {tick}, you are not the Phase "
             f"{p['id']} session: say so, read it, then post the brief.")
 
@@ -2517,7 +2915,7 @@ def phase_brief(p: dict, plan_name: str, providers: list) -> str:
             f"Generated by the control center from {plan_name} and docs/progress.toml; "
             "rewritten on every launch, so do not edit it. The checklist and its state "
             f"live in {tick}: read them there, tick there, never here.\n\n"
-            + "\n".join(facts) + "\n\n" + protocol_block(tick, p.get("items_mode", "checkboxes"))
+            + "\n".join(facts) + "\n\n" + protocol_block(tick, p.get("items_mode", "checkboxes"), proposals_file_of(plan_name))
             + (f"\n\nSources for this plan (read on demand; a MISSING one was declared but is "
                f"not here):\n{p['sources_block']}" if p.get("sources_block") else "")
             + prompt_appendix(providers) + "\n")

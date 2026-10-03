@@ -51,6 +51,7 @@ once: a session that already holds it gets only the next item.
 | an agent running off in the wrong direction | the session posts a plain brief — decisions numbered, outcomes each with a check — and **waits for your confirmation** before touching anything |
 | writing a ticket from scratch | click **Draft ticket** on the plan, review, create — key written back |
 | rewriting a plan that drifted | click **Re-plan…**, add steering, let a session edit it |
+| a session quietly changing later items to fit what it found | it **proposes** the change instead; you see the exact lines and press **Apply change** to make it |
 | chasing "is your checkout the same as mine?" | teammates get a launch command for *their* machine |
 | a standup document | `--standup` writes it from the snapshot diff: markdown for the repo, and a self-contained HTML report to open, download or attach to the plan's ticket |
 
@@ -144,7 +145,16 @@ providers consulted. It proposes its changes first and waits for your go-ahead, 
 edits the plan and the config under rules that keep history intact: valid items keep
 their state, a done item the new direction invalidates is flagged *needs redo* with
 the redo added as new work, and headings stay machine-readable. Re-planning one item
-or phase may add items — or a whole phase — when the rethink needs them. Saving the config reconciles `[[phase]]`
+or phase may add items — or a whole phase — when the rethink needs them.
+
+**Plan changes found while working.** When an item's work shows that a later item is
+now wrong, the working session does not edit the plan. It appends a one-line proposal
+(reword, add, drop, redo, or a free-form note) to a per-plan file in `.pcc/`, and the
+plan row shows *Plan changes: N proposed*. Each proposal previews the exact lines it
+would change; **Apply change** then **Confirm** writes them, logs a dated line under
+*Plan changes along the way* in the plan, and can be undone. Notes and proposals whose
+target has moved go to **Re-plan with this** instead, and **Dismiss** drops one
+without touching the plan. Saving the config reconciles `[[phase]]`
 blocks with the plan's headings, so adding a phase to the markdown is enough. And the
 page reloads itself when the plan changes on disk, so a `git pull` from a teammate
 lands on your screen instead of going unnoticed.

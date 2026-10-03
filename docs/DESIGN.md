@@ -315,9 +315,9 @@ the two. Preview is still there for reading first.
 
 Every session prompt has two shapes. The **cold** shape is for a session that has
 nothing yet: the phase context pointers (doc, exit test, modules, open items, the
-context providers' usage rules), a four-rule protocol block — brief first, then
+context providers' usage rules), a five-rule protocol block — brief first, then
 wait; only this item; claim only what was verified; tick only in the named checklist
-file — and the declaration *"This is the Phase N session: later items arrive as
+file; steer the plan by proposal — and the declaration *"This is the Phase N session: later items arrive as
 short 'Next item' messages"*. The **warm** shape, about 560 characters, is for the
 session that already holds all that: it names the next item, restates the protocol
 in one paragraph, tells the session to re-read the checklist, and says that if this
@@ -439,6 +439,45 @@ digest when present, because they change what runs.
   `tick` the shared surface
 - Codex session addressing
 - the startup cost of any new launch
+
+## Sessions propose plan changes; a person applies them
+
+An item's findings often change what a later item assumes. Left alone, the plan
+keeps describing the old assumption and sends the next session down it; edited by
+the working session, it changes without anyone reviewing the edit. So rule 5 of the
+protocol splits the two: the session says so in its brief and, once confirmed,
+appends one JSON line per change to `.pcc/proposals-<plan>.jsonl` —
+`{"phase", "from", "kind", "target", "text", "why"}`, where `kind` is `reword`,
+`add`, `drop`, `redo` or `note`. It never edits the plan for it.
+
+The dashboard reads that file and turns each proposal into the exact edit it would
+make: the item is found by its text (exact, then a unique prefix or substring; in
+the named phase, then across the plan), and ambiguity is a refusal, never a guess.
+A reword keeps the line's marker and state; an add copies its neighbour's style (a
+list-tracked plan gets the next number and no box, because a box would change how
+the plan is read); a drop keeps the item with `— superseded: <why>`, and an open
+superseded item no longer counts as work; a redo flags the done item `— needs redo`
+and adds the redo as new work. A ticked item is never rewritten. A note, or a
+proposal whose target has moved, cannot be a line edit and offers *Re-plan with
+this* instead, which opens the plan-level re-plan with the proposals as steering.
+
+**Apply change** shows the lines first; the second click writes them. The confirm
+carries a digest of the previewed edit, and the server re-derives the edit under a
+lock and refuses if it no longer matches — an unrelated tick elsewhere does not
+invalidate it, a change to the same lines does. Every apply adds a dated line under
+*Plan changes along the way* in the plan (an h2 created at the end when missing, so
+no phase section absorbs it). **Undo** finds the edited lines by content and
+restores them, and refuses if they changed since — a reworded item that was then
+ticked stays as it is.
+
+Sessions only ever append to the proposals file. Verdicts (applied with its undo
+record, dismissed, sent to re-plan) live in a separate state file that only the
+server writes, so a session appending while the page writes cannot lose a line. A
+line appended twice is one proposal, and a line that is not JSON is shown as
+unreadable so it can be dismissed. The freshness poll carries a stamp of both files,
+so a new proposal refreshes the list without reloading the page. Like the session
+records, all of this is local to the checkout until the roadmap's MCP server makes
+it shared.
 
 ## Trust
 

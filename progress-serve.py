@@ -1789,6 +1789,161 @@ def fresh_stamp() -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
+# ------------------------------------------------------------ plan proposals --
+# Rule 5's other half: sessions append proposals, this page applies them. The
+# proposals file is the sessions' (append-only); the verdicts live beside it in
+# a state file only this server writes, under one lock with the plan edit.
+_PROP_LOCK = threading.Lock()
+
+
+def _proposal_paths() -> tuple[Path, Path, str]:
+    plan = _pr.active_plan(CFG)
+    name = _pr.proposals_name(plan)
+    wd = REPO / _pr.WORK_DIR
+    return wd / name, wd / (name[: -len(".jsonl")] + ".state.json"), plan
+
+
+def _prop_state(sf: Path) -> dict:
+    try:
+        d = json.loads(sf.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_prop_state(sf: Path, d: dict) -> None:
+    sf.parent.mkdir(exist_ok=True)
+    tmp = sf.with_name(sf.name + ".tmp")
+    tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, sf)
+
+
+def proposals_stamp() -> str:
+    """Changes when a session appends a proposal or a verdict is written; the
+    freshness poll carries it so the page refreshes the list, not the page."""
+    jf, sf, _ = _proposal_paths()
+    parts = []
+    for f in (jf, sf):
+        try:
+            st = f.stat()
+            parts.append(f"{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append("-")
+    return "|".join(parts)
+
+
+def _regen_after_edit(out: dict) -> dict:
+    """Keep the artifact-bound HTML in step after a plan edit from the page."""
+    r = subprocess.run(_py("--quiet"), cwd=str(REPO), capture_output=True,
+                       creationflags=NO_WINDOW)
+    if r.returncode != 0:
+        out["warning"] = ("the plan was updated, but regenerating the report failed (rc "
+                          f"{r.returncode}): "
+                          + (r.stderr or b"")[:200].decode("utf-8", "replace").strip())
+    return out
+
+
+def proposals_view() -> dict:
+    """Every proposal for the active plan, open ones with the exact edit Apply
+    would make (or why it cannot), handled ones with their verdict."""
+    jf, sf, plan = _proposal_paths()
+    recs = _pr.read_proposals(jf)
+    state = _prop_state(sf)
+    model = build(REPO) if recs else {}
+    names = {str(p["id"]): p.get("name", "") for p in model.get("phases", [])}
+    today = _pr.date.today().isoformat()
+    out = []
+    for r in recs:
+        st = state.get(r["id"]) or {}
+        v = dict(r, status=st.get("status", "open"), handled_at=st.get("at", ""),
+                 summary=st.get("summary", ""))
+        if v["status"] == "open":
+            pl = _pr.plan_proposal(REPO, model, r, today)
+            if pl["ok"]:
+                v.update(summary=pl["summary"], ops=pl["ops"], digest=pl["digest"])
+            else:
+                v["problem"] = pl["problem"]
+        v["phase_name"] = names.get(v.get("phase", ""), "")
+        out.append(v)
+    try:
+        rel = jf.relative_to(REPO).as_posix()
+    except ValueError:
+        rel = str(jf)
+    return {"ok": True, "file": rel, "plan": plan,
+            "open": sum(1 for v in out if v["status"] == "open"), "items": out}
+
+
+def apply_proposal(pid: str, digest: str) -> dict:
+    """The confirm of Apply change: re-derive the edit against the files as
+    they are now and write it only if it is still the one that was previewed."""
+    if not digest:
+        return {"ok": False, "error": "apply confirms a previewed change - open its preview first"}
+    with _PROP_LOCK:
+        jf, sf, _ = _proposal_paths()
+        rec = next((r for r in _pr.read_proposals(jf) if r["id"] == pid), None)
+        if rec is None:
+            return {"ok": False, "stale": True, "error": "no such proposal - the list moved on"}
+        state = _prop_state(sf)
+        status = (state.get(pid) or {}).get("status", "open")
+        if status != "open":
+            return {"ok": False, "stale": True, "error": f"this proposal is already {status}"}
+        pl = _pr.plan_proposal(REPO, build(REPO), rec, _pr.date.today().isoformat())
+        if not pl["ok"]:
+            return {"ok": False, "stale": True, "error": pl["problem"]}
+        if pl["digest"] != digest:
+            return {"ok": False, "stale": True,
+                    "error": "the plan changed since this preview - review the change again"}
+        for rel, text in pl["files"].items():
+            (REPO / rel).write_bytes(text.encode("utf-8"))
+        state[pid] = {"status": "applied", "at": _now_iso(), "summary": pl["summary"],
+                      "ops": pl["ops"]}
+        _save_prop_state(sf, state)
+    return _regen_after_edit({"ok": True, "summary": pl["summary"], "files": sorted(pl["files"])})
+
+
+def undo_proposal(pid: str) -> dict:
+    with _PROP_LOCK:
+        jf, sf, _ = _proposal_paths()
+        state = _prop_state(sf)
+        st = state.get(pid) or {}
+        if st.get("status") != "applied":
+            return {"ok": False, "error": "only an applied change can be undone"}
+        r = _pr.undo_ops(REPO, st.get("ops") or [])
+        if not r["ok"]:
+            return {"ok": False, "error": r["problem"]}
+        for rel, text in r["files"].items():
+            (REPO / rel).write_bytes(text.encode("utf-8"))
+        state.pop(pid, None)            # back to open: apply again, or dismiss
+        _save_prop_state(sf, state)
+    return _regen_after_edit({"ok": True, "summary": st.get("summary", ""),
+                              "warnings": r["warnings"]})
+
+
+def mark_proposals(ids: list, status: str) -> dict:
+    """Dismiss, hand to re-plan, or reopen. Never touches the plan; an applied
+    change is reversed with Undo, not reopened."""
+    if status not in ("dismissed", "replan", "open"):
+        return {"ok": False, "error": "unknown status " + repr(status)}
+    with _PROP_LOCK:
+        jf, sf, _ = _proposal_paths()
+        known = {r["id"] for r in _pr.read_proposals(jf)}
+        state = _prop_state(sf)
+        n = 0
+        for pid in [str(x) for x in ids]:
+            if pid not in known:
+                continue
+            cur = (state.get(pid) or {}).get("status", "open")
+            if status == "open" and cur in ("dismissed", "replan"):
+                state.pop(pid, None)
+                n += 1
+            elif status != "open" and cur == "open":
+                state[pid] = {"status": status, "at": _now_iso()}
+                n += 1
+        if n:
+            _save_prop_state(sf, state)
+    return {"ok": True, "changed": n}
+
+
 PLAN_ID = "_plan"          # ticket target meaning "the active plan", not a phase
 
 
@@ -2427,6 +2582,24 @@ CSS = """
  background:var(--panel)}
 .planbar-head{display:flex;gap:10px;align-items:baseline;margin-bottom:8px;flex-wrap:wrap}
 .planbar .dact{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.pchanges{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.pchanges:empty{display:none}
+.pchead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:4px}
+.pchead .dact{margin-left:auto}
+.pchg{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;background:var(--panel-2)}
+.pchg.handled{opacity:.8}
+.pctop{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:12.5px}
+.pk{font-family:var(--mono);font-size:11px;padding:1px 7px;border-radius:999px;
+ background:var(--accent-soft);color:var(--ink)}
+.pk-drop,.pk-redo{background:var(--warn-soft)}
+.pk-unreadable{background:var(--crit-soft)}
+.pcwhat{margin:5px 0 3px;line-height:1.45}
+.pchg .dact{margin-top:6px}
+.pcfile{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin:8px 0 3px}
+.pdiff{margin:0;padding:6px 8px;border-radius:6px;background:var(--panel);border:1px solid var(--line);
+ font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.pdiff .del{color:var(--crit)}
+.pdiff .add{color:var(--done)}
 .psess{margin:6px 0 4px;font-family:var(--mono);font-size:11px;color:var(--ink-3);
  display:flex;flex-direction:column;gap:4px;line-height:1.5}
 .psess .warn{color:var(--warn)}
@@ -2672,7 +2845,7 @@ JS = r"""
   // which context providers the session should consult, asks the server for
   // the prompt (the rules live server-side, in one place), and hands it to
   // the same session machinery every other button uses.
-  function replanBox(scope, phaseId, itemLabel, say){
+  function replanBox(scope, phaseId, itemLabel, say, onSent){
     var box = document.createElement('div'); box.className = 'replanbox';
     var ta = document.createElement('textarea');
     ta.placeholder = scope === 'plan'
@@ -2728,6 +2901,7 @@ JS = r"""
         api('/api/session', {phase: 'replan-' + scope + '-' + (phaseId || 'all'),
                              prompt: pr, tool: window.__ANU_PROFILE_TOOL__ || 'claude'})
           .then(function(d){ again();
+            if(d && d.ok && onSent) onSent();
             say(d && d.ok ? 'session opened — this page follows the plan as it changes'
                           : ((d && d.error) || 'launch failed'), d && d.ok ? 'ok' : 'err'); })
           .catch(function(){ again(); say('launch failed — server unreachable', 'err'); });
@@ -2738,7 +2912,7 @@ JS = r"""
     cp.title = 'For a session you already have open, or another machine';
     cp.addEventListener('click', function(){
       withPrompt(function(pr){
-        copyLocal(pr).then(function(){ say('re-plan prompt copied', 'ok'); },
+        copyLocal(pr).then(function(){ if(onSent) onSent(); say('re-plan prompt copied', 'ok'); },
                            function(){ say('clipboard refused', 'err'); });
       });
     });
@@ -2838,12 +3012,22 @@ JS = r"""
     b.addEventListener('click', function(){
       if(box){
         host.textContent = '';   // the box AND its floating status line
-        box = null; b.textContent = 'Re-plan…'; return;
+        box = null; sent = null; b.textContent = 'Re-plan…'; return;
       }
-      box = replanBox('plan', '', '', sayTop);
+      box = replanBox('plan', '', '', sayTop, function(){ if(sent) sent(); });
       host.appendChild(box); b.textContent = 'Close re-plan';
       box.querySelector('textarea').focus();
     });
+    // "Re-plan with this/these" on proposed plan changes: this box, opened with
+    // the proposals as the steering. They count as handed over only once the
+    // session is actually opened or the prompt copied - not on a mere open.
+    var sent = null;
+    window.__pccReplanWith = function(text, onSent){
+      if(!box) b.click();
+      sent = onSent || null;
+      var ta = box.querySelector('textarea');
+      ta.value = text; ta.rows = Math.min(12, text.split('\n').length + 1); ta.focus();
+    };
   })();
 
   // ------------------------------------------------------------- freshness --
@@ -2863,6 +3047,7 @@ JS = r"""
       if(window.__pccSelfWrite) return;
       fetch('/api/fresh').then(function(r){ return r.json(); }).then(function(d){
         if(!d || !d.v) return;
+        if(window.__pccProposalsPoke) window.__pccProposalsPoke(d.pv);
         if(v0 === null){ v0 = d.v; return; }
         if(d.v === v0) return;
         // open-phase state survives via the shared render's own
@@ -3337,7 +3522,7 @@ JS = r"""
     var P0 = window.__ANU_PLAN__; if(!P0) return;
     var anchor = document.querySelector('nav.tabs'); if(!anchor) return;
     var panel = document.createElement('section'); panel.className = 'planbar';
-    panel.setAttribute('aria-label', 'Plan ticket');
+    panel.setAttribute('aria-label', 'Plan ticket and proposed plan changes');
     var head = document.createElement('div'); head.className = 'planbar-head';
     var lbl = document.createElement('span'); lbl.className = 'eyebrow'; lbl.textContent = 'Plan ticket';
     var nm = document.createElement('span'); nm.className = 'quiet'; nm.textContent = P0.name;
@@ -3368,6 +3553,253 @@ JS = r"""
     panel.appendChild(head); panel.appendChild(act); panel.appendChild(msg);
     anchor.parentNode.insertBefore(panel, anchor);
     ticketControls(P0, act, say, panel);
+  })();
+
+  // Plan changes proposed by working sessions (protocol rule 5). A session
+  // never edits the plan for a later item: it appends a proposal, the server
+  // previews it as the exact lines it would change, and nothing lands until
+  // Apply change is pressed and then confirmed. Applied changes are logged in
+  // the plan under "Plan changes along the way" and can be undone here.
+  (function(){
+    var panel = document.querySelector('section.planbar'); if(!panel) return;
+    var box = document.createElement('div'); box.className = 'pchanges';
+    panel.appendChild(box);
+    var seen = null, pending = false, showHandled = false, last = null, shown = null;
+    try { var sv = sessionStorage.getItem('pccChangesShown'); if(sv !== null) shown = sv === '1'; } catch(e){}
+    var KINDS = {reword: 1, add: 1, drop: 1, redo: 1, note: 1, unreadable: 1};
+    var STATUS = {applied: 'applied', dismissed: 'dismissed', replan: 'sent to re-plan'};
+    try {
+      var note = sessionStorage.getItem('pccPlanChangeNote');
+      if(note){
+        sessionStorage.removeItem('pccPlanChangeNote');
+        var pn = document.createElement('p'); pn.className = 'pnote'; pn.textContent = note;
+        var mh = document.querySelector('main') || document.body;
+        mh.insertBefore(pn, mh.firstChild);
+      }
+    } catch(e){}
+    function el(tag, cls, text){
+      var n = document.createElement(tag);
+      if(cls) n.className = cls;
+      if(text !== undefined && text !== null) n.textContent = text;
+      return n;
+    }
+    function previewing(){ return !!box.querySelector('.pcprev'); }
+    function load(){
+      api('/api/proposals', {}).then(function(d){ last = d; render(); }).catch(function(){});
+    }
+    // The freshness poll hands over the proposals stamp: a session appending a
+    // line refreshes this list, never the page. An open preview is not yanked
+    // away mid-confirm; the refresh waits until it closes.
+    window.__pccProposalsPoke = function(pv){
+      if(pv === undefined || pv === seen) return;
+      var first = seen === null; seen = pv;
+      if(first) return;
+      if(previewing()) pending = true; else load();
+    };
+    load();
+
+    function describe(v){
+      if(v.summary) return v.summary;
+      if(v.kind === 'note' || v.kind === 'unreadable') return v.text;
+      return (v.target ? '"' + v.target + '"' : '') + (v.text ? ' \u2192 "' + v.text + '"' : '');
+    }
+    function steering(list, file){
+      return 'Plan changes proposed by working sessions (recorded in ' + file + '). ' +
+        'Apply what still holds, reject what does not, and say which in the brief:\n' +
+        list.map(function(v, n){
+          return (n + 1) + '. [Phase ' + (v.phase || '?') + ' \u00b7 ' + v.kind + '] ' + describe(v) +
+            (v.why ? ' \u2014 ' + v.why : '') + (v.from ? ' (from ' + v.from + ')' : '');
+        }).join('\n');
+    }
+    function replanWith(list){
+      var ids = list.map(function(v){ return v.id; });
+      window.__pccReplanWith(steering(list, last.file), function(){
+        api('/api/proposals/mark', {ids: ids, status: 'replan'}).then(load);
+      });
+    }
+    function render(){
+      var d = last;
+      box.textContent = '';
+      if(!d || !d.ok || !d.items || !d.items.length) return;
+      var open = d.items.filter(function(v){ return v.status === 'open'; });
+      var done = d.items.filter(function(v){ return v.status !== 'open'; });
+      var head = el('div', 'pchead');
+      head.appendChild(el('span', 'eyebrow', 'Plan changes'));
+      head.appendChild(el('span', open.length ? '' : 'quiet', open.length
+        ? open.length + ' proposed by working sessions \u2014 the plan changes only when you apply'
+        : 'none waiting'));
+      var acts = el('div', 'dact');
+      // A long list would push the phases off the first screen: up to three
+      // show at once, more collapse behind Review, and the choice is kept
+      // across the reload every Apply causes.
+      var expanded = shown === null ? open.length <= 3 : shown;
+      if(open.length){
+        var tg = el('button', 'pcc-btn', expanded ? 'Hide' : 'Review ' + open.length);
+        tg.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        tg.addEventListener('click', function(){
+          shown = !expanded;
+          try { sessionStorage.setItem('pccChangesShown', shown ? '1' : '0'); } catch(e){}
+          render();
+        });
+        acts.appendChild(tg);
+      }
+      var steerable = open.filter(function(v){ return v.kind !== 'unreadable'; });
+      if(steerable.length > 1 && window.__pccReplanWith){
+        var rp = el('button', 'pcc-btn', 'Re-plan with these ' + steerable.length);
+        rp.title = 'Opens Re-plan with every waiting proposal as the steering \u2014 for changes that need judgment';
+        rp.addEventListener('click', function(){ replanWith(steerable); });
+        acts.appendChild(rp);
+      }
+      if(done.length){
+        var hb = el('button', 'pcc-btn', (showHandled ? 'Hide' : 'Show') + ' handled (' + done.length + ')');
+        hb.setAttribute('aria-expanded', showHandled ? 'true' : 'false');
+        hb.addEventListener('click', function(){ showHandled = !showHandled; render(); });
+        acts.appendChild(hb);
+      }
+      head.appendChild(acts);
+      box.appendChild(head);
+      if(expanded) open.forEach(function(v){ box.appendChild(card(v)); });
+      if(showHandled) done.forEach(function(v){ box.appendChild(card(v)); });
+    }
+    function card(v){
+      var c = el('div', 'pchg' + (v.status !== 'open' ? ' handled' : ''));
+      var top = el('div', 'pctop');
+      top.appendChild(el('span', 'pk pk-' + (KINDS[v.kind] ? v.kind : 'note'), v.kind));
+      top.appendChild(el('span', '', v.phase ? 'Phase ' + v.phase + (v.phase_name ? ' \u00b7 ' + v.phase_name : '')
+                                             : 'no phase named'));
+      if(v.from) top.appendChild(el('span', 'quiet', 'from ' + v.from));
+      if(v.status !== 'open'){
+        top.appendChild(el('span', 'quiet', (STATUS[v.status] || v.status) +
+          (v.handled_at ? ' ' + String(v.handled_at).slice(0, 16).replace('T', ' ') : '')));
+      }
+      c.appendChild(top);
+      c.appendChild(el('div', 'pcwhat', describe(v)));
+      if(v.why) c.appendChild(el('div', 'quiet', 'why: ' + v.why));
+      if(v.status === 'open' && v.problem) c.appendChild(el('div', 'dstatus warn', 'Cannot apply as written: ' + v.problem));
+      var row = el('div', 'dact');
+      var msg = el('div', 'dstatus');
+      function say(t, k){ msg.textContent = t || ''; msg.className = 'dstatus ' + (k || ''); }
+      if(v.status === 'open'){
+        if(v.ops){
+          var pv = null;
+          var ap = el('button', 'pcc-btn run', 'Apply change\u2026');
+          ap.title = 'Shows the exact lines this changes; nothing is written until you confirm';
+          ap.setAttribute('aria-expanded', 'false');
+          var close = function(){
+            if(pv){ pv.remove(); pv = null; }
+            ap.textContent = 'Apply change\u2026'; ap.setAttribute('aria-expanded', 'false');
+            if(pending){ pending = false; load(); }
+          };
+          ap.addEventListener('click', function(){
+            if(pv){ close(); say(''); return; }
+            pv = preview(v, say, close);
+            c.insertBefore(pv, msg);
+            ap.textContent = 'Close preview'; ap.setAttribute('aria-expanded', 'true');
+          });
+          row.appendChild(ap);
+        }
+        if(window.__pccReplanWith && v.kind !== 'unreadable'){
+          var rw = el('button', 'pcc-btn', 'Re-plan with this');
+          rw.title = 'Opens Re-plan with this proposal as the steering';
+          rw.addEventListener('click', function(){ replanWith([v]); });
+          row.appendChild(rw);
+        }
+        var ds = el('button', 'pcc-btn', 'Dismiss');
+        ds.title = 'Drops the proposal; the plan is not touched. Reopen it from Show handled.';
+        ds.addEventListener('click', function(){
+          ds.disabled = true;
+          api('/api/proposals/mark', {ids: [v.id], status: 'dismissed'}).then(function(r){
+            if(r && r.ok) load();
+            else { ds.disabled = false; say((r && r.error) || 'could not dismiss', 'err'); }
+          });
+        });
+        row.appendChild(ds);
+      } else if(v.status === 'applied'){
+        var un = el('button', 'pcc-btn', 'Undo');
+        un.title = 'Restores the lines this change edited and removes its log line \u2014 refused if those lines changed since';
+        un.addEventListener('click', function(){
+          un.disabled = true;
+          window.__pccSelfWrite = true;
+          api('/api/proposals/undo', {id: v.id}).then(function(r){
+            if(r && r.ok){
+              try { sessionStorage.setItem('pccPlanChangeNote', 'Plan change undone: ' + (r.summary || '') +
+                ((r.warnings && r.warnings.length) ? ' \u2014 ' + r.warnings.join('; ') : '')); } catch(e){}
+              location.reload();
+              return;
+            }
+            window.__pccSelfWrite = false; un.disabled = false;
+            say((r && r.error) || 'could not undo', 'err');
+          });
+        });
+        row.appendChild(un);
+      } else {
+        var ro = el('button', 'pcc-btn', 'Reopen');
+        ro.addEventListener('click', function(){
+          api('/api/proposals/mark', {ids: [v.id], status: 'open'}).then(function(r){
+            if(r && r.ok) load(); else say((r && r.error) || 'could not reopen', 'err');
+          });
+        });
+        row.appendChild(ro);
+      }
+      c.appendChild(row);
+      c.appendChild(msg);
+      return c;
+    }
+    // The second step: the exact lines, then a confirm that names the files.
+    // The digest pins the confirm to THIS preview - if the plan moved on in
+    // between, the server refuses and the list refreshes with the new edit.
+    function preview(v, say, close){
+      var w = el('div', 'pcprev');
+      var files = [];
+      v.ops.forEach(function(op){
+        if(files.indexOf(op.file) < 0) files.push(op.file);
+        var pre = el('pre', 'pdiff');
+        if(op.log !== undefined){
+          w.appendChild(el('div', 'pcfile', op.file + ' \u00b7 logged under "Plan changes along the way"' +
+            (op.heading ? ' (a new section at the end of the plan)' : '')));
+          pre.appendChild(el('span', 'add', '+ ' + op.log));
+          w.appendChild(pre);
+          return;
+        }
+        w.appendChild(el('div', 'pcfile', op.file));
+        (op.before || []).forEach(function(l){
+          pre.appendChild(el('span', 'del', '\u2212 ' + l)); pre.appendChild(document.createTextNode('\n'));
+        });
+        (op.after || []).forEach(function(l){
+          pre.appendChild(el('span', 'add', '+ ' + l)); pre.appendChild(document.createTextNode('\n'));
+        });
+        w.appendChild(pre);
+      });
+      var bar = el('div', 'dact');
+      var label = 'Confirm: write to ' + files.join(' and ');
+      var ok = el('button', 'pcc-btn run', label);
+      ok.addEventListener('click', function(){
+        ok.disabled = true; ok.textContent = 'Applying\u2026';
+        window.__pccSelfWrite = true;
+        api('/api/proposals/apply', {id: v.id, digest: v.digest}).then(function(r){
+          if(r && r.ok){
+            try { sessionStorage.setItem('pccPlanChangeNote', 'Plan change applied: ' + r.summary +
+              ' \u2014 logged in the plan under "Plan changes along the way". Undo it from Plan changes \u2192 Show handled.' +
+              (r.warning ? ' ' + r.warning : '')); } catch(e){}
+            location.reload();
+            return;
+          }
+          window.__pccSelfWrite = false;
+          ok.disabled = false; ok.textContent = label;
+          say((r && r.error) || 'apply failed', 'err');
+          if(r && r.stale){ pending = true; close(); }
+        }).catch(function(){
+          window.__pccSelfWrite = false; ok.disabled = false; ok.textContent = label;
+          say('server unreachable \u2014 is the dashboard still running?', 'err');
+        });
+      });
+      var cn = el('button', 'pcc-btn', 'Cancel');
+      cn.addEventListener('click', function(){ close(); say(''); });
+      bar.appendChild(ok); bar.appendChild(cn);
+      w.appendChild(bar);
+      setTimeout(function(){ ok.focus(); }, 0);
+      return w;
+    }
   })();
 
   // Watch for the draft the session is writing. Recorded in sessionStorage so a
@@ -5342,7 +5774,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/api/fresh":
-            self._json({"v": fresh_stamp()})
+            self._json({"v": fresh_stamp(), "pv": proposals_stamp()})
             return
 
         if path.startswith("/standup/"):
@@ -5621,6 +6053,22 @@ class Handler(BaseHTTPRequestHandler):
                                     blank=bool(body.get("blank")),
                                     item=str(body.get("item", "")),
                                     prompt_warm=str(body.get("prompt_warm", ""))))
+            return
+
+        if path == "/api/proposals":
+            self._json(proposals_view())
+            return
+
+        if path == "/api/proposals/apply":
+            self._json(apply_proposal(str(body.get("id", "")), str(body.get("digest", ""))))
+            return
+
+        if path == "/api/proposals/undo":
+            self._json(undo_proposal(str(body.get("id", ""))))
+            return
+
+        if path == "/api/proposals/mark":
+            self._json(mark_proposals(list(body.get("ids") or []), str(body.get("status", ""))))
             return
 
         if path == "/api/session/forget":

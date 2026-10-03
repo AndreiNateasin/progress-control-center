@@ -48,6 +48,9 @@ dashboard — the change happened, and the page shows only the result.
 
 - [ ] Surface `> re-planned` notes as a phase history strip: when, and the one-line
   reason, newest first.
+- [x] Plan changes found while working arrive as proposals: previewed as exact lines,
+  applied only on confirm, logged under "Plan changes along the way", undoable.
+- [ ] Show the "Plan changes along the way" log per phase on the dashboard.
 - [ ] Plan-change ledger derived from git: which checkboxes flipped in which commit,
   by whom — no new store, `git log -p` over the plan file is the source.
 - [ ] "Changed since you last looked": the freshness poll already knows the plan
