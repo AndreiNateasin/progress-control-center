@@ -337,6 +337,48 @@ def _toml_val(v) -> str:
     return _toml_str(v)
 
 
+def _assignment(body: str, key: str) -> tuple | None:
+    """The active `key = value` in a table body: (start, end, value, parsed).
+
+    The span covers EVERY line of the value. A list written one item per
+    line, or a multi-line string, is legal TOML people write by hand; an
+    editor that replaced only the `files = [` line left the items behind as
+    garbage and the next save refused the whole config. The end is found with
+    the real parser rather than by counting brackets, so a string holding a
+    bracket or a `#` cannot fool it. `end` stops before the last line's
+    newline, like the one-line match this replaces. None when the key is
+    absent; parsed is False when no run of lines parses, and the span is then
+    the first line only - the old behaviour, for a value already broken.
+    """
+    m = re.search(r"^[ \t]*" + re.escape(key) + r"[ \t]*=", body, re.M)
+    if not m:
+        return None
+    start, acc = m.start(), ""
+    for ln in body[start:].splitlines(keepends=True)[:500]:
+        acc += ln
+        try:
+            d = tomllib.loads(acc)
+        except tomllib.TOMLDecodeError:
+            continue
+        if key in d:
+            return start, start + len(acc.rstrip("\r\n")), d[key], True
+        break
+    first = body[start:].split("\n", 1)[0].rstrip("\r")
+    return start, start + len(first), None, False
+
+
+def _commented(block: str, note: str = "") -> str:
+    """Comment out an assignment, every line of it, the note on the first."""
+    lines = block.split("\n")
+    first = lines[0]
+    cr = "\r" if first.endswith("\r") else ""
+    ind = re.match(r"[ \t]*", first).group(0)
+    tail = f"    # {note}" if note else ""
+    out = [f"{ind}# {first[len(ind):].rstrip()}{tail}{cr}"]
+    out += [("# " + ln if ln.strip() else ln) for ln in lines[1:]]
+    return "\n".join(out)
+
+
 def _aligned_kv(body: str, key: str, value) -> str:
     """`key = value` padded to the column its siblings in this table already use.
 
@@ -392,14 +434,8 @@ def _reads_as(text: str, header: str, key: str, want) -> bool:
     span = _section_body(text, header)
     if span is None:
         return False
-    m = re.search(r"^[ 	]*" + re.escape(key) + r"\s*=[ 	]*(.+?)[ 	]*(?:#.*)?$",
-                  text[span[0]:span[1]], re.M)
-    if not m:
-        return False
-    try:
-        return tomllib.loads("x = " + m.group(1))["x"] == want
-    except (tomllib.TOMLDecodeError, KeyError, ValueError):
-        return False
+    asg = _assignment(text[span[0]:span[1]], key)
+    return bool(asg and asg[3] and asg[2] == want)
 
 
 def set_toml_key(text: str, header: str, key: str, value) -> str:
@@ -416,18 +452,24 @@ def set_toml_key(text: str, header: str, key: str, value) -> str:
         return text.rstrip("\n") + f"\n\n{header}\n{lit}\n"
     a, b = span
     body = text[a:b]
-    active = re.search(r"^([ \t]*)" + re.escape(key) + r"\s*=.*$", body, re.M)
-    if active:
+    asg = _assignment(body, key)
+    if asg:
+        s, e, cur, parsed = asg
+        if parsed and cur == value:
+            return text          # already holds it: keep the file's own layout
+        block = body[s:e]
+        first = block.split("\n", 1)[0].rstrip("\r")
+        ind = re.match(r"[ \t]*", first).group(0)
         # Keep the file's column alignment: these configs are read by humans.
-        head = active.group(0).split("=", 1)[0]
-        pad = " " * max(0, len(head) - len(active.group(1)) - len(key))
+        head = first.split("=", 1)[0]
+        pad = " " * max(0, len(head) - len(ind) - len(key))
         # And keep any trailing comment. These files are hand-annotated, and
         # rewriting `start_date = "..."   # first plan commit` without the note
         # quietly destroys the reason the value is what it is.
-        tail = re.search(r"(\s+#.*)$", active.group(0))
-        return text[:a] + body[:active.start()] + active.group(1) + key + pad + \
+        tail = re.search(r"(\s+#.*)$", first) if "\n" not in block else None
+        return text[:a] + body[:s] + ind + key + pad + \
             "= " + _toml_val(value) + (tail.group(1) if tail else "") + \
-            body[active.end():] + text[b:]
+            body[e:] + text[b:]
     comm = re.search(r"^[ \t]*#\s*" + re.escape(key) + r"\s*=.*$", body, re.M)
     if comm:
         return text[:a] + body[:comm.start()] + lit + body[comm.end():] + text[b:]
@@ -471,10 +513,13 @@ def set_phase_key(text: str, phase_id: str, key: str, value, plan: str | None = 
             continue
         body = text[a:b]
         lit = _aligned_kv(body, key, value)
-        active = re.search(r"^([ \t]*)" + re.escape(key) + r"\s*=.*$", body, re.M)
-        if active:
-            return text[:a] + body[:active.start()] + active.group(1) + lit + \
-                body[active.end():] + text[b:]
+        asg = _assignment(body, key)
+        if asg:
+            s, e, cur, parsed = asg
+            if parsed and cur == value:
+                return text
+            ind = re.match(r"[ \t]*", body[s:e]).group(0)
+            return text[:a] + body[:s] + ind + lit + body[e:] + text[b:]
         comm = re.search(r"^[ \t]*#\s*" + re.escape(key) + r"\s*=.*$", body, re.M)
         if comm:
             return text[:a] + body[:comm.start()] + lit + body[comm.end():] + text[b:]
@@ -516,13 +561,11 @@ def del_phase_key(text: str, phase_id: str, key: str, note: str = "",
         if not want.search(text[a:b]) or not _span_in_plan(text[a:b], plan):
             continue
         body = text[a:b]
-        active = re.search(r"^([ \t]*)(" + re.escape(key) + r"\s*=.*?)(\r?\n|$)", body, re.M)
-        if not active:
+        asg = _assignment(body, key)
+        if not asg:
             return text                      # already absent; nothing to do
-        tail = f"    # {note}" if note else ""
-        return (text[:a] + body[:active.start()]
-                + f"{active.group(1)}# {active.group(2).rstrip()}{tail}{active.group(3)}"
-                + body[active.end():] + text[b:])
+        s, e = asg[0], asg[1]
+        return text[:a] + body[:s] + _commented(body[s:e], note) + body[e:] + text[b:]
     raise KeyError(f"no [[phase]] with id = {phase_id!r}")
 
 
@@ -1016,12 +1059,15 @@ def apply_project_edits(repo: Path, fields: dict, contexts: list | None = None,
         tofile="docs/progress.toml " + ("(proposed)" if dry_run else "(saved)"), n=2))
     if text == before:
         return {"ok": True, "changed": False, "notes": notes, "diff": "", "written": False}
-    if dry_run:
-        return {"ok": True, "changed": True, "notes": notes, "diff": diff, "written": False}
+    # Checked on Preview too: a preview that shows a change Save will refuse
+    # is the page contradicting itself.
     try:
         tomllib.loads(text)                    # never write a file we just broke
     except tomllib.TOMLDecodeError as exc:
-        return {"ok": False, "error": f"the edit would produce invalid TOML ({exc}) — nothing written"}
+        return {"ok": False, "error": f"the edit would produce invalid TOML ({exc}) — nothing "
+                + ("would be " if dry_run else "") + "written"}
+    if dry_run:
+        return {"ok": True, "changed": True, "notes": notes, "diff": diff, "written": False}
     cfgp.write_bytes(text.replace("\r\n", "\n").replace("\n", eol).encode("utf-8"))
     return {"ok": True, "changed": True, "notes": notes, "diff": diff, "written": True,
             "path": str(cfgp)}
@@ -1591,12 +1637,11 @@ def del_toml_key(text: str, header: str, key: str, note: str = "") -> str:
         return text
     a, b = span
     body = text[a:b]
-    m = re.search(r"^([ \t]*)(" + re.escape(key) + r"\s*=.*?)(\r?\n|$)", body, re.M)
-    if not m:
+    asg = _assignment(body, key)
+    if not asg:
         return text
-    tail = f"    # {note}" if note else ""
-    return (text[:a] + body[:m.start()] + f"{m.group(1)}# {m.group(2).rstrip()}{tail}{m.group(3)}"
-            + body[m.end():] + text[b:])
+    s, e = asg[0], asg[1]
+    return text[:a] + body[:s] + _commented(body[s:e], note) + body[e:] + text[b:]
 
 
 def plan_table(cfg: dict, plan: str | None = None) -> dict:
