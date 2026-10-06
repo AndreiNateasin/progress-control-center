@@ -440,6 +440,18 @@ digest when present, because they change what runs.
 - Codex session addressing
 - the startup cost of any new launch
 
+## What the checklist shows that it does not count
+
+Only top-level entries (or checkboxes) are items, and only open, unsuperseded ones
+are work. Two things are shown without being counted. A superseded entry stays in
+plan order, greyed, with the reason the plan gives, so a phase never seems to have
+lost items. And an entry whose first line is only a heading (`Cutover:`) shows its
+nested bullets under it, each as its first sentence with the full text on hover; a
+bullet marked `[x]`, or starting "done", shows as done. In checkbox mode a nested
+checkbox is an item of its own and is not repeated there. The display list is a
+second parse kept apart from the counted one, and the page falls back to the
+counted list whenever the two disagree.
+
 ## A phase's exit test is its outcomes
 
 A phase ends when some things are true, so its exit test is a short list of
@@ -473,7 +485,8 @@ the named phase, then across the plan), and ambiguity is a refusal, never a gues
 A reword keeps the line's marker and state; an add copies its neighbour's style (a
 list-tracked plan gets the next number and no box, because a box would change how
 the plan is read); a drop keeps the item with `— superseded: <why>`, and an open
-superseded item no longer counts as work; a redo flags the done item `— needs redo`
+superseded item no longer counts as work but stays on the checklist, greyed, with
+its reason, and the phase line says how many there are; a redo flags the done item `— needs redo`
 and adds the redo as new work. A ticked item is never rewritten. A note, or a
 proposal whose target has moved, cannot be a line edit and offers *Re-plan with
 this* instead, which opens the plan-level re-plan with the proposals as steering.

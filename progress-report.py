@@ -1532,6 +1532,62 @@ SUPERSEDED = re.compile(r"(?:\u2014|\u2013|--|\s-)\s*superseded:", re.I)
 
 
 
+def _superseded_parts(label: str) -> dict:
+    """A superseded entry's own text and the reason the plan gives."""
+    m = SUPERSEDED.search(label)
+    if not m:
+        return {"label": label, "reason": ""}
+    return {"label": label[:m.start()].strip().rstrip("\u2014-").strip(),
+            "reason": label[m.end():].strip()}
+
+
+def _nested_detail(lines: list[str], start: int, base: int, skip_boxes: bool = False) -> list[dict]:
+    """The first-level bullets nested under an item whose label is only a
+    heading ("Cutover:") - its real content, shown under it, never counted.
+    Wrapped lines join their bullet; deeper bullets are left out. A bullet
+    marked [x], or starting "done", reads as done. With skip_boxes (checkbox
+    mode) a nested checkbox is an item of its own and is left out here."""
+    out, lvl, deep = [], None, False
+    for ln in lines[start:start + 400]:
+        if not ln.strip():
+            continue
+        ind = len(ln) - len(ln.lstrip())
+        if ind <= base or re.match(r"^#{1,6}\s", ln) or _FENCE.match(ln):
+            break
+        b = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[([ xX~/-])\]\s+)?(.*)$", ln)
+        if b and skip_boxes and b.group(1) is not None:
+            deep = True                      # its own item in checkbox mode
+            continue
+        if b and (lvl is None or ind <= lvl):
+            lvl = ind if lvl is None else lvl
+            out.append({"text": b.group(2).strip(), "mark": b.group(1) or ""})
+            deep = False
+        elif b:
+            deep = True
+        elif out and not deep:
+            out[-1]["text"] += " " + ln.strip()
+    res = []
+    for d in out:
+        t = _clean_label(d["text"]).rstrip(";").strip()
+        if t:
+            res.append({"text": t, "done": d["mark"] in ("x", "X") or bool(re.match(r"(?i)done\b", t))})
+    return res
+
+
+def _gist(t: str, cap: int = 170) -> str:
+    """The first sentence of a long bullet; the full text goes in a tooltip."""
+    cut = len(t)
+    for sep in (". ", "; "):
+        k = t.find(sep, 24)
+        if k != -1:
+            cut = min(cut, k + 1)
+    s = t[:cut].rstrip(";").strip()
+    if len(s) > cap:
+        s = s[:cap].rsplit(" ", 1)[0] + "\u2026"
+    return s
+
+
+
 # A phase's exit test: what must be true when the phase ends, as a short list
 # of outcomes. From docs/progress.toml when set there (a list, or a string
 # whose parts are separated by ";"); otherwise derived from the plan - the
@@ -1631,7 +1687,7 @@ def git_branch(repo: Path) -> str:
         return ""
 
 
-def parse_checklist(text: str, file: str | None = None) -> list[dict]:
+def parse_checklist(text: str, file: str | None = None, keep_superseded: bool = False) -> list[dict]:
     """Pull `- [ ]` items out of a markdown blob, keeping order and state.
 
     `file` and the verbatim `raw` line are carried through so an editor (see
@@ -1671,10 +1727,17 @@ def parse_checklist(text: str, file: str | None = None) -> list[dict]:
         # and the flag says the new direction wants it redone. The redo itself
         # is a separate open item, so the maths stays honest either way.
         redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
-        if state != "done" and SUPERSEDED.search(label):
+        sup = state != "done" and bool(SUPERSEDED.search(label))
+        if sup and not keep_superseded:
             continue
         out.append({"state": state, "label": label.strip(),
                     "file": file, "raw": raw, "redo": redo})
+        if sup:
+            out[-1].update(superseded=True, **_superseded_parts(label.strip()))
+        elif label.strip().endswith(":"):
+            det = _nested_detail(lines, i, len(raw) - len(raw.lstrip()), skip_boxes=True)
+            if det:
+                out[-1]["detail"] = det
     return out
 
 
@@ -2126,7 +2189,7 @@ _FENCE = re.compile(r"^\s*(```|~~~)")
 _HRULE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
 
 
-def parse_list_items(text: str, file: str | None = None) -> list[dict]:
+def parse_list_items(text: str, file: str | None = None, keep_superseded: bool = False) -> list[dict]:
     """items = "lists": every top-level list entry is an item.
 
     For a plan written as numbered steps with no checkboxes. The state lives in
@@ -2159,17 +2222,24 @@ def parse_list_items(text: str, file: str | None = None) -> list[dict]:
         label = _clean_label(" ".join(parts))
         state = _state(m.group(2)) if m.group(2) is not None else "todo"
         redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
-        if state != "done" and SUPERSEDED.search(label):
+        sup = state != "done" and bool(SUPERSEDED.search(label))
+        if sup and not keep_superseded:
             continue
         out.append({"state": state, "label": label, "file": file, "raw": raw,
                     "redo": redo, "implied": m.group(2) is None})
+        if sup:
+            out[-1].update(superseded=True, **_superseded_parts(label))
+        elif label.endswith(":"):
+            det = _nested_detail(lines, i, 0)
+            if det:
+                out[-1]["detail"] = det
     # A phase written as a table ("today | becomes") has no list entries; its
     # body rows are the units of work. Only as a fallback, so a table beside a
     # list stays documentation.
-    return out or _parse_table_items(text, file)
+    return out or _parse_table_items(text, file, keep_superseded)
 
 
-def _parse_table_items(text: str, file: str | None = None) -> list[dict]:
+def _parse_table_items(text: str, file: str | None = None, keep_superseded: bool = False) -> list[dict]:
     out, lines, fence = [], text.splitlines(), False
     for n, ln in enumerate(lines):
         if _FENCE.match(ln):
@@ -2187,15 +2257,21 @@ def _parse_table_items(text: str, file: str | None = None) -> list[dict]:
         label = _clean_label(" \u2192 ".join(cells[:2]))
         state = _state(m.group(2)) if m.group(2) is not None else "todo"
         redo = bool(state == "done" and re.search(r"needs redo:", label, re.I))
-        if state != "done" and SUPERSEDED.search(label):
+        sup = state != "done" and bool(SUPERSEDED.search(label))
+        if sup and not keep_superseded:
             continue
         out.append({"state": state, "label": label, "file": file, "raw": ln,
                     "redo": redo, "implied": m.group(2) is None})
+        if sup:
+            out[-1].update(superseded=True, **_superseded_parts(label))
     return out
 
 
-def parse_items(text: str, file: str | None, mode: str) -> list[dict]:
-    return parse_list_items(text, file) if mode == "lists" else parse_checklist(text, file)
+def parse_items(text: str, file: str | None, mode: str, keep_superseded: bool = False) -> list[dict]:
+    """Counted items; with keep_superseded, also the superseded entries (flagged),
+    for display only - nothing that counts may ask for them."""
+    return (parse_list_items(text, file, keep_superseded) if mode == "lists"
+            else parse_checklist(text, file, keep_superseded))
 
 
 def detect_items_mode(texts: list[str]) -> str:
@@ -3357,14 +3433,21 @@ def build(repo: Path) -> dict:
 
         # Prefer a dedicated phase doc: it is granular and kept current during the
         # phase. Fall back to the plan's own checklist for phases not yet started.
-        items, src = [], None
+        items, src, view = [], None, []
         doc = p.get("doc")
         if doc and (repo / doc).exists():
-            items = parse_items((repo / doc).read_text(encoding="utf-8", errors="replace"), doc, mode)
+            _dt = (repo / doc).read_text(encoding="utf-8", errors="replace")
+            items = parse_items(_dt, doc, mode)
+            view = parse_items(_dt, doc, mode, keep_superseded=True)
             src = doc
         if not items and pid in sections:
             items = parse_items(sections[pid], proj.get("plan", DEFAULT_PLAN), mode)
+            view = parse_items(sections[pid], proj.get("plan", DEFAULT_PLAN), mode, keep_superseded=True)
             src = f"{proj.get('plan')} §6"
+        # The display list is the counted list plus superseded entries in plan
+        # order. If the two ever disagree on the counted part, show the counted.
+        if [x["raw"] for x in view if not x.get("superseded")] != [x["raw"] for x in items]:
+            view = items
 
         done = sum(1 for i in items if i["state"] == "done")
         active = sum(1 for i in items if i["state"] == "active")
@@ -3385,7 +3468,8 @@ def build(repo: Path) -> dict:
         ex, ex_src = phase_exit(p, sections.get(pid, ""), doc_text)
         p.update(items=items, item_source=src, done=done, active=active,
                  total=total, pct=pct, status=status,
-                 exit=ex, exit_source=ex_src, exit_test="; ".join(ex))
+                 exit=ex, exit_source=ex_src, exit_test="; ".join(ex),
+                 items_view=view, superseded=sum(1 for x in view if x.get("superseded")))
         phases.append(p)
 
     schedule(phases)
@@ -3802,6 +3886,17 @@ li.item.empty{color:var(--ink-3)}
 li.item[data-s="done"] .tick{background:var(--done-soft);border-color:transparent}
 li.item[data-s="active"] .tick{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
 details.idet{min-width:0}
+ul.items li.sup{display:grid;grid-template-columns:24px 1fr;gap:10px;align-items:start;color:var(--ink-3)}
+li.sup .supmark{width:24px;height:24px;display:grid;place-items:center;font-size:12px}
+li.sup .lbl{text-decoration:line-through;text-decoration-color:var(--line)}
+.suppill{margin-left:8px;font-family:var(--mono);font-size:10px;letter-spacing:.08em;
+  text-transform:uppercase;padding:2px 7px;border-radius:5px;background:var(--todo-soft);color:var(--ink-2)}
+.supwhy{display:block;font-size:12.5px;margin-top:1px}
+ul.items ul.subs{grid-column:2;list-style:none;margin:0 0 6px;padding:0;display:flex;flex-direction:column;gap:3px}
+ul.items ul.subs li{display:grid;grid-template-columns:14px 1fr;gap:6px;font-size:13px;line-height:1.45;color:var(--ink-2)}
+ul.items ul.subs li.sdone{color:var(--ink-3)}
+ul.items ul.subs .sm{color:var(--ink-3)}
+ul.items ul.subs li.sdone .sm{color:var(--done)}
 details.idet > summary{cursor:pointer;list-style:none;font-size:14px;line-height:1.5;
   padding:2px 0;border-radius:5px;min-height:24px;display:flex;align-items:center}
 details.idet > summary::-webkit-details-marker{display:none}
@@ -4490,7 +4585,23 @@ def render(d: dict) -> str:
         # undiscoverable anyway. It now says what it does.
         NEXT = {"todo": "done", "done": "active", "active": "todo"}
         GLYPH = {"done": "✓", "active": "~", "todo": ""}
+        def sub_html(i: dict) -> str:
+            det = i.get("detail") or []
+            if not det:
+                return ""
+            return ('<ul class="subs">' + "".join(
+                f'<li class="{"sdone" if s["done"] else ""}" title="{e(s["text"])}">'
+                f'<span class="sm" aria-hidden="true">{"✓" if s["done"] else "·"}</span>'
+                f'<span>{e(_gist(s["text"]))}</span></li>' for s in det) + "</ul>")
+
+        def sup_html(i: dict) -> str:
+            return (f'<li class="sup" data-s="superseded"><span class="supmark" aria-hidden="true">–</span>'
+                    f'<div><span class="lbl">{e(i["label"])}</span><span class="suppill">superseded</span>'
+                    + (f'<span class="supwhy">{e(i["reason"])}</span>' if i.get("reason") else "")
+                    + '</div></li>')
+
         items_html = "".join(
+            sup_html(i) if i.get("superseded") else
             f'<li class="item" data-s="{i["state"]}" data-item="{e(i["label"])}">'
             f'<button class="tick" type="button" data-next="{NEXT.get(i["state"], "done")}"'
             f' aria-label="{e(i["state"])}: {e(i["label"])}. Change state."'
@@ -4509,8 +4620,8 @@ def render(d: dict) -> str:
                f'<div class="launch" data-phase="{e(p["id"])}" data-item="{e(i["label"])}">'
                f'<code></code></div></details></div>'
                if i["state"] != "done" else '<div class="ibar"></div>')
-            + '</details></li>'
-            for i in p["items"]) or \
+            + '</details>' + sub_html(i) + '</li>'
+            for i in (p.get("items_view") or p["items"])) or \
             '<li class="item empty"><span></span><span class="lbl quiet">'\
             'No checklist items found for this phase.</span></li>'
 
@@ -4534,7 +4645,8 @@ def render(d: dict) -> str:
                f'{p["done"]}/{p["total"]} done</span>'
                if p.get("continuous") else
                f'<span class="pmeta num">{e(p["start_date"])} → {e(p["end_date"])} · '
-               f'{p.get("days",0)}d · {p["done"]}/{p["total"]} done</span>')
+               f'{p.get("days",0)}d · {p["done"]}/{p["total"]} done'
+               + (f' · {p["superseded"]} superseded' if p.get("superseded") else "") + '</span>')
             + f'<span class="bar"><i style="width:{p["pct"]}%"></i></span></span>'
             f'<span class="ppct num">{p["pct"]}%</span>'
             f'</summary>'
