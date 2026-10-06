@@ -1638,8 +1638,8 @@ def phase_activity(phase_id: str, model: dict) -> dict:
     docs = [d for d in (ph.get("doc"), ) if d]
     paths = mods + docs
     if not paths:
-        return {"ok": True, "paths": [], "commits": [], "stat": "",
-                "note": "no modules or doc declared for this phase — add `modules` to see activity"}
+        return {"ok": True, "paths": [], "commits": [], "stat": "", "branch": _pr.git_branch(REPO),
+                "note": "add `modules` to this phase to see its commits here"}
     try:
         # Check the exit code. A failed git run yields empty stdout, which is
         # indistinguishable from "succeeded and found nothing" — so the panel
@@ -1661,7 +1661,8 @@ def phase_activity(phase_id: str, model: dict) -> dict:
         bits = line.split("|", 3)
         if len(bits) == 4:
             commits.append(dict(zip(("sha", "date", "author", "subject"), bits)))
-    return {"ok": True, "paths": paths, "commits": commits, "stat": stat}
+    return {"ok": True, "paths": paths, "commits": commits, "stat": stat,
+            "branch": _pr.git_branch(REPO)}
 
 
 def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
@@ -2028,7 +2029,7 @@ def ticket_prompt(ph: dict, plan: str, doc: str, open_items: list,
         "reading is that the scope and the acceptance criteria are TRUE, not that the "
         "ticket recounts what you read.\n\n"
 
-        f"Exit test for the phase: {ph.get('exit_test', 'see plan')}\n"
+        f"Exit test for the phase: {ph.get('exit_test') or 'none written yet'}\n"
         f"Open checklist items:\n{items}\n"
         + (f"JIRA project key: {project}\n" if project else "")
 
@@ -3566,7 +3567,7 @@ JS = r"""
     panel.appendChild(box);
     var seen = null, pending = false, showHandled = false, last = null, shown = null;
     try { var sv = sessionStorage.getItem('pccChangesShown'); if(sv !== null) shown = sv === '1'; } catch(e){}
-    var KINDS = {reword: 1, add: 1, drop: 1, redo: 1, note: 1, unreadable: 1};
+    var KINDS = {reword: 1, add: 1, drop: 1, redo: 1, note: 1, exit: 1, unreadable: 1};
     var STATUS = {applied: 'applied', dismissed: 'dismissed', replan: 'sent to re-plan'};
     try {
       var note = sessionStorage.getItem('pccPlanChangeNote');
@@ -4038,12 +4039,15 @@ JS = r"""
     sessionStrip(p, det, say);
     wireTicks(det);
 
-    // Work tree: what git says actually happened under this phase's modules.
+    // Branch and activity: what git says happened under this phase's code paths.
     var box = det.querySelector('.pactivity');
     if(box){
       box.innerHTML = '<span class="quiet">loading activity…</span>';
       api('/api/phase/activity', {phase: p.id}).then(function(d){
         if(!d.ok){ box.innerHTML = '<span class="dstatus err">'+esc(d.error)+'</span>'; return; }
+        // the branch as it is now - the render may predate a checkout
+        var bEl = det.querySelector('.pbranch');
+        if(bEl && d.branch) bEl.textContent = d.branch;
         if(d.note){ box.innerHTML = '<span class="quiet">'+esc(d.note)+'</span>'; return; }
         var rows = d.commits.map(function(c){
           return '<div><span class="num quiet">'+esc(c.date)+'  '+esc(c.sha)+'</span>  '+

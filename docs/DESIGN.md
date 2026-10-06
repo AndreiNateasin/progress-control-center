@@ -97,7 +97,7 @@ name       = "Ingest pipeline"
 days       = 3
 depends_on = []
 doc        = "docs/PHASE-1.md"     # else the plan's own phase section
-exit_test  = "curl /health -> 200"
+exit_test  = ["curl /health -> 200", "ingest backlog drained"]   # outcomes; else from the plan
 modules    = ["services/ingest"]   # paths; the phase shows git activity under them
 test       = "smoke"               # id of an [[action]] — see below
 owner      = "alice"
@@ -439,6 +439,23 @@ digest when present, because they change what runs.
   `tick` the shared surface
 - Codex session addressing
 - the startup cost of any new launch
+
+## A phase's exit test is its outcomes
+
+A phase ends when some things are true, so its exit test is a short list of
+outcomes, each with its check, in the shape an item's brief uses for "how we'll
+know it's done". The list comes from `exit_test` in the phase's block when that is
+set (a list, or a string whose parts are separated by `;`), and otherwise from the
+plan: the phase section's `Exit criteria:` / `Exit test:` / `Done when:` entry (as a
+list entry, a bold paragraph or a sub-heading), its nested bullets or its inline
+text. Derived, not copied: the plan stays the one place the outcomes are written.
+
+A phase with none gets its session to propose them when it opens: two to four
+outcomes in plain words, recorded as an `exit` proposal. Apply writes them into the
+plan's phase section as an `Exit criteria:` block with indented bullets, which are
+not checklist items in either items mode, so no count moves. The phase's facts also
+show the branch the checkout is on, refreshed live when the phase opens, and the
+declared `modules` as code paths with their git activity.
 
 ## Sessions propose plan changes; a person applies them
 

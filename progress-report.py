@@ -1531,6 +1531,106 @@ def _state(mark: str) -> str:
 SUPERSEDED = re.compile(r"(?:\u2014|\u2013|--|\s-)\s*superseded:", re.I)
 
 
+
+# A phase's exit test: what must be true when the phase ends, as a short list
+# of outcomes. From docs/progress.toml when set there (a list, or a string
+# whose parts are separated by ";"); otherwise derived from the plan - the
+# phase's "Exit criteria:" / "Exit test:" / "Done when:" entry, its nested
+# bullets or its inline text. Derived, not copied: the plan stays the one
+# place the outcomes are written.
+EXIT_HEAD = re.compile(
+    r"^(\s*)(?:(?:\d+[.)]|[-*+])\s+)?(?:\[[ xX~/-]\]\s+)?(?:\*\*|__)?"
+    r"(?:exit\s+criteri(?:a|on)|exit\s+tests?|done\s+when|definition\s+of\s+done)"
+    r"\s*(?:\*\*|__)?\s*:\s*(?:\*\*|__)?\s*(.*)$", re.I)
+EXIT_SUBHEAD = re.compile(
+    r"^#{2,6}\s+(?:exit\s+criteri(?:a|on)|exit\s+tests?|done\s+when|definition\s+of\s+done)\s*:?\s*$", re.I)
+_OUTCOME = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX~/-]\]\s+)?(.*)$")
+
+
+def _split_outcomes(s: str) -> list[str]:
+    return [x.strip() for x in re.split(r"\s*;\s*", s) if x.strip()]
+
+
+def _exit_from_text(text: str) -> list[str]:
+    """The first exit block in a markdown text, as outcomes ([] when none)."""
+    lines, fence = text.splitlines(), False
+    for n, ln in enumerate(lines):
+        if _FENCE.match(ln):
+            fence = not fence
+            continue
+        if fence:
+            continue
+        sub = EXIT_SUBHEAD.match(ln)
+        m = None if sub else EXIT_HEAD.match(ln)
+        if not (sub or m):
+            continue
+        ind = 0 if sub else len(m.group(1))
+        # an entry ("5. **Exit criteria:**") owns only what is nested under it;
+        # a paragraph ("**Exit criteria:**") owns the list that follows it
+        entry = bool(m) and bool(re.match(r"\s*(?:\d+[.)]|[-*+])\s", ln))
+        out, inline, blank = [], ("" if sub else m.group(2).strip()), False
+        for nxt in lines[n + 1:]:
+            if not nxt.strip():
+                blank = True
+                continue
+            if re.match(r"^#{1,6}\s", nxt):
+                break
+            nind = len(nxt) - len(nxt.lstrip())
+            if (entry and nind <= ind) or (not sub and nind < ind):
+                break
+            b = _OUTCOME.match(nxt)
+            if b:
+                if re.match(r"^\s*[-*]\s*\[[ xX~/-]\]", nxt) and not entry:
+                    break                      # a checklist item, not an outcome
+                out.append(b.group(1).strip())
+            elif out and nind > ind:
+                out[-1] += " " + nxt.strip()   # a wrapped outcome
+            elif not out and not blank and not sub:
+                inline = (inline + " " + nxt.strip()).strip()
+            else:
+                break
+            blank = False
+        outs = [o for o in (_clean_label(x).rstrip(";").strip() for x in out) if o]
+        if outs:
+            return outs
+        return _split_outcomes(_clean_label(inline)) if inline else []
+    return []
+
+
+def phase_exit(p: dict, section: str, doc_text: str = "") -> tuple[list[str], str]:
+    """(outcomes, source): source is "config", "plan" or "" when there are none."""
+    v = p.get("exit_test")
+    if isinstance(v, list):
+        out = [_clean_label(str(x)).strip() for x in v if str(x).strip()]
+        if out:
+            return out, "config"
+    elif isinstance(v, str) and v.strip() and v.strip().upper() != "TODO":
+        return _split_outcomes(v), "config"
+    for text in (doc_text, section):
+        out = _exit_from_text(text or "")
+        if out:
+            return out, "plan"
+    return [], ""
+
+
+def git_branch(repo: Path) -> str:
+    """The checkout's current branch, `detached at <sha>`, or "" when git cannot say."""
+    def run(*a: str) -> str:
+        r = subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True,
+                           timeout=10, **TEXT_IO)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    try:
+        # symbolic-ref names the branch even before its first commit, where
+        # rev-parse --abbrev-ref fails; it fails only on a detached HEAD
+        b = run("symbolic-ref", "--short", "-q", "HEAD")
+        if b:
+            return b
+        sha = run("rev-parse", "--short", "HEAD")
+        return f"detached at {sha}" if sha else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def parse_checklist(text: str, file: str | None = None) -> list[dict]:
     """Pull `- [ ]` items out of a markdown blob, keeping order and state.
 
@@ -2430,7 +2530,7 @@ def steering_rule(proposals_file: str) -> str:
 # (applied, dismissed, sent to re-plan) in a separate state file, so a session
 # writing while the page writes can never lose a line.
 
-PROPOSAL_KINDS = ("reword", "add", "drop", "redo", "note")
+PROPOSAL_KINDS = ("reword", "add", "drop", "redo", "note", "exit")
 CHANGES_HEADING = "Plan changes along the way"
 _ITEM_HEAD = re.compile(r"^(\s*[-*]\s*\[[ xX~/-]\]\s*|(?:\d+[.)]|[-*+])[ \t]+(?:\[[ xX~/-]\][ \t]+)?)(\S.*?)\s*$")
 _LABEL_CONT = re.compile(r"^\s{2,}(?![-*+>]\s|\d+[.)]\s)\S")
@@ -2485,6 +2585,11 @@ def read_proposals(path: Path) -> list[dict]:
         r = {"id": pid, "line": n, "kind": kind,
              "phase": re.sub(r"(?i)^phase\s*", "", g("phase")),
              "from": g("from"), "target": g("target"), "text": g("text"), "why": g("why")}
+        if kind == "exit":
+            its = rec.get("items")
+            its = its if isinstance(its, list) else re.split(r"\s*;\s*|\n", str(rec.get("text") or ""))
+            r["items"] = [re.sub(r"\s+", " ", str(x)).strip() for x in its if str(x).strip()]
+            r["text"] = "; ".join(r["items"])
         if kind not in PROPOSAL_KINDS:
             r["problem"] = f'unknown kind "{kind}" - expected one of {", ".join(PROPOSAL_KINDS)}'
         out.append(r)
@@ -2669,7 +2774,37 @@ def _plan_proposal(repo: Path, model: dict, rec: dict, today: str) -> dict:
         L.insert(at, line + _file_eol(L))
 
     ops: list[dict] = []
-    if kind == "add":
+    if kind == "exit":
+        ph = next((p for p in phases if str(p["id"]) == pid), None)
+        if ph is None:
+            raise _Refuse(f"no Phase {pid or '?'} in this plan")
+        outs = [o for o in (rec.get("items") or []) if o]
+        if not outs:
+            raise _Refuse("an exit proposal needs its outcomes, as items")
+        if ph.get("exit_source") == "config":
+            raise _Refuse(f"Phase {ph['id']}'s exit test is set in docs/progress.toml - edit it there")
+        if ph.get("exit"):
+            raise _Refuse(f"Phase {ph['id']} already has exit criteria in the plan - edit them "
+                          "there or re-plan")
+        L = _md_lines(repo, texts, plan_rel)
+        full = "".join(L)
+        sec = plan_phase_sections(full).get(str(ph["id"]))
+        if not sec:
+            raise _Refuse(f"the plan has no Phase {ph['id']} heading to add them under")
+        first = full.count("\n", 0, full.find(sec))
+        last = first + sec.rstrip("\r\n").count("\n")       # the section's last line
+        while last > first and not L[last].strip():
+            last -= 1
+        if not L[last].endswith(("\n", "\r")):
+            L[last] += _file_eol(L)
+        # indented bullets: an outcome is not a checklist item in either items mode
+        block = ["", "**Exit criteria:**"] + [f"  - {o}" for o in outs]
+        L[last + 1:last + 1] = [x + _file_eol(L) for x in block]
+        ops.append({"file": plan_rel, "before": [], "after": block})
+        n_out = f"{len(outs)} outcome" + ("" if len(outs) == 1 else "s")
+        summary = f"exit criteria for Phase {ph['id']}: {n_out}"
+        logline = f"added exit criteria ({n_out})"
+    elif kind == "add":
         if not text:
             raise _Refuse("an add needs the new item's text")
         if rec.get("target"):
@@ -2825,6 +2960,36 @@ def _phase_context(p: dict, plan_name: str) -> str:
     return " ".join(bits)
 
 
+def _exit_lines(p: dict) -> str:
+    ex = p.get("exit") or []
+    if not ex:
+        return "- Exit test: none written yet."
+    return "- Exit test - true when this phase ends:\n" + "\n".join(f"  - {x}" for x in ex)
+
+
+def _exit_ask(p: dict, plan_name: str) -> str:
+    """A phase with no exit test gets its session to propose one on opening -
+    as a proposal, so it lands in the plan only after the user applies it."""
+    if p.get("exit"):
+        return ""
+    shape = json.dumps({"phase": str(p["id"]), "kind": "exit",
+                        "items": ["<outcome> (<its check>)", "..."],
+                        "why": "the phase had no exit test"})
+    return ("This phase has no exit test yet. In the same reply, after the one-line "
+            "acknowledgement, propose 2-4 outcomes that must be true when it ends - plain "
+            "words, each followed by its check in parentheses - and once confirmed append "
+            f"them as ONE line to {proposals_file_of(plan_name)}: {shape}. The user applies "
+            "it from the dashboard, which writes them into the plan.\n\n")
+
+
+def exit_html(p: dict) -> str:
+    ex = p.get("exit") or []
+    if not ex:
+        return ('<span class="quiet">none yet \u2014 the phase session proposes them when it '
+                'opens, and Apply adds them to the plan</span>')
+    return '<ul class="exitlist">' + "".join(f"<li>{e(x)}</li>" for x in ex) + "</ul>"
+
+
 def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
     """The OPENING brief of a phase session - sent once.
 
@@ -2838,7 +3003,7 @@ def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
     items = p.get("items") or []
     open_items = [i for i in items if i["state"] != "done"]
     lines = [f"- Read now: {doc}.",
-             f"- Exit test: {p.get('exit_test') or 'see plan'}",
+             _exit_lines(p),
              "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
     if p.get("jira") or p.get("plan_ticket"):
         lines.append(f"- Ticket: {p.get('jira') or p.get('plan_ticket')} - reference it in commits.")
@@ -2875,6 +3040,7 @@ def phase_prompt(p: dict, plan_name: str, providers: list) -> str:
             + (f"\n\nSOURCES for this plan (read on demand, never paste whole; a MISSING one "
                f"was declared but is not here):\n{p['sources_block']}" if p.get("sources_block") else "")
             + prompt_appendix(providers) + "\n\n"
+            + _exit_ask(p, plan_name) +
             "No item yet: acknowledge this brief in one line - what the phase is for and "
             'how many items are open - then WAIT for the first "Next item".')
 
@@ -2947,7 +3113,7 @@ def phase_brief(p: dict, plan_name: str, providers: list) -> str:
     tick = tick_file_of(p, plan_name)
     facts = [f"- Plan: {plan_name}",
              f"- Phase context: {_source(p, plan_name)}",
-             f"- Exit test: {p.get('exit_test') or 'see plan'}",
+             _exit_lines(p),
              "- Modules: " + (", ".join(p["modules"]) if p.get("modules") else "none declared")]
     if p.get("jira") or p.get("plan_ticket"):
         facts.append(f"- Ticket: {p.get('jira') or p.get('plan_ticket')}")
@@ -3214,8 +3380,12 @@ def build(repo: Path) -> dict:
         if p.get("continuous") and status == "todo" and done:
             status = "active"
 
+        doc_text = ((repo / doc).read_text(encoding="utf-8", errors="replace")
+                    if doc and (repo / doc).exists() else "")
+        ex, ex_src = phase_exit(p, sections.get(pid, ""), doc_text)
         p.update(items=items, item_source=src, done=done, active=active,
-                 total=total, pct=pct, status=status)
+                 total=total, pct=pct, status=status,
+                 exit=ex, exit_source=ex_src, exit_test="; ".join(ex))
         phases.append(p)
 
     schedule(phases)
@@ -3440,6 +3610,7 @@ def build(repo: Path) -> dict:
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "today": today.isoformat(),
         "phases": phases,
+        "branch": git_branch(repo),
         "items_mode": mode,
         "plans": known_plans(raw_cfg),
         "plan_ticket": plan_ticket(raw_cfg),
@@ -3616,6 +3787,8 @@ details.phase[data-s="active"] .bar i{background:var(--accent)}
 .pfacts dt{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
   color:var(--ink-3);padding-top:2px}
 .pfacts dd{margin:0}
+.exitlist{margin:0;padding-left:18px}
+.exitlist li{margin:2px 0}
 
 /* checklist: the tick is a real button OUTSIDE the item's <summary>, because a
    control nested in a summary steals its activation, and a box that silently
@@ -4371,9 +4544,10 @@ def render(d: dict) -> str:
             f'<ul class="items">{items_html}</ul>'
             f'<dl class="pfacts">'
             + (f'<dt>Ticket</dt><dd>{jira_body_link(p)}</dd>' if p.get("jira") else "")
-            + f'<dt>Exit test</dt><dd>{e(p.get("exit_test", "")) or "—"}</dd>'
+            + f'<dt>Exit test</dt><dd>{exit_html(p)}</dd>'
             f'<dt>Unlocks</dt><dd>{e(unlocks)}</dd>'
-            f'<dt>Work tree</dt><dd>{e(", ".join(p.get("modules") or [])) or "—"}'
+            + (f'<dt>Code paths</dt><dd>{e(", ".join(p["modules"]))}</dd>' if p.get("modules") else "")
+            + f'<dt>Branch</dt><dd><span class="pbranch num">{e(d.get("branch") or "—")}</span>'
             f'<div class="pactivity"></div></dd>'
             f'</dl>'
             f'<details class="promptfold"><summary>session prompt</summary>'
@@ -4523,14 +4697,14 @@ def render(d: dict) -> str:
             curl = (ctmpl_all
                     .replace("{summary}", quote(f"Phase {p['id']}: {p['name']}"))
                     .replace("{description}",
-                             quote(f"Exit test: {p.get('exit_test', 'see plan')} — from {plan_name}")))
+                             quote(f"Exit test: {p.get('exit_test') or 'none written yet'} — from {plan_name}")))
         pdata[p["id"]] = {
             "id": p["id"], "name": p["name"], "status": p["status"], "pct": p["pct"],
             "done": p["done"], "total": p["total"], "days": p.get("days", 0),
             "start": p.get("start_date", ""), "end": p.get("end_date", ""),
             "owner": p.get("owner", ""), "critical": p["critical"],
             "group": p.get("group", ""), "continuous": bool(p.get("continuous")),
-            "doc": p.get("doc", ""), "exit_test": p.get("exit_test", ""),
+            "doc": p.get("doc", ""), "exit_test": p.get("exit_test", ""), "exit": p.get("exit", []),
             "modules": p.get("modules", []), "depends_on": p.get("depends_on", []),
             "dependents": p.get("dependents", []), "blocked_by": p.get("blocked_by", []),
             "startable": p.get("startable", False), "test": p.get("test", ""),

@@ -91,8 +91,9 @@ there is only one of them.
 
 ## What you get
 
-**A phase list.** Each phase expands in place to its checklist, exit test, what it
-unlocks, and the git activity under its modules. Filter to what's *ready* (every
+**A phase list.** Each phase expands in place to its checklist, its exit test (the
+outcomes that must be true when it ends), what it unlocks, the branch the checkout is
+on, and the git activity under its modules. Filter to what's *ready* (every
 dependency met), what's *blocked*, or what's *done*.
 
 **A schedule you did not write.** From `depends_on` and `days` it computes the
@@ -286,7 +287,7 @@ name       = "Ingest pipeline"
 days       = 3                      # working days of focused effort, not calendar
 depends_on = []                     # the REAL technical dependency, not plan order
 doc        = "docs/PHASE-1.md"
-exit_test  = "curl /health -> 200"
+exit_test  = ["curl /health -> 200", "ingest backlog drained"]   # outcomes; else read from the plan
 modules    = ["services/ingest"]    # paths; the phase shows git activity under them
 test       = "smoke"                # id of an [[action]] — never a command itself
 owner      = "alice"
