@@ -1887,7 +1887,7 @@ def session_states(repo: Path, now: float | None = None) -> list[dict]:
         except OSError:
             continue
         title = where = phase = item = None
-        last_asst, last_kind = None, None
+        last_asst, last_kind, first_line = None, None, ""
         for ln in text.splitlines():
             if not ln.startswith("{"):
                 continue
@@ -1917,6 +1917,11 @@ def session_states(repo: Path, now: float | None = None) -> list[dict]:
                 s = c if isinstance(c, str) else " ".join(
                     b.get("text", "") for b in (c or []) if isinstance(b, dict) and b.get("type") == "text")
                 last_kind = "user"
+                # an untitled session is named by its first real prompt line
+                if not first_line and not o.get("isMeta"):
+                    ln0 = next((x.strip() for x in (s or "").splitlines() if x.strip()), "")
+                    if ln0 and not ln0.startswith("<"):
+                        first_line = ln0[:80]
                 hit = PHASE_ASK.search(s or "")
                 if hit:
                     phase, item = hit.group(1), hit.group(3).strip()
@@ -1930,7 +1935,7 @@ def session_states(repo: Path, now: float | None = None) -> list[dict]:
             elif age < 12 * 3600:
                 state = "turn"
         if state:
-            out.append({"sid": f.stem, "state": state, "title": title or "a Claude session",
+            out.append({"sid": f.stem, "state": state, "title": title or first_line or "a Claude session",
                         "where": where or "a Claude session", "phase": phase or "", "item": item or "",
                         "at": (last_asst or {}).get("at", "")})
     return out
@@ -2032,13 +2037,14 @@ def project_card(e: dict, live: dict, now: float) -> dict:
             what = s["title"]
         row = {"kind": s["state"], "phase": s["phase"], "title": what, "at": s["at"],
                "resume": f'cd "{p}"; claude --resume {s["sid"]}'}
+        # the session's own title only when the row is not already named by it
+        named = "" if what == s["title"] else f" \u00b7 \u201c{s['title']}\u201d"
         if s["state"] == "brief":
-            row["detail"] = (f"Its brief waits for your confirmation in {s['where']} \u00b7 "
-                             f"\u201c{s['title']}\u201d")
+            row["detail"] = f"Its brief waits for your confirmation in {s['where']}{named}"
         elif s["state"] == "turn":
-            row["detail"] = f"Replied in {s['where']} and waits for you \u00b7 \u201c{s['title']}\u201d"
+            row["detail"] = f"Replied in {s['where']} and waits for you{named}"
         else:
-            row["detail"] = f"Working in {s['where']} \u00b7 \u201c{s['title']}\u201d"
+            row["detail"] = f"Working in {s['where']}{named}"
         (card["working"] if s["state"] == "working" else card["waiting"]).append(row)
 
     plan = _pr.active_plan(cfg)
@@ -3031,11 +3037,20 @@ CSS = """
 .today main{flex:999 1 600px;min-width:0}
 .today aside{flex:1 1 280px;min-width:0}
 .today h1{margin:0}
+.tdproj{border:1px solid var(--line);border-top:3px solid var(--line);border-radius:10px;background:var(--panel);
+ overflow:hidden;margin:0 0 16px}
+.tdphead{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px 12px;align-items:center;padding:14px 16px}
+.tdpname h2{margin:0;font-size:17px}
+.tdpname h2 a{color:var(--ink);text-decoration:none}
+.tdpname h2 a:hover{text-decoration:underline}
+.tdpname p{margin:2px 0 0;font-size:12.5px}
+.tdproj .inbox{border:0;border-radius:0;margin:0}
+.inbox .grp h3{margin:0;font-weight:400}
 .tdsub{color:var(--ink-2);margin:2px 0 14px}
 .inbox{list-style:none;margin:0 0 16px;padding:0;border:1px solid var(--line);border-radius:10px;
  background:var(--panel);overflow:hidden}
 .inbox .grp{padding:12px 16px 9px;background:var(--panel-2);border-top:1px solid var(--line);
- display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+ display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 10px;align-items:baseline}
 .inbox .grp:first-child{border-top:0}
 .inbox .grp h2{margin:0;font-weight:400}
 .inbox .row{display:flex;flex-wrap:wrap;gap:10px 12px;padding:14px 16px;border-top:1px solid var(--line);align-items:flex-start}
@@ -3045,6 +3060,7 @@ CSS = """
 .inbox .meta a{color:inherit}
 .inbox .ttl{margin:5px 0 0;font-weight:600}
 .inbox .det{margin:0;color:var(--ink-2);font-size:13px}
+.inbox .ttl,.inbox .det{overflow-wrap:anywhere}
 .kpill{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--todo-soft);color:var(--ink-2)}
 .kpill.wait{background:var(--warn-soft);color:var(--warn)}
 .kpill.live{background:var(--done-soft);color:var(--done)}
@@ -3066,6 +3082,9 @@ CSS = """
   .pcc-tab .tabname{display:none}
   .pcc-bar-in{padding:0 12px}
   .inbox .row .acts{margin-left:40px}
+  .tdproj .inbox .row .acts{margin-left:0}
+  .tdphead{grid-template-columns:auto minmax(0,1fr)}
+  .tdphead > .pcc-btn{grid-column:1 / -1;justify-self:start}
   .inbox .pcc-btn,.projs .pcc-btn,.pcc-here .pcc-btn{min-height:44px}
 }
 .planbar{margin:18px 0 6px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
@@ -4742,7 +4761,8 @@ TODAY_JS = r"""
     if(s < 60) return 'just now';
     if(s < 3600) return Math.round(s / 60) + ' min ago';
     if(s < 86400) return Math.round(s / 3600) + ' h ago';
-    return Math.round(s / 86400) + ' days ago';
+    var dd = Math.round(s / 86400);
+    return dd + (dd === 1 ? ' day ago' : ' days ago');
   }
   // Where a project's page is: here, another port, or nowhere yet.
   function href(p, hash){
@@ -4835,21 +4855,26 @@ TODAY_JS = r"""
   }
 
   // ------------------------------------------------------------ Today
-  function rowEl(p, r){
+  // inProject: inside a project's card, which already names the project
+  function rowEl(p, r, inProject){
     var li = el('li', 'row');
-    li.appendChild(markEl(p, 28));
+    if(!inProject) li.appendChild(markEl(p, 28));
     var txt = el('div', 'txt');
     var meta = el('div', 'meta');
     var k = KIND[r.kind] || [r.kind, ''];
     meta.appendChild(el('span', 'kpill ' + k[1], k[0]));
     var who = el('span');
-    var pl = el('a', '', p.name);
-    var ph = href(p, '');
-    pl.href = ph || '#';
-    if(!ph) pl.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
-    who.appendChild(pl);
     var when = r.at ? ago(r.at) : '';
-    if(when) who.appendChild(document.createTextNode(' \u00b7 ' + when));
+    if(!inProject){
+      var pl = el('a', '', p.name);
+      var ph = href(p, '');
+      pl.href = ph || '#';
+      if(!ph) pl.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
+      who.appendChild(pl);
+      if(when) who.appendChild(document.createTextNode(' \u00b7 ' + when));
+    } else if(when){
+      who.appendChild(document.createTextNode(when));
+    }
     meta.appendChild(who);
     txt.appendChild(meta);
     txt.appendChild(el('p', 'ttl', r.title));
@@ -4889,6 +4914,50 @@ TODAY_JS = r"""
     li.appendChild(acts);
     return li;
   }
+  function rank(r){ return ORDER[r.kind] === undefined ? 9 : ORDER[r.kind]; }
+  function byPressing(a, b){
+    return (rank(a) - rank(b)) || String(a.at || '').localeCompare(String(b.at || ''));
+  }
+  // One card per project: its identity and counts, then its own rows -
+  // waiting (most pressing first), working, coming up.
+  function projectCard(p, n){
+    var waiting = p.waiting.slice().sort(byPressing);
+    var sec = el('section', 'tdproj');
+    sec.style.borderTopColor = p.color;
+    var hid = 'tdp-' + n;
+    sec.setAttribute('aria-labelledby', hid);
+    var head = el('div', 'tdphead');
+    head.appendChild(markEl(p, 32));
+    var nm = el('div', 'tdpname');
+    var h = el('h2'); h.id = hid;
+    var a = el('a', '', p.name), ph = href(p, '');
+    a.href = ph || '#';
+    if(!ph) a.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
+    h.appendChild(a); nm.appendChild(h);
+    var counts = [];
+    if(waiting.length) counts.push(waiting.length + ' waiting');
+    if(p.working.length) counts.push(p.working.length + ' working');
+    if(p.coming.length) counts.push(p.coming.length + ' coming up');
+    if(p.phase) counts.push(p.phase);
+    nm.appendChild(el('p', 'quiet', counts.join(' \u00b7 ')));
+    head.appendChild(nm);
+    head.appendChild(actBtn(p, 'Open project', '', false));
+    sec.appendChild(head);
+    var ul = el('ul', 'inbox');
+    var group = function(title, hint, list){
+      if(!list.length) return;
+      var g = el('li', 'grp');
+      g.appendChild(el('h3', 'eyebrow', title + ' \u00b7 ' + list.length));
+      g.appendChild(el('span', 'quiet', hint));
+      ul.appendChild(g);
+      list.forEach(function(r){ ul.appendChild(rowEl(p, r, true)); });
+    };
+    group('Waiting on you', 'most pressing first', waiting);
+    group('Working', 'no action needed', p.working);
+    group('Coming up', 'blockers and the next phase', p.coming);
+    sec.appendChild(ul);
+    return sec;
+  }
   function today(d){
     var root = document.getElementById('pcc-today'); if(!root) return;
     root.textContent = '';
@@ -4896,22 +4965,14 @@ TODAY_JS = r"""
     var main = el('main'), side = el('aside');
     side.setAttribute('aria-label', 'Project status');
     main.appendChild(el('h1', '', 'Today'));
-    var waiting = [], working = [], coming = [];
-    d.projects.forEach(function(p){
-      p.waiting.forEach(function(r){ waiting.push([p, r]); });
-      p.working.forEach(function(r){ working.push([p, r]); });
-      p.coming.forEach(function(r){ coming.push([p, r]); });
-    });
-    waiting.sort(function(a, b){
-      var o = (ORDER[a[1].kind] === undefined ? 9 : ORDER[a[1].kind]) - (ORDER[b[1].kind] === undefined ? 9 : ORDER[b[1].kind]);
-      return o || String(a[1].at || '').localeCompare(String(b[1].at || ''));
-    });
+    var nwait = 0, nwork = 0;
+    d.projects.forEach(function(p){ nwait += p.waiting.length; nwork += p.working.length; });
     var np = d.totals.projects_waiting;
-    var sub = waiting.length ? waiting.length + (waiting.length === 1 ? ' thing waits' : ' things wait') +
+    var sub = nwait ? nwait + (nwait === 1 ? ' thing waits' : ' things wait') +
               ' on you in ' + np + (np === 1 ? ' project' : ' projects') : 'All clear';
-    if(working.length) sub += ' \u00b7 ' + working.length + (working.length === 1 ? ' session' : ' sessions') + ' working';
+    if(nwork) sub += ' \u00b7 ' + nwork + (nwork === 1 ? ' session' : ' sessions') + ' working';
     main.appendChild(el('p', 'tdsub', sub));
-    if(!waiting.length){
+    if(!nwait){
       var e = el('div', 'tdempty');
       e.appendChild(el('h2', '', 'Nothing waits on you'));
       e.appendChild(el('p', 'quiet', 'No brief to confirm, no plan change to review, no task marked for you.'));
@@ -4920,21 +4981,16 @@ TODAY_JS = r"""
       if(ea.childNodes.length) e.appendChild(ea);
       main.appendChild(e);
     }
-    if(waiting.length || working.length || coming.length){
-      var ul = el('ul', 'inbox');
-      var group = function(title, hint, list){
-        if(!list.length) return;
-        var g = el('li', 'grp');
-        g.appendChild(el('h2', 'eyebrow', title + ' \u00b7 ' + list.length));
-        g.appendChild(el('span', 'quiet', hint));
-        ul.appendChild(g);
-        list.forEach(function(x){ ul.appendChild(rowEl(x[0], x[1])); });
-      };
-      group('Waiting on you', 'most pressing first', waiting);
-      group('Working', 'no action needed', working);
-      group('Coming up', 'blockers and the next phase', coming);
-      main.appendChild(ul);
-    }
+    // the project with the most pressing waiting item first; then those with
+    // work in flight; then those with only what is coming
+    var shown = d.projects.filter(function(p){ return p.waiting.length || p.working.length || p.coming.length; });
+    shown.sort(function(a, b){
+      var ta = a.waiting.length ? 0 : (a.working.length ? 1 : 2), tb = b.waiting.length ? 0 : (b.working.length ? 1 : 2);
+      if(ta !== tb) return ta - tb;
+      if(!ta) return byPressing(a.waiting.slice().sort(byPressing)[0], b.waiting.slice().sort(byPressing)[0]);
+      return 0;
+    });
+    shown.forEach(function(p, n){ main.appendChild(projectCard(p, n)); });
     var box = el('div', 'projs');
     box.appendChild(el('h2', 'eyebrow', 'Projects'));
     var lst = el('ul');
