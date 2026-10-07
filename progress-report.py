@@ -586,8 +586,13 @@ def load_projects() -> list[dict]:
     out = []
     for e in d.get("project", []):
         if e.get("path"):
-            out.append({"path": str(e["path"]), "name": str(e.get("name", "")),
-                        "last_opened": str(e.get("last_opened", ""))})
+            row = {"path": str(e["path"]), "name": str(e.get("name", "")),
+                   "last_opened": str(e.get("last_opened", ""))}
+            # which dashboard serves it right now, and its bar colour
+            for k, typ in (("port", int), ("pid", int), ("color", str)):
+                if isinstance(e.get(k), typ) and e.get(k) not in ("", 0):
+                    row[k] = e[k]
+            out.append(row)
     return out
 
 
@@ -597,11 +602,61 @@ def save_projects(items: list[dict]) -> Path:
     for e in items:
         lines += ["[[project]]", f"path        = {_toml_str(e['path'])}",
                   f"name        = {_toml_str(e.get('name', ''))}",
-                  f"last_opened = {_toml_str(e.get('last_opened', ''))}", ""]
+                  f"last_opened = {_toml_str(e.get('last_opened', ''))}"]
+        for k in ("color", "port", "pid"):
+            if e.get(k) not in (None, "", 0):
+                lines.append(f"{k:<11} = {_toml_val(e[k])}")
+        lines.append("")
     p = projects_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Atomic: several dashboards write this file, and a reader must never see
+    # half of it.
+    tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, p)
     return p
+
+
+class _registry_lock:
+    """Several dashboards update the projects list - one starting while
+    another records its port lost a write. A lock file next to it, held only
+    for the read-modify-write; a stale one (a crashed holder) is broken after
+    10 s, and a server start never hangs on it for more than 3 s."""
+
+    def __enter__(self):
+        import time as _t
+        self.path = projects_path().with_suffix(".lock")
+        self.fd = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return self
+        deadline = _t.time() + 3
+        while True:
+            try:
+                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except FileExistsError:
+                try:
+                    if _t.time() - self.path.stat().st_mtime > 10:
+                        self.path.unlink()
+                        continue
+                except OSError:
+                    pass
+                if _t.time() > deadline:
+                    return self          # go ahead unlocked rather than hang
+                _t.sleep(0.05)
+            except OSError:
+                return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        return False
 
 
 def remember_project(repo: Path, name: str = "") -> None:
@@ -615,20 +670,120 @@ def remember_project(repo: Path, name: str = "") -> None:
                     .get("project", {}).get("name", "")) if cfgp.exists() else ""
         except (OSError, tomllib.TOMLDecodeError):
             name = ""
-    items = [e for e in load_projects()
-             if Path(e["path"]).as_posix().lower() != repo.as_posix().lower()]
-    items.insert(0, {"path": str(repo), "name": name or repo.name,
-                     "last_opened": date.today().isoformat()})
-    try:
-        save_projects(items[:24])
-    except OSError:
-        pass                     # a picker that cannot be saved is not fatal
+    with _registry_lock():
+        every = load_projects()
+        old = next((e for e in every if _same_path(e["path"], repo)), {})
+        items = [e for e in every if not _same_path(e["path"], repo)]
+        entry = {"path": str(repo), "name": name or repo.name,
+                 "last_opened": date.today().isoformat(),
+                 **{k: old[k] for k in ("port", "pid", "color") if k in old}}
+        if not entry.get("color"):
+            entry["color"] = _free_color(items)
+        items.insert(0, entry)
+        try:
+            save_projects(items[:24])
+        except OSError:
+            pass                 # a picker that cannot be saved is not fatal
+
+
+# A project's identity on the shared project bar: a short mark and a colour.
+# The colour is assigned once per machine (the first free one, kept in the
+# projects list) so two open projects never look alike; [project] mark and
+# color override both. White text on every palette entry passes 4.5:1, and
+# none reuses a status colour (done, warn, critical).
+MARK_COLORS = ("#2160A8", "#9B3A86", "#B3541E", "#5B4BB0", "#0E6B73", "#A3324A", "#4A5868", "#7D4E24")
+
+
+def project_mark(name: str, override: str = "") -> str:
+    """Two or three characters: the override, else a letter and the first
+    digit of the first word (project43max -> P4), else two initials for a
+    long multi-word name, else the first two letters (rx_shopify -> RX)."""
+    o = re.sub(r"[^A-Za-z0-9]", "", str(override or ""))[:3].upper()
+    if o:
+        return o
+    parts = [x for x in re.split(r"[^A-Za-z0-9]+|(?<=[a-z])(?=[A-Z])", str(name or "")) if x]
+    if not parts:
+        return "?"
+    first = parts[0]
+    dig = re.search(r"\d", first)
+    if dig and first[0].isalpha():
+        return (first[0] + dig.group(0)).upper()
+    if len(parts) > 1 and len(first) > 3:
+        return (first[0] + parts[1][0]).upper()
+    return first[:2].upper()
+
+
+def _free_color(items: list[dict]) -> str:
+    used = {str(e.get("color") or "").lower() for e in items}
+    for c in MARK_COLORS:
+        if c.lower() not in used:
+            return c
+    return MARK_COLORS[len(items) % len(MARK_COLORS)]
+
+
+def ensure_colors() -> list[dict]:
+    """Give every listed project a colour, once, and keep it."""
+    items = load_projects()
+    if all(e.get("color") for e in items):
+        return items
+    with _registry_lock():
+        items = load_projects()
+        for i, e in enumerate(items):
+            if not e.get("color"):
+                e["color"] = _free_color(items[:i] + [x for x in items[i + 1:] if x.get("color")])
+        try:
+            save_projects(items)
+        except OSError:
+            pass
+    return items
+
+
+def _same_path(a, b) -> bool:
+    return Path(str(a)).as_posix().lower() == Path(str(b)).as_posix().lower()
+
+
+def mark_served(repo: Path, port: int, pid: int) -> None:
+    """This repo is being served on this port by this process. A port has one
+    server, so any other entry that claimed it is cleared."""
+    repo = Path(repo).resolve()
+    with _registry_lock():
+        items = load_projects()
+        for e in items:
+            if _same_path(e["path"], repo):
+                e["port"], e["pid"] = int(port), int(pid)
+            elif e.get("port") == int(port):
+                e.pop("port", None)
+                e.pop("pid", None)
+        try:
+            save_projects(items)
+        except OSError:
+            pass
+
+
+def clear_served(repo: Path, pid: int) -> None:
+    """The server stopped (or moved to another project): forget its port -
+    only when this process is the one that recorded it."""
+    repo = Path(repo).resolve()
+    with _registry_lock():
+        items = load_projects()
+        hit = False
+        for e in items:
+            if _same_path(e["path"], repo) and e.get("pid") == int(pid):
+                e.pop("port", None)
+                e.pop("pid", None)
+                hit = True
+        if hit:
+            try:
+                save_projects(items)
+            except OSError:
+                pass
 
 
 def forget_project(path: str) -> None:
     want = Path(path).as_posix().lower()
-    save_projects([e for e in load_projects()
-                   if Path(e["path"]).as_posix().lower() != want])
+    with _registry_lock():
+        save_projects([e for e in load_projects()
+                       if Path(e["path"]).as_posix().lower() != want])
 
 
 def _load_cfg_quietly(repo: Path) -> dict:
@@ -3320,9 +3475,9 @@ def install_skills(repo: Path) -> int:
     return rc
 
 
-def git(*args: str) -> str:
+def git(*args: str, repo: Path | None = None) -> str:
     try:
-        return subprocess.run(["git", "-C", str(REPO), *args],
+        return subprocess.run(["git", "-C", str(repo or REPO), *args],
                               capture_output=True, text=True, timeout=20, **TEXT_IO).stdout.strip()
     except Exception:
         return ""
@@ -3686,7 +3841,7 @@ def build(repo: Path) -> dict:
     overall = round(sum(p["pct"] * p.get("days", 0) for p in counted) /
                     max(sum(p.get("days", 0) for p in counted), 1))
 
-    log = [l for l in git("log", "--pretty=%h|%ad|%s", "--date=short", "-12").splitlines() if l]
+    log = [l for l in git("log", "--pretty=%h|%ad|%s", "--date=short", "-12", repo=repo).splitlines() if l]
     commits = [dict(zip(("sha", "date", "subject"), l.split("|", 2))) for l in log]
 
     return {

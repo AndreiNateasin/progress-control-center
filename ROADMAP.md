@@ -85,8 +85,9 @@ The picker switches projects one at a time and the dashboard serves one repo. An
 running three projects runs three servers or clicks through three configs, and there
 is no view of the portfolio.
 
-- [ ] Overview across every registered project: percentage, next phase, projected
-  finish, blocked count — one row each, from each project's own config.
+- [x] Overview across every registered project: percentage, next phase, projected
+  finish, blocked count — one row each, from each project's own config. (*Today* and
+  the project bar; each project keeps its own server.)
 - [ ] Cross-project risk roll-up: which external blockers stall more than one
   project, which projects share a critical-path dependency.
 - [ ] Serve several repos from one process rather than rebinding `REPO`, so switching

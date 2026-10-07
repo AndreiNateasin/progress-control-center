@@ -44,6 +44,7 @@ once: a session that already holds it gets only the next item.
 |---|---|
 | writing a status report | open the page — progress is derived, nothing to update |
 | working out what can start now | read *Ready* — dependencies are resolved for you |
+| checking three projects to find what needs you | open **Today**: briefs to confirm, plan changes, tasks marked for you and working sessions, across every project |
 | guessing the finish date | read the projected finish, computed from your **measured** pace — items per active day and active days per week — not from typed days |
 | pasting context into an AI session | click **Open session** — the prompt is built from the phase |
 | re-explaining the phase to a session that already knows it | click **Send to phase session** — only the item goes, into the same conversation |
@@ -159,6 +160,17 @@ without touching the plan. Saving the config reconciles `[[phase]]`
 blocks with the plan's headings, so adding a phase to the markdown is enough. And the
 page reloads itself when the plan changes on disk, so a `git pull` from a teammate
 lands on your screen instead of going unnoticed.
+
+**Several projects at once.** Every dashboard carries a project bar: *Today*, then
+one tab per project with its mark, its colour and how many things wait on you there.
+*Today* is one list across all of them, most pressing first: a session whose brief
+waits for your confirmation (read from its transcript, wherever it runs), a session
+that replied and waits for you, a proposed plan change, a task the plan marks
+`[You]` — with *Mark done* right there — then the sessions still working, and what is
+coming: critical blockers and the next phase. Each project still runs its own
+dashboard on its own port; they find each other through the projects list, and a
+project whose dashboard is off gets a *Start dashboard* button that opens it in a new
+window. Terminal tabs carry the project mark, so two "Phase 1" sessions stay apart.
 
 **A risk register** derived from the schedule: what is on the critical path, what
 external blockers will stall which phase, and how much slack is left.

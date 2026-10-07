@@ -469,6 +469,36 @@ not checklist items in either items mode, so no count moves. The phase's facts a
 show the branch the checkout is on, refreshed live when the phase opens, and the
 declared `modules` as code paths with their git activity.
 
+## Several projects: a bar and a Today page, no central server
+
+One server serves one project, and that stays the architecture. What the person
+needs when working on two or three projects is not one process but one answer: what
+needs me, where. So every dashboard can draw that answer for every project on the
+machine's projects list, by reading their files directly - config, plan,
+plan-change proposals, and Claude's transcripts - and the dashboards find each other
+through the list: each records its port and process when it starts and clears them
+when it stops, and a reader confirms a recorded port by asking it which project it
+serves (`/api/whoami`), so a stale record or a reused port is never trusted. The
+usual port range is probed too, for a dashboard started by hand. The list is updated
+under a lock file, since dashboards starting together raced on it.
+
+A project's identity is a two- or three-character mark and a colour, assigned once
+per machine from a palette whose entries all carry white text at 4.5:1 and avoid the
+status colours; `[project] mark` and `color` override them. The mark leads every
+terminal tab title, so two projects' "Phase 1" sessions stay apart.
+
+*Today* lists, most pressing first: a session whose brief stopped at the protocol's
+confirmation question, a plan change waiting to be applied, a session that replied in
+the last twelve hours and waits for you, and open items the plan marks `[You]`
+(`[project] you_marker` changes the marker); then sessions still working; then
+critical external blockers and the phase that unlocks next. Sessions are read from
+their transcripts wherever they run - a terminal, VS Code, the Claude app - from the
+head (where the phase prompt names the phase and item) and the tail (the last
+turns), never whole. *Mark done* is the one write Today makes in another project,
+through the same verbatim-line tick as everywhere else, and only for a project on the
+list. A project whose dashboard is not running gets *Start dashboard*, which opens it
+in a new terminal window, so a first-time approval of its commands is answered there.
+
 ## Sessions propose plan changes; a person applies them
 
 An item's findings often change what a later item assumes. Left alone, the plan

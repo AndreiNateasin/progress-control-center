@@ -59,6 +59,7 @@ import tomllib
 SELF_DIR = Path(__file__).resolve().parent      # where THIS install lives
 REPO = _pr.REPO                                 # re-pointed by init_repo()
 BIND_HOST = "127.0.0.1"                         # set by main() before init_repo
+SERVE_PORT = 0                                  # set by main(); recorded in the projects list
 DISTRO = os.environ.get("PCC_DISTRO", "Ubuntu-24.04")
 PROMPT_DIR = REPO / _pr.WORK_DIR                # generated, gitignored; one name, shared
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -76,7 +77,11 @@ def wsl(path: Path) -> str:
 def _py(*args: str) -> list[str]:
     """Run the generator FROM THIS INSTALL against the CURRENT repo — the two
     are different directories once one installed copy serves many projects."""
-    return [sys.executable, str(SELF_DIR / "progress-report.py"), "--repo", str(REPO), *args]
+    return _py_for(REPO, *args)
+
+
+def _py_for(repo: Path, *args: str) -> list[str]:
+    return [sys.executable, str(SELF_DIR / "progress-report.py"), "--repo", str(repo), *args]
 
 
 def _expand(s: str, repo: Path | None = None) -> str:
@@ -223,13 +228,16 @@ def start_run(task: str) -> str:
     return rid
 
 
-def tick(rel_file: str, raw: str, state: str) -> dict:
-    """Flip one checkbox in the plan. Matches the verbatim line, never a number."""
+def tick(rel_file: str, raw: str, state: str, repo: Path | None = None) -> dict:
+    """Flip one checkbox in the plan. Matches the verbatim line, never a number.
+    `repo` is another registered project (Today's Mark done); default this one."""
     if state not in MARK:
         return {"ok": False, "error": "unknown state " + repr(state)}
+    root = Path(repo).resolve() if repo else REPO
+    own = _pkey(root) == _pkey(REPO)
 
-    target = (REPO / rel_file).resolve()
-    if REPO.resolve() not in target.parents or target.suffix != ".md":
+    target = (root / rel_file).resolve()
+    if root.resolve() not in target.parents or target.suffix != ".md":
         return {"ok": False, "error": "refusing to edit outside the repo's markdown"}
     if not target.exists():
         return {"ok": False, "error": rel_file + " does not exist"}
@@ -258,7 +266,7 @@ def tick(rel_file: str, raw: str, state: str) -> dict:
         # A plain list entry is an item only when the model says so (items =
         # "lists", under a phase heading). Any other list line in the repo's
         # markdown is not this endpoint's to edit.
-        model = build(REPO)
+        model = build(root)
         if not m or model.get("items_mode") != "lists" or not any(
                 it.get("file") == rel_file and it.get("raw") == raw
                 for ph in model["phases"] for it in ph.get("items", [])):
@@ -270,12 +278,14 @@ def tick(rel_file: str, raw: str, state: str) -> dict:
         # Record the mode BEFORE the first box is written: once a line carries
         # `[x]` the plan has a checkbox, and detection alone would switch the
         # whole plan back to checkbox mode and hide every other entry.
-        if not (CFG.get("project") or {}).get("items"):
-            r = _pr.apply_project_edits(REPO, {"items": "lists"}, dry_run=False)
+        cfg_now = CFG if own else tomllib.loads((root / "docs" / "progress.toml").read_text(encoding="utf-8"))
+        if not (cfg_now.get("project") or {}).get("items"):
+            r = _pr.apply_project_edits(root, {"items": "lists"}, dry_run=False)
             if not r.get("ok"):
                 return {"ok": False, "error": "could not record items = \"lists\" in "
                         "docs/progress.toml: " + str(r.get("error"))}
-            CFG.setdefault("project", {})["items"] = "lists"
+            if own:
+                CFG.setdefault("project", {})["items"] = "lists"
         if m is None:
             lines[n] = body[:s] + "[" + MARK[state] + "] " + body[s:] + eol
         elif m.group(2) is not None:
@@ -290,7 +300,7 @@ def tick(rel_file: str, raw: str, state: str) -> dict:
     # Claude's edits, and this edit came from a browser. The plan file — the
     # source of truth — is already written above, so a regeneration failure is
     # reported rather than fatal: the tick DID happen.
-    r = subprocess.run(_py("--quiet"), cwd=str(REPO), capture_output=True,
+    r = subprocess.run(_py_for(root, "--quiet"), cwd=str(root), capture_output=True,
                        creationflags=NO_WINDOW)
     out = {"ok": True, "raw": lines[n].rstrip("\r\n")}
     if r.returncode != 0:
@@ -718,10 +728,14 @@ def switch_project(path: str) -> dict:
         return {"ok": False, "error": f"not a usable path: {exc}"}
     if not p.is_dir():
         return {"ok": False, "error": f"{p} is not a directory"}
+    was = REPO
     try:
         init_repo(p)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return {"ok": False, "error": f"{p} has an unreadable config ({exc})"}
+    if SERVE_PORT:
+        _pr.clear_served(was, os.getpid())
+        _pr.mark_served(REPO, SERVE_PORT, os.getpid())
     gate = gate_actions()
     if gate["trusted"]:
         post_trust_setup()
@@ -1349,7 +1363,11 @@ def _tab_title(phase_id: str, base: str) -> str:
     """The tab a tracked launch is given. Built from sanitised parts: wt.exe
     splits its argv on ';', so nothing repo-authored may reach it raw."""
     tb = "".join(c for c in str(base) if c.isalnum() or c in "-_") or "x"
-    return f"Phase {_pr.safe_id(phase_id)} - {tb}"
+    # The project's mark first: with two projects open, two "Phase 1 - claude"
+    # tabs could not be told apart.
+    proj = CFG.get("project") or {}
+    mk = _pr.project_mark(str(proj.get("name") or REPO.name), str(proj.get("mark") or ""))
+    return f"{mk} \u00b7 Phase {_pr.safe_id(phase_id)} - {tb}"
 
 
 def _where(phase_id: str, base: str, rec: dict, sid: str) -> str:
@@ -1762,6 +1780,410 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
     )
     return {"ok": True, "prompt": prompt}
     return {"ok": True, "prompt": prompt}
+
+
+# ------------------------------------------------------------------ the hub --
+# Every dashboard can answer "what needs me, across my projects?" without a
+# central server. It reads the other registered projects' files directly -
+# plan, config, plan-change proposals, Claude transcripts - and finds their
+# running dashboards through the ports they record in the projects list,
+# confirmed by asking each port which project it serves. Read-only for other
+# repos, except the one deliberate write Today offers: ticking an item marked
+# for you, which goes through the same verbatim-line tick as everywhere else.
+
+PROTOCOL_ASK = re.compile(r"(?:confirm these steps|apply these changes),\s*or redirect me\?", re.I)
+PHASE_ASK = re.compile(r"Phase ([0-9A-Za-z]+) \(([^\n]*)\n\n {4}(\S[^\n]*)")
+_WHERE = {"cli": "a terminal", "claude-vscode": "VS Code", "claude-desktop": "the Claude app",
+          "claude-jetbrains": "JetBrains"}
+HUB_PORTS = range(8765, 8780)
+
+
+def _pkey(p) -> str:
+    try:
+        return os.path.normcase(str(Path(str(p)).resolve()))
+    except OSError:
+        return os.path.normcase(str(p))
+
+
+def _probe(port: int, timeout: float = 0.4) -> dict | None:
+    """Ask a port which project its dashboard serves. Loopback, and never
+    through a proxy: a corporate HTTP_PROXY must not see this request."""
+    import urllib.request
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(f"http://127.0.0.1:{int(port)}/api/whoami", timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return d if isinstance(d, dict) and d.get("repo") else None
+    except Exception:  # noqa: BLE001 - "nothing there" is the common answer
+        return None
+
+
+_RUN = {"at": 0.0, "map": {}}
+_RUN_LOCK = threading.Lock()
+
+
+def running_dashboards(force: bool = False) -> dict:
+    """{project key: port} for every dashboard answering on this machine: the
+    ports the projects list records, plus the usual range (a dashboard started
+    by hand on another port, or before ports were recorded)."""
+    now = time.time()
+    with _RUN_LOCK:
+        if not force and now - _RUN["at"] < 8:
+            return dict(_RUN["map"])
+    ports = set(HUB_PORTS) | {int(e["port"]) for e in _pr.load_projects() if e.get("port")}
+    ports.discard(SERVE_PORT)
+    found = {_pkey(REPO): SERVE_PORT} if SERVE_PORT else {}
+    order = sorted(ports)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for port, who in zip(order, ex.map(_probe, order)):
+            if who:
+                found.setdefault(_pkey(who["repo"]), port)
+    with _RUN_LOCK:
+        _RUN.update(at=now, map=found)
+    return dict(found)
+
+
+def _transcripts_dir(repo: Path) -> Path:
+    return Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9-]", "-", str(Path(repo).resolve()))
+
+
+def _read_ends(f: Path, head: int = 65536, tail: int = 393216) -> str:
+    """The start (where the phase prompt is) and the end (the last turns) of a
+    transcript, without reading a long one whole."""
+    size = f.stat().st_size
+    with open(f, "rb") as fh:
+        data = fh.read(min(size, head))
+        if size > head:
+            fh.seek(max(head, size - tail))
+            data += b"\n" + fh.read()
+    return data.decode("utf-8", "replace")
+
+
+def session_states(repo: Path, now: float | None = None) -> list[dict]:
+    """This repo's Claude sessions that matter today, read from their
+    transcripts wherever they run (a terminal, VS Code, the Claude app):
+    "brief" - stopped at the protocol's confirmation question; "turn" - a
+    finished reply in the last 12 hours, waiting for you; "working" - written
+    to in the last 5 minutes and mid-turn."""
+    now = now or time.time()
+    out = []
+    try:
+        files = list(_transcripts_dir(repo).glob("*.jsonl"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            age = now - f.stat().st_mtime
+            if age > 72 * 3600:
+                continue
+            text = _read_ends(f)
+        except OSError:
+            continue
+        title = where = phase = item = None
+        last_asst, last_kind = None, None
+        for ln in text.splitlines():
+            if not ln.startswith("{"):
+                continue
+            try:
+                o = json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(o, dict) or o.get("isSidechain"):
+                continue
+            t = o.get("type")
+            if t == "ai-title" and o.get("aiTitle"):
+                title = str(o["aiTitle"])
+            if o.get("entrypoint"):
+                where = _WHERE.get(str(o["entrypoint"]), "a Claude session")
+            m = o.get("message") if isinstance(o.get("message"), dict) else {}
+            c = m.get("content")
+            if t == "assistant" and isinstance(c, list):
+                last_asst = {"stop": m.get("stop_reason"), "at": str(o.get("timestamp") or ""),
+                             "text": " ".join(b.get("text", "") for b in c
+                                              if isinstance(b, dict) and b.get("type") == "text")}
+                last_kind = "assistant"
+            elif t == "user":
+                if isinstance(c, list) and c and all(isinstance(b, dict) and b.get("type") == "tool_result"
+                                                     for b in c):
+                    last_kind = "tool_result"
+                    continue
+                s = c if isinstance(c, str) else " ".join(
+                    b.get("text", "") for b in (c or []) if isinstance(b, dict) and b.get("type") == "text")
+                last_kind = "user"
+                hit = PHASE_ASK.search(s or "")
+                if hit:
+                    phase, item = hit.group(1), hit.group(3).strip()
+        state = None
+        if age < 300 and (last_kind in ("user", "tool_result")
+                          or (last_kind == "assistant" and last_asst and last_asst["stop"] == "tool_use")):
+            state = "working"
+        elif last_kind == "assistant" and last_asst and last_asst["stop"] == "end_turn":
+            if PROTOCOL_ASK.search(last_asst["text"][-600:]):
+                state = "brief"
+            elif age < 12 * 3600:
+                state = "turn"
+        if state:
+            out.append({"sid": f.stem, "state": state, "title": title or "a Claude session",
+                        "where": where or "a Claude session", "phase": phase or "", "item": item or "",
+                        "at": (last_asst or {}).get("at", "")})
+    return out
+
+
+_MODELS: dict = {}
+_MODELS_LOCK = threading.Lock()
+
+
+def _repo_stamp(p: Path) -> tuple:
+    files = [p / "docs" / "progress.toml"]
+    try:
+        cfg = tomllib.loads(files[0].read_text(encoding="utf-8"))
+        files.append(p / _pr.active_plan(cfg))
+        files += [p / str(x["doc"]) for x in (cfg.get("phase") or []) if x.get("doc")]
+    except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
+        pass
+    out = []
+    for f in files:
+        try:
+            st = f.stat()
+            out.append((str(f), st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((str(f), 0, 0))
+    return tuple(out)
+
+
+def _model_of(p: Path) -> dict:
+    """build() for any registered project, cached until its files change - or
+    for 90 seconds, since dates and the branch move on their own."""
+    k, stamp = _pkey(p), _repo_stamp(p)
+    with _MODELS_LOCK:
+        hit = _MODELS.get(k)
+        if hit and hit[0] == stamp and time.time() - hit[1] < 90:
+            return hit[2]
+    m = build(p)
+    with _MODELS_LOCK:
+        _MODELS[k] = (stamp, time.time(), m)
+    return m
+
+
+def _registered(path: str) -> dict | None:
+    """A project on this machine's list - the only ones Today may act on."""
+    if not str(path).strip():
+        return None
+    k = _pkey(path)
+    hit = next((e for e in _pr.load_projects() if _pkey(e["path"]) == k), None)
+    if hit is None and k == _pkey(REPO):
+        hit = {"path": str(REPO), "name": (CFG.get("project") or {}).get("name", "")}
+    return hit
+
+
+def project_card(e: dict, live: dict, now: float) -> dict:
+    """One project as Today sees it: identity, where it stands, and what waits."""
+    p = Path(e["path"])
+    k = _pkey(p)
+    cur = k == _pkey(REPO)
+    port = live.get(k)
+    card = {"path": str(p), "name": e.get("name") or p.name, "current": cur,
+            "running": bool(port) or cur, "url": f"http://127.0.0.1:{port}/" if port else "",
+            "configured": (p / "docs" / "progress.toml").exists(), "error": "",
+            "color": e.get("color") or _pr.MARK_COLORS[0], "pct": 0, "phase": "", "phase_id": "",
+            "finish": "", "waiting": [], "working": [], "coming": []}
+    cfg = {}
+    if card["configured"]:
+        try:
+            cfg = tomllib.loads((p / "docs" / "progress.toml").read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            card["error"] = f"config unreadable ({exc})"
+    proj = cfg.get("project") or {}
+    card["name"] = str(proj.get("name") or card["name"])
+    card["mark"] = _pr.project_mark(card["name"], str(proj.get("mark") or ""))
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", str(proj.get("color") or "")):
+        card["color"] = proj["color"]
+    if not card["configured"] or card["error"]:
+        return card
+    try:
+        m = _model_of(p)
+    except Exception as exc:  # noqa: BLE001 - one broken project must not blank Today
+        card["error"] = f"{type(exc).__name__}: {exc}"
+        return card
+    card["pct"] = m.get("overall", 0)
+    # a project that has started nothing has no current phase: show the first
+    # one that can start
+    curp = m.get("current") or next((x for x in m.get("phases", []) if x.get("startable")), None) or {}
+    if curp:
+        card["phase_id"] = str(curp.get("id", ""))
+        card["phase"] = f"Phase {curp.get('id')} \u00b7 {curp.get('name', '')}"
+    card["finish"] = (m.get("pace") or {}).get("finish") or m.get("finish_date") or ""
+    names = {str(x["id"]): x["name"] for x in m.get("phases", [])}
+
+    for s in session_states(p, now):
+        if s["phase"] and s["item"]:
+            what = f"Phase {s['phase']} \u00b7 {s['item'][:140]}"
+        elif s["phase"]:
+            what = f"Phase {s['phase']} \u00b7 {names.get(s['phase'], '')}"
+        else:
+            what = s["title"]
+        row = {"kind": s["state"], "phase": s["phase"], "title": what, "at": s["at"],
+               "resume": f'cd "{p}"; claude --resume {s["sid"]}'}
+        if s["state"] == "brief":
+            row["detail"] = (f"Its brief waits for your confirmation in {s['where']} \u00b7 "
+                             f"\u201c{s['title']}\u201d")
+        elif s["state"] == "turn":
+            row["detail"] = f"Replied in {s['where']} and waits for you \u00b7 \u201c{s['title']}\u201d"
+        else:
+            row["detail"] = f"Working in {s['where']} \u00b7 \u201c{s['title']}\u201d"
+        (card["working"] if s["state"] == "working" else card["waiting"]).append(row)
+
+    plan = _pr.active_plan(cfg)
+    jf = p / _pr.WORK_DIR / _pr.proposals_name(plan)
+    st = _prop_state(jf.with_name(jf.name[: -len(".jsonl")] + ".state.json"))
+    today = _pr.date.today().isoformat()
+    for r in _pr.read_proposals(jf):
+        if r["kind"] == "unreadable" or (st.get(r["id"]) or {}).get("status", "open") != "open":
+            continue
+        pl = _pr.plan_proposal(p, m, r, today)
+        card["waiting"].append({
+            "kind": "change", "phase": r.get("phase", ""),
+            "title": pl["summary"] if pl.get("ok") else (r.get("text") or r.get("target") or r["kind"]),
+            "detail": (f"Proposed by {r['from']}" if r.get("from") else "Proposed by a working session")
+                      + ("" if pl.get("ok") else " \u00b7 needs judgment: re-plan or dismiss it")})
+
+    marker = str(proj.get("you_marker") or "[You]")
+    for ph in m.get("phases", []):
+        if not (ph.get("startable") or ph.get("status") == "active"):
+            continue
+        mine = [i for i in ph.get("items") or [] if i["state"] != "done"
+                and i["label"].lower().startswith(marker.lower())]
+        for n, i in enumerate(mine[:3]):
+            more = len(mine) - 3 if n == 2 and len(mine) > 3 else 0
+            card["waiting"].append({
+                "kind": "task", "phase": str(ph["id"]),
+                "title": i["label"][len(marker):].strip(" :-") or i["label"],
+                "detail": f"Phase {ph['id']} \u00b7 marked {marker} in the plan, so no session takes it"
+                          + (f" \u00b7 {more} more like it in this phase" if more else ""),
+                "file": i.get("file") or "", "raw": i.get("raw") or ""})
+
+    for r in m.get("risks") or []:
+        if r.get("severity") == "critical" and "blocker" in str(r.get("source", "")):
+            card["coming"].append({"kind": "blocker", "phase": "",
+                                   "title": str(r.get("risk", "")).split(" \u2014 ")[0],
+                                   "detail": str(r.get("detail", ""))})
+            if sum(1 for x in card["coming"] if x["kind"] == "blocker") >= 2:
+                break
+    live_ids = {str(x["id"]) for x in m.get("phases", []) if x.get("startable") or x.get("status") == "active"}
+    for ph in m.get("phases", []):
+        un = [str(x) for x in ph.get("blocked_by") or []]
+        if un and set(un) <= live_ids:
+            card["coming"].append({"kind": "next", "phase": str(ph["id"]),
+                                   "title": f"Phase {ph['id']} \u00b7 {ph['name']}",
+                                   "detail": f"Unlocks when Phase {', Phase '.join(un)} is done"})
+            break
+    return card
+
+
+def today_view() -> dict:
+    """Every project on this machine's list, as Today and the project bar show it."""
+    now = time.time()
+    live = running_dashboards()
+    entries = _pr.ensure_colors()
+    if not any(_pkey(e["path"]) == _pkey(REPO) for e in entries):
+        entries = [{"path": str(REPO), "name": (CFG.get("project") or {}).get("name", "")}] + entries
+    seen, cards = set(), []
+    for e in entries:
+        k = _pkey(e["path"])
+        if k in seen or not Path(e["path"]).is_dir():
+            continue
+        seen.add(k)
+        cards.append(project_card(e, live, now))
+    return {"ok": True, "generated": _now_iso(), "projects": cards,
+            "totals": {"waiting": sum(len(c["waiting"]) for c in cards),
+                       "working": sum(len(c["working"]) for c in cards),
+                       "projects_waiting": sum(1 for c in cards if c["waiting"])}}
+
+
+def today_tick(body: dict) -> dict:
+    """Mark done from Today: the same verbatim-line tick, in the item's repo."""
+    e = _registered(str(body.get("path", "")))
+    if not e:
+        return {"ok": False, "error": "that project is not on this machine's list"}
+    r = tick(str(body.get("file", "")), str(body.get("raw", "")), str(body.get("state", "done")),
+             repo=Path(e["path"]))
+    with _MODELS_LOCK:
+        _MODELS.pop(_pkey(e["path"]), None)
+    return r
+
+
+def _free_port(exclude: set) -> int | None:
+    import socket
+    for port in range(8765, 8800):
+        if port in exclude:
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return None
+
+
+def start_dashboard(path: str) -> dict:
+    """Start another project's dashboard in a window of its own: visible, so
+    the one-time approval of its commands can be answered there, and stopped
+    with Ctrl-C like one you started by hand."""
+    e = _registered(path)
+    if not e:
+        return {"ok": False, "error": "that project is not on this machine's list - open it once "
+                                      "from Setup > Projects"}
+    p = Path(e["path"])
+    live = running_dashboards(force=True)
+    if _pkey(p) in live:
+        return {"ok": True, "url": f"http://127.0.0.1:{live[_pkey(p)]}/", "already": True}
+    port = _free_port(set(live.values()) | {SERVE_PORT})
+    if port is None:
+        return {"ok": False, "error": "no free port between 8765 and 8799"}
+    argv = [sys.executable, str(SELF_DIR / "progress-serve.py"), "--repo", str(p),
+            "--port", str(port), "--no-open"]
+    cmd = " ".join(f'"{a}"' if " " in a else a for a in argv)
+    name = re.sub(r"[^A-Za-z0-9 _.-]", "", str(e.get("name") or p.name))[:40] or "project"
+    try:
+        if os.name == "nt":
+            import shutil
+            wt = shutil.which("wt.exe")
+            if wt and ";" not in str(p):
+                subprocess.Popen([wt, "-w", "0", "nt", "--title", f"{name} control center",
+                                  "-d", str(p), *argv], creationflags=NO_WINDOW)
+            else:
+                subprocess.Popen(argv, cwd=str(p), creationflags=NEW_CONSOLE)
+        else:
+            log = p / _pr.WORK_DIR / "dashboard.log"
+            log.parent.mkdir(exist_ok=True)
+            subprocess.Popen(argv, cwd=str(p), stdin=subprocess.DEVNULL, stdout=open(log, "ab"),
+                             stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"could not start it ({exc}); run it yourself: {cmd}"}
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        who = _probe(port, 0.5)
+        if who and _pkey(who["repo"]) == _pkey(p):
+            with _RUN_LOCK:
+                _RUN["at"] = 0.0
+            return {"ok": True, "url": f"http://127.0.0.1:{port}/"}
+        time.sleep(0.4)
+    return {"ok": False, "pending": True,
+            "error": f"started in a new window, but nothing answers on :{port} yet - if it asks you to "
+                     f"approve the project's commands, answer there, then reload. Or run: {cmd}"}
+
+
+def today_page(token: str) -> str:
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Today \u00b7 Control Center</title><style>' + _pr.CSS + CSS + '</style></head><body>'
+            '<div class="wrap"><div id="pcc-today"><p class="quiet">Reading your projects\u2026</p></div></div>'
+            '<script>window.__ANU_TOKEN__=' + _pr.js(token) + ';window.__PCC_HUB_HERE__="today";</script>'
+            '<script>' + TODAY_JS + '</script></body></html>')
 
 
 def fresh_stamp() -> str:
@@ -2579,6 +3001,65 @@ CSS = """
 .pcc-btn[disabled]{opacity:.5;cursor:progress}
 .pcc-btn.run{border-color:var(--accent);background:var(--accent);color:#fff}
 .pcc-btn.run:hover{color:#fff;filter:brightness(1.08)}
+/* ---- project bar, Today, identity (multi-project) ---- */
+#pcc-bar{background:var(--panel);border-bottom:1px solid var(--line)}
+.pcc-bar-in{max-width:1180px;margin:0 auto;padding:0 24px;display:flex;gap:2px;align-items:stretch;overflow-x:auto}
+.pcc-tab{display:flex;align-items:center;gap:8px;padding:0 14px;min-height:46px;text-decoration:none;
+ color:var(--ink);border-bottom:3px solid transparent;white-space:nowrap;font-size:14px}
+.pcc-tab:hover{background:var(--panel-2);color:var(--ink)}
+.pcc-tab.on{font-weight:600}
+.pcc-tab .quiet{font-size:12px}
+#pcc-msg{max-width:1180px;margin:0 auto;padding:6px 24px}
+#pcc-msg:empty{display:none}
+.pmark{display:inline-flex;align-items:center;justify-content:center;flex:none;border-radius:7px;
+ color:#fff;font-weight:700;font-family:var(--mono);font-size:10px;line-height:1}
+.pcount{font-size:11.5px;padding:1px 7px;border-radius:999px;background:var(--warn-soft);color:var(--warn)}
+.pidrow{display:flex;gap:14px;align-items:center}
+.pcc-here{margin:0 0 16px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
+ background:var(--warn-soft);display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+.pcc-here p{margin:0}
+.pcc-here .acts,.today .acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.today{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start}
+.today main{flex:999 1 600px;min-width:0}
+.today aside{flex:1 1 280px;min-width:0}
+.today h1{margin:0}
+.tdsub{color:var(--ink-2);margin:2px 0 14px}
+.inbox{list-style:none;margin:0 0 16px;padding:0;border:1px solid var(--line);border-radius:10px;
+ background:var(--panel);overflow:hidden}
+.inbox .grp{padding:12px 16px 9px;background:var(--panel-2);border-top:1px solid var(--line);
+ display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.inbox .grp:first-child{border-top:0}
+.inbox .grp h2{margin:0;font-weight:400}
+.inbox .row{display:flex;flex-wrap:wrap;gap:10px 12px;padding:14px 16px;border-top:1px solid var(--line);align-items:flex-start}
+.inbox .row .txt{flex:1 1 200px;min-width:0}
+.inbox .row .acts{margin-left:auto}
+.inbox .meta{display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;font-size:12.5px;color:var(--ink-2)}
+.inbox .meta a{color:inherit}
+.inbox .ttl{margin:5px 0 0;font-weight:600}
+.inbox .det{margin:0;color:var(--ink-2);font-size:13px}
+.kpill{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--todo-soft);color:var(--ink-2)}
+.kpill.wait{background:var(--warn-soft);color:var(--warn)}
+.kpill.live{background:var(--done-soft);color:var(--done)}
+.kpill.crit{background:var(--crit-soft);color:var(--crit)}
+.kpill.info{background:var(--accent-soft);color:var(--accent)}
+.tdempty{padding:24px;border:1px solid var(--line);border-radius:10px;background:var(--panel);margin-bottom:16px}
+.tdempty h2{margin:0 0 6px;font-size:17px}
+.projs{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:14px 16px 4px}
+.projs h2{margin:0;font-weight:400}
+.projs ul{list-style:none;margin:8px 0 0;padding:0}
+.projs li{padding:12px 0;border-top:1px solid var(--line)}
+.projs .prow{display:flex;gap:10px;align-items:center}
+.projs .pname{flex:1;font-weight:600;color:var(--ink)}
+.projs .pinfo{margin:8px 0 0 38px}
+.projs .pinfo p{margin:5px 0 0;font-size:12px}
+.pbar{height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+.pbar span{display:block;height:100%;border-radius:3px}
+@media (max-width:640px){
+  .pcc-tab .tabname{display:none}
+  .pcc-bar-in{padding:0 12px}
+  .inbox .row .acts{margin-left:40px}
+  .inbox .pcc-btn,.projs .pcc-btn,.pcc-here .pcc-btn{min-height:44px}
+}
 .planbar{margin:18px 0 6px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
  background:var(--panel)}
 .planbar-head{display:flex;gap:10px;align-items:baseline;margin-bottom:8px;flex-wrap:wrap}
@@ -4207,6 +4688,366 @@ def plan_switcher(model: dict) -> str:
             'tickets - and its progress stays in its own file.">' + opts + '</select>')
 
 
+TODAY_JS = r"""
+// ------------------------------------------------------------ the hub --
+// The project bar (every dashboard), the Today page, and a project's own
+// "waiting on you here" strip - all drawn from /api/today, which reads every
+// project on this machine's list. Nothing here is on a published page.
+(function(){
+  var HERE = window.__PCC_HUB_HERE__ || '';
+  var T = window.__ANU_TOKEN__ || '';
+  var KIND = {brief: ['Brief to confirm', 'wait'], turn: ['Your turn', 'wait'], change: ['Plan change', 'info'],
+              task: ['Your task', ''], working: ['Session working', 'live'], blocker: ['Blocker', 'crit'],
+              next: ['Next phase', '']};
+  var ORDER = {brief: 0, change: 1, turn: 2, task: 3};
+
+  function post(path, body){
+    return fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-PCC-Token': T},
+      body: JSON.stringify(body || {})}).then(function(r){ return r.json(); });
+  }
+  function el(tag, cls, text){
+    var n = document.createElement(tag);
+    if(cls) n.className = cls;
+    if(text !== undefined && text !== null) n.textContent = text;
+    return n;
+  }
+  function markEl(p, size){
+    var s = el('span', 'pmark', p.mark);
+    s.style.background = p.color;
+    s.style.width = s.style.height = size + 'px';
+    if(size >= 36) s.style.fontSize = '14px';
+    s.setAttribute('aria-hidden', 'true');
+    return s;
+  }
+  function fmtDate(iso){
+    if(!iso) return '';
+    var d = new Date(String(iso).slice(0, 10) + 'T00:00:00');
+    if(isNaN(d.getTime())) return String(iso);
+    var o = {month: 'short', day: 'numeric'};
+    if(d.getFullYear() !== new Date().getFullYear()) o.year = 'numeric';
+    return d.toLocaleDateString(undefined, o);
+  }
+  function ago(iso){
+    if(!iso) return '';
+    var s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if(isNaN(s)) return '';
+    if(s < 60) return 'just now';
+    if(s < 3600) return Math.round(s / 60) + ' min ago';
+    if(s < 86400) return Math.round(s / 3600) + ' h ago';
+    return Math.round(s / 86400) + ' days ago';
+  }
+  // Where a project's page is: here, another port, or nowhere yet.
+  function href(p, hash){
+    hash = hash || '';
+    if(p.current) return HERE === 'today' ? '/' + hash : (hash || '#');
+    return p.url ? p.url + hash : '';
+  }
+  function say(msg, cls){
+    var n = document.getElementById('pcc-msg');
+    if(!n){
+      n = el('div', 'dstatus'); n.id = 'pcc-msg'; n.setAttribute('role', 'status');
+      var bar = document.getElementById('pcc-bar');
+      if(bar) bar.appendChild(n); else document.body.insertBefore(n, document.body.firstChild);
+    }
+    n.textContent = msg || ''; n.className = 'dstatus ' + (cls || '');
+  }
+  function start(p, hash){
+    say('starting the ' + p.name + ' dashboard in a new window\u2026');
+    post('/api/projects/start', {path: p.path}).then(function(r){
+      if(r && r.ok && r.url){ location.href = r.url + (hash || ''); return; }
+      say((r && r.error) || 'could not start it', 'err');
+    }).catch(function(){ say('this dashboard is not answering', 'err'); });
+  }
+  function go(p, hash){
+    var h = href(p, hash);
+    if(!h){ start(p, hash); return; }
+    if(h.charAt(0) === '#'){ if(location.hash === h) hashGo(); else location.hash = h; }
+    else location.href = h;
+  }
+  function actBtn(p, label, hash, primary){
+    var live = p.current || p.running;
+    var b = el('button', 'pcc-btn' + (primary ? ' run' : ''), live ? label : 'Start dashboard');
+    b.type = 'button';
+    if(!live) b.title = p.name + "'s dashboard is not running \u2014 this starts it, then opens it";
+    b.addEventListener('click', function(){ go(p, hash); });
+    return b;
+  }
+  function copy(text){
+    if(navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+    return new Promise(function(res, rej){
+      var t = el('textarea'); t.value = text; document.body.appendChild(t); t.select();
+      try { document.execCommand('copy') ? res() : rej(); } catch(e){ rej(e); }
+      t.remove();
+    });
+  }
+
+  // ------------------------------------------------------- project bar
+  function bar(d){
+    var nav = document.getElementById('pcc-bar');
+    if(!nav){
+      nav = el('nav'); nav.id = 'pcc-bar'; nav.setAttribute('aria-label', 'Projects');
+      document.body.insertBefore(nav, document.body.firstChild);
+    }
+    var msg = document.getElementById('pcc-msg');
+    nav.textContent = '';
+    var inner = el('div', 'pcc-bar-in'); nav.appendChild(inner);
+    if(msg) nav.appendChild(msg);
+    var tw = d.totals.waiting;
+    var t = el('a', 'pcc-tab' + (HERE === 'today' ? ' on' : ''));
+    t.href = '/today';
+    t.setAttribute('aria-label', 'Today, ' + tw + ' waiting on you');
+    if(HERE === 'today'){ t.setAttribute('aria-current', 'page'); t.style.borderBottomColor = 'var(--ink)'; }
+    t.appendChild(el('span', '', 'Today'));
+    if(tw){ var c = el('span', 'pcount', String(tw)); c.setAttribute('aria-hidden', 'true'); t.appendChild(c); }
+    inner.appendChild(t);
+    d.projects.forEach(function(p){
+      if(!p.configured) return;
+      var on = p.current && HERE !== 'today';
+      var live = p.current || p.running;
+      var a = el('a', 'pcc-tab' + (on ? ' on' : ''));
+      a.href = href(p, '') || '#';
+      a.setAttribute('aria-label', p.name + (p.waiting.length ? ', ' + p.waiting.length + ' waiting' : '') +
+                                  (live ? '' : ', dashboard not running'));
+      if(on){
+        a.setAttribute('aria-current', 'page');
+        a.style.borderBottomColor = p.color;
+        a.style.background = 'color-mix(in srgb, ' + p.color + ' 12%, transparent)';
+      }
+      a.appendChild(markEl(p, 22));
+      a.appendChild(el('span', 'tabname', p.name));
+      if(p.waiting.length){
+        var b = el('span', 'pcount', String(p.waiting.length)); b.setAttribute('aria-hidden', 'true'); a.appendChild(b);
+      }
+      if(!live){
+        var o = el('span', 'quiet tabname', 'off'); o.setAttribute('aria-hidden', 'true'); a.appendChild(o);
+        a.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
+      }
+      inner.appendChild(a);
+    });
+  }
+
+  // ------------------------------------------------------------ Today
+  function rowEl(p, r){
+    var li = el('li', 'row');
+    li.appendChild(markEl(p, 28));
+    var txt = el('div', 'txt');
+    var meta = el('div', 'meta');
+    var k = KIND[r.kind] || [r.kind, ''];
+    meta.appendChild(el('span', 'kpill ' + k[1], k[0]));
+    var who = el('span');
+    var pl = el('a', '', p.name);
+    var ph = href(p, '');
+    pl.href = ph || '#';
+    if(!ph) pl.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
+    who.appendChild(pl);
+    var when = r.at ? ago(r.at) : '';
+    if(when) who.appendChild(document.createTextNode(' \u00b7 ' + when));
+    meta.appendChild(who);
+    txt.appendChild(meta);
+    txt.appendChild(el('p', 'ttl', r.title));
+    if(r.detail) txt.appendChild(el('p', 'det', r.detail));
+    li.appendChild(txt);
+    var acts = el('div', 'acts');
+    var hash = r.phase ? '#phase-' + r.phase : '';
+    if(r.kind === 'task'){
+      var mk = el('button', 'pcc-btn', 'Mark done'); mk.type = 'button';
+      mk.title = 'Ticks this item in ' + p.name + "'s plan";
+      mk.addEventListener('click', function(){
+        mk.disabled = true;
+        post('/api/today/tick', {path: p.path, file: r.file, raw: r.raw, state: 'done'}).then(function(x){
+          if(x && x.ok){ say('ticked in ' + p.name, 'ok'); refresh(); }
+          else { mk.disabled = false; say((x && x.error) || 'could not tick it', 'err'); }
+        }).catch(function(){ mk.disabled = false; say('this dashboard is not answering', 'err'); });
+      });
+      acts.appendChild(mk);
+    } else if(r.kind === 'change'){
+      acts.appendChild(actBtn(p, 'Review change', '#plan-changes', false));
+    } else if(r.kind === 'blocker'){
+      acts.appendChild(actBtn(p, 'Open risks', '#risks', false));
+    } else if(r.kind === 'next'){
+      acts.appendChild(actBtn(p, 'Read in', hash, false));
+    } else {
+      acts.appendChild(actBtn(p, r.phase ? 'Open phase' : 'Open project', hash, r.kind === 'brief'));
+    }
+    if(r.resume){
+      var cp = el('button', 'pcc-btn', 'Copy resume command'); cp.type = 'button';
+      cp.title = 'For when its window is gone: ' + r.resume;
+      cp.addEventListener('click', function(){
+        copy(r.resume).then(function(){ say('resume command copied \u2014 run it in a terminal', 'ok'); },
+                            function(){ say('the clipboard refused it', 'err'); });
+      });
+      acts.appendChild(cp);
+    }
+    li.appendChild(acts);
+    return li;
+  }
+  function today(d){
+    var root = document.getElementById('pcc-today'); if(!root) return;
+    root.textContent = '';
+    var wrap = el('div', 'today');
+    var main = el('main'), side = el('aside');
+    side.setAttribute('aria-label', 'Project status');
+    main.appendChild(el('h1', '', 'Today'));
+    var waiting = [], working = [], coming = [];
+    d.projects.forEach(function(p){
+      p.waiting.forEach(function(r){ waiting.push([p, r]); });
+      p.working.forEach(function(r){ working.push([p, r]); });
+      p.coming.forEach(function(r){ coming.push([p, r]); });
+    });
+    waiting.sort(function(a, b){
+      var o = (ORDER[a[1].kind] === undefined ? 9 : ORDER[a[1].kind]) - (ORDER[b[1].kind] === undefined ? 9 : ORDER[b[1].kind]);
+      return o || String(a[1].at || '').localeCompare(String(b[1].at || ''));
+    });
+    var np = d.totals.projects_waiting;
+    var sub = waiting.length ? waiting.length + (waiting.length === 1 ? ' thing waits' : ' things wait') +
+              ' on you in ' + np + (np === 1 ? ' project' : ' projects') : 'All clear';
+    if(working.length) sub += ' \u00b7 ' + working.length + (working.length === 1 ? ' session' : ' sessions') + ' working';
+    main.appendChild(el('p', 'tdsub', sub));
+    if(!waiting.length){
+      var e = el('div', 'tdempty');
+      e.appendChild(el('h2', '', 'Nothing waits on you'));
+      e.appendChild(el('p', 'quiet', 'No brief to confirm, no plan change to review, no task marked for you.'));
+      var ea = el('div', 'acts');
+      d.projects.forEach(function(p){ if(p.configured && (p.current || p.running)) ea.appendChild(actBtn(p, 'Open ' + p.name, '', false)); });
+      if(ea.childNodes.length) e.appendChild(ea);
+      main.appendChild(e);
+    }
+    if(waiting.length || working.length || coming.length){
+      var ul = el('ul', 'inbox');
+      var group = function(title, hint, list){
+        if(!list.length) return;
+        var g = el('li', 'grp');
+        g.appendChild(el('h2', 'eyebrow', title + ' \u00b7 ' + list.length));
+        g.appendChild(el('span', 'quiet', hint));
+        ul.appendChild(g);
+        list.forEach(function(x){ ul.appendChild(rowEl(x[0], x[1])); });
+      };
+      group('Waiting on you', 'most pressing first', waiting);
+      group('Working', 'no action needed', working);
+      group('Coming up', 'blockers and the next phase', coming);
+      main.appendChild(ul);
+    }
+    var box = el('div', 'projs');
+    box.appendChild(el('h2', 'eyebrow', 'Projects'));
+    var lst = el('ul');
+    d.projects.forEach(function(p){
+      var li = el('li'), top = el('div', 'prow');
+      top.appendChild(markEl(p, 28));
+      var nm = el('a', 'pname', p.name), h = href(p, '');
+      nm.href = h || '#';
+      if(!h) nm.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
+      top.appendChild(nm);
+      if(p.current) top.appendChild(el('span', 'kpill live', 'this dashboard'));
+      else if(p.running) top.appendChild(el('span', 'kpill live', 'running :' + ((/:(\d+)\//.exec(p.url) || [])[1] || '')));
+      else {
+        var sb = el('button', 'pcc-btn', 'Start dashboard'); sb.type = 'button';
+        sb.addEventListener('click', function(){ start(p, ''); });
+        top.appendChild(sb);
+      }
+      li.appendChild(top);
+      var info = el('div', 'pinfo');
+      if(p.configured && !p.error){
+        var pb = el('div', 'pbar'), fill = el('span');
+        fill.style.width = (p.pct || 0) + '%'; fill.style.background = p.color;
+        pb.appendChild(fill); info.appendChild(pb);
+        info.appendChild(el('p', 'quiet', (p.pct || 0) + '% \u00b7 ' + (p.phase || 'no current phase') +
+                                          (p.finish ? ' \u00b7 finish ' + fmtDate(p.finish) : '')));
+      } else {
+        info.appendChild(el('p', 'quiet', p.error || 'not set up yet \u2014 open it to run Setup'));
+      }
+      li.appendChild(info);
+      lst.appendChild(li);
+    });
+    box.appendChild(lst);
+    side.appendChild(box);
+    wrap.appendChild(main); wrap.appendChild(side);
+    root.appendChild(wrap);
+  }
+
+  // ------------------------------------------- this project's own strip
+  function summarize(list){
+    var n = {brief: 0, turn: 0, change: 0, task: 0}, bp = '';
+    list.forEach(function(r){ n[r.kind] = (n[r.kind] || 0) + 1; if(r.kind === 'brief' && !bp) bp = r.phase; });
+    var parts = [];
+    if(n.brief) parts.push(n.brief === 1 ? (bp ? 'the Phase ' + bp + ' brief to confirm' : 'a brief to confirm') : n.brief + ' briefs to confirm');
+    if(n.change) parts.push(n.change + (n.change === 1 ? ' plan change' : ' plan changes') + ' to review');
+    if(n.turn) parts.push(n.turn + (n.turn === 1 ? ' session waiting' : ' sessions waiting') + ' for your reply');
+    if(n.task) parts.push(n.task + (n.task === 1 ? ' task' : ' tasks') + ' marked for you');
+    if(parts.length < 2) return parts.join('');
+    return parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1];
+  }
+  function here(d){
+    var me = d.projects.filter(function(p){ return p.current; })[0];
+    if(!me) return;
+    var hd = document.querySelector('.wrap > header');
+    if(hd && !hd.querySelector('.pidrow') && hd.firstElementChild){
+      var row = el('div', 'pidrow'), left = hd.firstElementChild;
+      hd.insertBefore(row, left);
+      row.appendChild(markEl(me, 44));
+      row.appendChild(left);
+    }
+    var old = document.getElementById('pcc-here');
+    if(old) old.remove();
+    if(!me.waiting.length) return;
+    var tiles = document.querySelector('.wrap > .tiles');
+    if(!tiles) return;
+    var s = el('section', 'pcc-here'); s.id = 'pcc-here';
+    s.setAttribute('aria-label', 'Waiting on you in this project');
+    var p = el('p');
+    p.appendChild(el('b', '', me.waiting.length + (me.waiting.length === 1 ? ' thing waits' : ' things wait') + ' on you here: '));
+    p.appendChild(document.createTextNode(summarize(me.waiting) + '.'));
+    s.appendChild(p);
+    var acts = el('div', 'acts');
+    var fb = me.waiting.filter(function(r){ return (r.kind === 'brief' || r.kind === 'turn') && r.phase; })[0];
+    if(fb) acts.appendChild(actBtn(me, 'Open Phase ' + fb.phase, '#phase-' + fb.phase, true));
+    if(me.waiting.some(function(r){ return r.kind === 'change'; })) acts.appendChild(actBtn(me, 'Review changes', '#plan-changes', false));
+    var tl = el('a', 'pcc-btn', 'Today'); tl.href = '/today'; tl.style.textDecoration = 'none';
+    acts.appendChild(tl);
+    s.appendChild(acts);
+    tiles.parentNode.insertBefore(s, tiles);
+  }
+
+  // Links from Today land on a phase, the plan changes or the risks.
+  function hashGo(){
+    var h = location.hash || '';
+    var m = /^#phase-([\w.-]+)$/.exec(h);
+    if(m){
+      var a = document.querySelector('[data-phase-actions="' + m[1] + '"]');
+      var det = a && a.closest('details');
+      if(det){ det.open = true; setTimeout(function(){ det.scrollIntoView({block: 'start'}); }, 60); }
+      return;
+    }
+    if(h === '#plan-changes'){
+      var tries = 0;
+      (function find(){
+        var box = document.querySelector('.pchanges');
+        var btn = box && [].slice.call(box.querySelectorAll('button')).filter(function(b){ return /^Review /.test(b.textContent); })[0];
+        if(btn) btn.click();
+        if(box && box.childNodes.length){ box.scrollIntoView({block: 'start'}); return; }
+        if(++tries < 20) setTimeout(find, 300);
+      })();
+      return;
+    }
+    if(h === '#risks'){
+      var t = document.getElementById('tab-risk');
+      if(t){ t.click(); t.scrollIntoView({block: 'start'}); }
+    }
+  }
+
+  function refresh(){
+    fetch('/api/today').then(function(r){ return r.json(); }).then(function(d){
+      if(!d || !d.ok) return;
+      bar(d);
+      if(HERE === 'today') today(d); else here(d);
+    }).catch(function(){});
+  }
+  if(HERE !== 'today'){ hashGo(); window.addEventListener('hashchange', hashGo); }
+  refresh();
+  setInterval(function(){ if(document.visibilityState === 'visible') refresh(); }, HERE === 'today' ? 20000 : 60000);
+})();
+"""
+
+
 def action_layer(token: str, model: dict) -> str:
     """Everything the local build adds on top of the shared render()."""
     # label -> source line, so a click can find its way back into the markdown.
@@ -4264,7 +5105,8 @@ def action_layer(token: str, model: dict) -> str:
             {k: {"label": v["label"], "mode": v.get("mode", ""),
                  "base": v.get("base", k), "warm": bool(v.get("warm"))}
              for k, v in LAUNCHERS.items()}) + ";</script>"
-        "<script>" + JS + "</script>")
+        "<script>" + JS + "</script>"
+        "<script>" + TODAY_JS + "</script>")
 
 
 # ------------------------------------------------------------ setup wizard ---
@@ -5842,6 +6684,32 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if path == "/api/whoami":
+            # Other dashboards on this machine ask which project this port serves.
+            self._json({"repo": str(REPO), "pid": os.getpid(), "port": SERVE_PORT,
+                        "name": (CFG.get("project") or {}).get("name", "")})
+            return
+
+        if path == "/api/today":
+            try:
+                self._json(today_view())
+            except Exception as exc:  # noqa: BLE001 - the bar must degrade, not 500 the page
+                self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+
+        if path == "/today":
+            body = today_page(Handler.token).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except CLIENT_GONE:
+                pass
+            return
+
         if path == "/setup":
             # Deliberately reachable even when the repo has NO config yet — a
             # wizard you can only open once you are already configured is no use
@@ -6075,6 +6943,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(mark_proposals(list(body.get("ids") or []), str(body.get("status", ""))))
             return
 
+        if path == "/api/today/tick":
+            self._json(today_tick(body))
+            return
+
+        if path == "/api/projects/start":
+            self._json(start_dashboard(str(body.get("path", ""))))
+            return
+
         if path == "/api/session/forget":
             self._json(forget_session(str(body.get("phase", "")), str(body.get("base", ""))))
             return
@@ -6122,6 +6998,13 @@ def main() -> int:
         print("  another dashboard is probably already running there. Stop it, or "
               "pass --port.", file=sys.stderr)
         return 1
+    global SERVE_PORT
+    SERVE_PORT = a.port
+    # Recorded so the other dashboards' project bars can link here; cleared on
+    # the way out (and a stale record is caught by asking the port).
+    _pr.mark_served(REPO, a.port, os.getpid())
+    import atexit
+    atexit.register(lambda: _pr.clear_served(REPO, os.getpid()))
     url = "http://{}:{}/".format(a.host, a.port)
     if fresh:
         url += "setup"
