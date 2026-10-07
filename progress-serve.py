@@ -1709,7 +1709,9 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
     check_cmd = f"python {_pr.__file__} --check --repo {REPO}"
     # The rules below speak `- [ ]`. A plan tracked by its list entries must be
     # told how that maps, or a session "fixes" it into a format it never used.
-    lists = build(REPO).get("items_mode") == "lists"
+    mdl = build(REPO)
+    lists = mdl.get("items_mode") == "lists"
+    opt_ids = [str(x) for x in mdl.get("optional_phases") or []]
     lists_rule = ("- This plan's items are the TOP-LEVEL list entries under each phase "
                   "heading (numbered or bulleted); a mark after the list marker "
                   "(`3. [x] ...`) is the state, no mark means open. Where these rules say "
@@ -1765,6 +1767,10 @@ def replan_prompt(scope: str, phase_id: str, item: str, comment: str,
         "- Phase headings keep the exact form this file already uses (`## Phase "
         "<id> \u2014 <name>` at whatever heading level it has) \u2014 the dashboard "
         "derives everything from it.\n"
+        + (f"- Phase{'s' if len(opt_ids) > 1 else ''} {', '.join(opt_ids)} "
+           f"{'are' if len(opt_ids) > 1 else 'is'} optional: keep the `(optional)` / `(future)` "
+           "heading qualifier and any `optional = true` exactly, and never make a base phase "
+           "depend on one.\n" if opt_ids else "") +
         "- Any phase you ADD gets a matching `[[phase]]` block in "
         "docs/progress.toml (id, name, days, depends_on); any phase you RETIRE "
         "has its block commented out under a dated note, never deleted.\n"
@@ -2009,7 +2015,8 @@ def project_card(e: dict, live: dict, now: float) -> dict:
     card["pct"] = m.get("overall", 0)
     # a project that has started nothing has no current phase: show the first
     # one that can start
-    curp = m.get("current") or next((x for x in m.get("phases", []) if x.get("startable")), None) or {}
+    curp = m.get("current") or next((x for x in m.get("phases", [])
+                                     if x.get("startable") and not x.get("optional")), None) or {}
     if curp:
         card["phase_id"] = str(curp.get("id", ""))
         card["phase"] = f"Phase {curp.get('id')} \u00b7 {curp.get('name', '')}"
@@ -2073,7 +2080,7 @@ def project_card(e: dict, live: dict, now: float) -> dict:
     live_ids = {str(x["id"]) for x in m.get("phases", []) if x.get("startable") or x.get("status") == "active"}
     for ph in m.get("phases", []):
         un = [str(x) for x in ph.get("blocked_by") or []]
-        if un and set(un) <= live_ids:
+        if un and set(un) <= live_ids and not ph.get("optional"):
             card["coming"].append({"kind": "next", "phase": str(ph["id"]),
                                    "title": f"Phase {ph['id']} \u00b7 {ph['name']}",
                                    "detail": f"Unlocks when Phase {', Phase '.join(un)} is done"})
@@ -2378,6 +2385,7 @@ def plan_ticket_prompt(model: dict, project: str, out: Path, cap: int = 2000) ->
     for p in model.get("phases", []):
         open_n = sum(1 for i in p.get("items", []) if i["state"] != "done")
         rows.append(f"  - Phase {p['id']} - {p['name']}: {open_n} of {p['total']} items open"
+                    + ("; optional, not part of the plan's finish" if p.get("optional") else "")
                     + (f"; exit test: {p['exit_test']}" if p.get("exit_test") else ""))
     return (
         f"Draft ONE JIRA ticket for the whole plan {plan} "

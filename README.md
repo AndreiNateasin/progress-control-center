@@ -172,6 +172,12 @@ dashboard on its own port; they find each other through the projects list, and a
 project whose dashboard is off gets a *Start dashboard* button that opens it in a new
 window. Terminal tabs carry the project mark, so two "Phase 1" sessions stay apart.
 
+**Optional and future work, kept apart.** A phase marked `optional = true`, or
+headed `### Phase 6 (optional): ...` / `(future)`, gets its own progress figure and
+its own group under the base plan. It stays out of the overall %, the critical path,
+the finish date and the ready list, but keeps its checklist, briefs, sessions and
+re-plan. A plan with no optional phase renders exactly as before.
+
 **A risk register** derived from the schedule: what is on the critical path, what
 external blockers will stall which phase, and how much slack is left.
 

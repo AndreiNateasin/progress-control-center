@@ -452,6 +452,32 @@ checkbox is an item of its own and is not repeated there. The display list is a
 second parse kept apart from the counted one, and the page falls back to the
 counted list whenever the two disagree.
 
+## Optional phases have their own progress
+
+Some tracked work is not on the way to "done": a follow-up track, modules for
+later. Counted in the overall %, it made the plan look further from finished and
+put its days on the critical path. A phase is optional when its block sets
+`optional = true`, or, without the key, when its heading carries `(optional)` or
+`(future)`; the key wins over the heading both ways.
+
+`overall` stays the base figure, the day-weighted % over phases that are neither
+continuous nor optional; `optional_overall` is the same formula over the optional
+phases (`null` when there are none), and the model lists `base_phases` and
+`optional_phases`. Optional phases leave the critical path, remaining days, the
+finish date, the measured-pace estimate's items left (its rate still counts every
+tick), the parallel saving, the phase counts, the current phase, the ready list and
+the near-complete warning; their external blockers stay listed at *info*. They keep
+everything else and stay startable. The page shows the base phases first, then an
+*Optional / future* group with its own % and bar; the timeline puts them after the
+base, hatched; waves never mix the two; agent files get an *Optional phases*
+section. Snapshots record `optional_overall` when the plan has an optional phase.
+`--check` fails a non-boolean `optional`, warns when a base phase depends on an
+optional one, and treats an optional phase without items as a placeholder.
+
+Everything above renders only when an optional phase exists, so a plan without
+one produces byte-identical output; only the `--json` dump gains the three keys.
+Tests: `python -m unittest discover -s tests -v`.
+
 ## A phase's exit test is its outcomes
 
 A phase ends when some things are true, so its exit test is a short list of
