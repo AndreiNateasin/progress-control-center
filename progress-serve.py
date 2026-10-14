@@ -729,6 +729,8 @@ def switch_project(path: str) -> dict:
     if not p.is_dir():
         return {"ok": False, "error": f"{p} is not a directory"}
     was = REPO
+    # choosing a retired project here is the deliberate way back
+    restored = _pr.restore_project(p)
     try:
         init_repo(p)
     except (OSError, tomllib.TOMLDecodeError) as exc:
@@ -740,7 +742,7 @@ def switch_project(path: str) -> dict:
     if gate["trusted"]:
         post_trust_setup()
     _pr.remember_project(p, (CFG.get("project", {}) or {}).get("name", ""))
-    return {"ok": True, "repo": str(p),
+    return {"ok": True, "repo": str(p), "restored": restored,
             "name": (CFG.get("project", {}) or {}).get("name", "") or p.name,
             "configured": (p / "docs" / "progress.toml").exists(),
             "trusted": gate["trusted"], "blocked": gate["blocked"]}
@@ -4834,6 +4836,7 @@ TODAY_JS = r"""
       var live = p.current || p.running;
       var a = el('a', 'pcc-tab' + (on ? ' on' : ''));
       a.href = href(p, '') || '#';
+      a.title = p.name + ' \u2014 ' + p.path;
       a.setAttribute('aria-label', p.name + (p.waiting.length ? ', ' + p.waiting.length + ' waiting' : '') +
                                   (live ? '' : ', dashboard not running'));
       if(on){
@@ -4932,6 +4935,7 @@ TODAY_JS = r"""
     var h = el('h2'); h.id = hid;
     var a = el('a', '', p.name), ph = href(p, '');
     a.href = ph || '#';
+    a.title = p.path;
     if(!ph) a.addEventListener('click', function(ev){ ev.preventDefault(); start(p, ''); });
     h.appendChild(a); nm.appendChild(h);
     var counts = [];
@@ -5418,7 +5422,7 @@ SETUP_JS = r"""
           api('/api/setup/switch',{path:p.path}).then(function(d){
             go.disabled = false;
             if(!d.ok){ say('#sw-pmsg2',d.error,'err'); return; }
-            say('#sw-pmsg2','now serving ' + d.name + (d.trusted ? '' :
+            say('#sw-pmsg2','now serving ' + d.name + (d.restored ? ', back on your list' : '') + (d.trusted ? '' :
                 ' \u2014 read-only: ' + (d.blocked.join(', ') || 'its commands') +
                 ' need approval at a restart'), d.trusted ? 'ok' : '');
             load();
@@ -5427,7 +5431,8 @@ SETUP_JS = r"""
         right.appendChild(go);
       }
       var drop = el('button',{class:'act',text:'Forget'});
-      drop.title = 'Remove from this list. Does not touch the project itself.';
+      drop.title = 'Take it off this list for good: a dashboard started on it later stops and ' +
+                   'asks for --restore. Does not touch the project itself.';
       drop.disabled = !!p.current;
       drop.addEventListener('click',function(){
         api('/api/setup/forget-project',{path:p.path}).then(function(d){
@@ -7039,11 +7044,28 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true", help="log every request")
     ap.add_argument("--trust-yes", action="store_true", dest="trust_yes",
                     help="approve this repo's configured commands without asking")
+    ap.add_argument("--restore", action="store_true",
+                    help="serve a project that was taken off the list, and put it back on")
     a = ap.parse_args()
     global BIND_HOST
     BIND_HOST = a.host
 
-    init_repo(_pr.resolve_repo(a.repo))
+    repo = _pr.resolve_repo(a.repo)
+    # A project taken off the list stays off: an old command recalled from the
+    # shell's history must not bring it back, on the default port, unnoticed.
+    gone = _pr.retired_entry(repo)
+    if gone and not a.restore:
+        print(f"{repo} was taken off your project list"
+              + (f" on {gone['since']}" if gone["since"] else "") + ".", file=sys.stderr)
+        if gone["instead"]:
+            print(f"  the project now lives in {gone['instead']}:", file=sys.stderr)
+            print(f"    python {sys.argv[0]} --repo {gone['instead']}", file=sys.stderr)
+        print("  to serve this folder anyway and put it back on the list, add --restore",
+              file=sys.stderr)
+        return 2
+    if gone:
+        _pr.restore_project(repo)
+    init_repo(repo)
     fresh = not (REPO / "docs" / "progress.toml").exists()
     if not check_trust(REPO, ACTIONS, a.trust_yes, config_launchers(CFG)):
         return 1

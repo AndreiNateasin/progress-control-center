@@ -593,7 +593,10 @@ def load_projects() -> list[dict]:
                 if isinstance(e.get(k), typ) and e.get(k) not in ("", 0):
                     row[k] = e[k]
             out.append(row)
-    return out
+    # a retired project stays off the list, even when a dashboard that knows
+    # nothing of retired.toml wrote it back
+    gone = load_retired()
+    return [r for r in out if not any(_same_path(r["path"], g["path"]) for g in gone)]
 
 
 def save_projects(items: list[dict]) -> Path:
@@ -663,6 +666,8 @@ def remember_project(repo: Path, name: str = "") -> None:
     """Record a project as opened. Called on every serve, so the picker fills
     itself from use rather than needing to be curated."""
     repo = Path(repo).resolve()
+    if retired_entry(repo):
+        return
     if not name:
         cfgp = repo / "docs" / "progress.toml"
         try:
@@ -779,11 +784,70 @@ def clear_served(repo: Path, pid: int) -> None:
                 pass
 
 
-def forget_project(path: str) -> None:
-    want = Path(path).as_posix().lower()
+def retired_path() -> Path:
+    return user_config_dir() / "retired.toml"
+
+
+def load_retired() -> list[dict]:
+    """Projects taken off the list. Kept apart from projects.toml, which every
+    running dashboard rewrites from what it read at its own start - a record
+    kept in there would be lost to the first older server that saved."""
+    p = retired_path()
+    try:
+        d = tomllib.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    return [{"path": str(e["path"]), "since": str(e.get("since", "")),
+             "instead": str(e.get("instead", ""))}
+            for e in d.get("retired", []) if isinstance(e, dict) and e.get("path")]
+
+
+def retired_entry(repo) -> dict | None:
+    """The retired record for this folder, or None."""
+    want = Path(str(repo)).resolve()
+    return next((e for e in load_retired() if _same_path(e["path"], want)), None)
+
+
+def _save_retired(items: list[dict]) -> None:
+    lines = ["# Projects taken off the list. A dashboard will not start on one of",
+             "# these without --restore. Safe to edit or delete.", ""]
+    for e in items:
+        lines += ["[[retired]]", f"path    = {_toml_str(e['path'])}",
+                  f"since   = {_toml_str(e.get('since', ''))}"]
+        if e.get("instead"):
+            lines.append(f"instead = {_toml_str(e['instead'])}")
+        lines.append("")
+    p = retired_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def forget_project(path: str, instead: str = "") -> None:
+    """Take a project off the list, for good: it is recorded as retired, so a
+    later dashboard start on that folder (an old command from the shell's
+    history, say) does not quietly put it back. `instead` names the folder
+    that replaced it, for the message that start prints."""
+    want = Path(str(path)).resolve()
     with _registry_lock():
-        save_projects([e for e in load_projects()
-                       if Path(e["path"]).as_posix().lower() != want])
+        save_projects([e for e in load_projects() if not _same_path(e["path"], want)])
+        rest = [e for e in load_retired() if not _same_path(e["path"], want)]
+        rest.append({"path": str(want), "since": date.today().isoformat(),
+                     "instead": str(Path(str(instead)).resolve()) if instead else ""})
+        _save_retired(rest)
+
+
+def restore_project(path) -> bool:
+    """Put a retired project back within reach; True when it was retired."""
+    want = Path(str(path)).resolve()
+    with _registry_lock():
+        items = load_retired()
+        rest = [e for e in items if not _same_path(e["path"], want)]
+        if len(rest) == len(items):
+            return False
+        _save_retired(rest)
+    return True
 
 
 def _load_cfg_quietly(repo: Path) -> dict:
